@@ -1,16 +1,14 @@
-//! The keyspace and key expiration.
+//! The keyspace, typed values, and key expiration.
 //!
-//! Expiry is stored in a *separate* map (key -> expire-at unix-ms), exactly like
-//! Redis. Two mechanisms keep it honest:
-//!   * PASSIVE: on every access we check the key's deadline and delete it if due,
-//!     so an expired key is never returned (this guarantees correctness).
-//!   * ACTIVE: a periodic sampling pass (see `active_expire`) reclaims memory
-//!     from keys that are never touched again.
+//! A value is no longer just bytes — it's one of several Redis types. Commands
+//! must check the type and return WRONGTYPE when it doesn't match.
+//!
+//! Expiry (key -> deadline) is kept in a separate map, with PASSIVE checking on
+//! access and an ACTIVE sampling reaper (see `active_expire`).
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::time::{SystemTime, UNIX_EPOCH};
 
-/// Wall-clock milliseconds since the Unix epoch (Redis uses wall time for TTLs).
 pub fn now_ms() -> u64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -18,9 +16,37 @@ pub fn now_ms() -> u64 {
         .unwrap_or(0)
 }
 
+/// A stored value. Each variant is a distinct Redis type.
+pub enum Value {
+    Str(Vec<u8>),
+    List(VecDeque<Vec<u8>>),
+    Hash(HashMap<Vec<u8>, Vec<u8>>),
+    Set(HashSet<Vec<u8>>),
+}
+
+impl Value {
+    pub fn type_name(&self) -> &'static str {
+        match self {
+            Value::Str(_) => "string",
+            Value::List(_) => "list",
+            Value::Hash(_) => "hash",
+            Value::Set(_) => "set",
+        }
+    }
+
+    fn is_empty_collection(&self) -> bool {
+        match self {
+            Value::List(l) => l.is_empty(),
+            Value::Hash(h) => h.is_empty(),
+            Value::Set(s) => s.is_empty(),
+            Value::Str(_) => false,
+        }
+    }
+}
+
 pub struct Db {
-    data: HashMap<Vec<u8>, Vec<u8>>,
-    expires: HashMap<Vec<u8>, u64>, // key -> expire-at (unix ms)
+    data: HashMap<Vec<u8>, Value>,
+    expires: HashMap<Vec<u8>, u64>,
 }
 
 impl Db {
@@ -31,7 +57,6 @@ impl Db {
         }
     }
 
-    /// PASSIVE expiry: if this key has a due deadline, delete it now.
     fn check_expiry(&mut self, key: &[u8]) {
         if let Some(&deadline) = self.expires.get(key) {
             if deadline <= now_ms() {
@@ -41,9 +66,24 @@ impl Db {
         }
     }
 
-    pub fn get(&mut self, key: &[u8]) -> Option<&Vec<u8>> {
+    pub fn get(&mut self, key: &[u8]) -> Option<&Value> {
         self.check_expiry(key);
         self.data.get(key)
+    }
+
+    pub fn get_mut(&mut self, key: &[u8]) -> Option<&mut Value> {
+        self.check_expiry(key);
+        self.data.get_mut(key)
+    }
+
+    pub fn insert(&mut self, key: Vec<u8>, value: Value) {
+        self.data.insert(key, value);
+    }
+
+    pub fn remove(&mut self, key: &[u8]) -> Option<Value> {
+        self.check_expiry(key);
+        self.expires.remove(key);
+        self.data.remove(key)
     }
 
     pub fn contains(&mut self, key: &[u8]) -> bool {
@@ -51,22 +91,27 @@ impl Db {
         self.data.contains_key(key)
     }
 
-    pub fn remove(&mut self, key: &[u8]) -> Option<Vec<u8>> {
+    pub fn type_name(&mut self, key: &[u8]) -> Option<&'static str> {
         self.check_expiry(key);
-        self.expires.remove(key);
-        self.data.remove(key)
+        self.data.get(key).map(|v| v.type_name())
     }
 
-    /// Insert/replace a value. Does NOT touch TTL — callers decide (plain SET
-    /// clears it; INCR/APPEND preserve it), matching Redis semantics.
-    pub fn set(&mut self, key: Vec<u8>, val: Vec<u8>) {
-        self.data.insert(key, val);
+    /// Get a value for in-place mutation, creating it via `f` if absent.
+    /// (If the key exists with a different type, the existing value is returned
+    /// unchanged — callers must type-check the result.)
+    pub fn get_or_insert_with(&mut self, key: &[u8], f: impl FnOnce() -> Value) -> &mut Value {
+        self.check_expiry(key);
+        self.data.entry(key.to_vec()).or_insert_with(f)
     }
 
-    /// Get a mutable handle to a value, creating an empty one if absent.
-    pub fn entry_or_default(&mut self, key: &[u8]) -> &mut Vec<u8> {
-        self.check_expiry(key);
-        self.data.entry(key.to_vec()).or_default()
+    /// Delete the key if it now holds an empty collection (Redis removes empty
+    /// lists/hashes/sets so they don't linger).
+    pub fn remove_if_empty(&mut self, key: &[u8]) {
+        let empty = self.data.get(key).map_or(false, |v| v.is_empty_collection());
+        if empty {
+            self.data.remove(key);
+            self.expires.remove(key);
+        }
     }
 
     pub fn set_expire(&mut self, key: &[u8], at_ms: u64) {
@@ -84,10 +129,6 @@ impl Db {
         self.expires.get(key).copied()
     }
 
-    /// ACTIVE expiry, Redis-style: sample some keys-with-TTL, delete the expired
-    /// ones, and repeat while more than ~25% of a sample was expired (a hint that
-    /// many remain). Bounded work per call. (True random sampling is a later
-    /// refinement; HashMap iteration order is good enough here.)
     pub fn active_expire(&mut self) {
         let now = now_ms();
         loop {
@@ -105,7 +146,7 @@ impl Db {
                 }
             }
             if expired * 4 < total {
-                break; // fewer than ~25% expired — likely done
+                break;
             }
         }
     }

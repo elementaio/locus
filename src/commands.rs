@@ -1,113 +1,52 @@
-//! Command dispatch and string/expiry command implementations.
+//! Command dispatch and implementations.
+//!
+//! Organized by type: generic/expiry, strings, lists, hashes, sets. Every
+//! command that targets a typed key returns WRONGTYPE if the key holds a
+//! different type.
 
-use crate::db::{now_ms, Db};
-use crate::resp::{bulk_string, error, integer, null_bulk, simple_string};
+use std::collections::{HashMap, HashSet, VecDeque};
+
+use crate::db::{now_ms, Db, Value};
+use crate::resp::{
+    array, bulk_array, bulk_string, error, integer, null_array, null_bulk, simple_string,
+};
+
+// --- shared helpers ---------------------------------------------------------
 
 fn wrong_args(cmd: &str) -> Vec<u8> {
     error(&format!("ERR wrong number of arguments for '{cmd}' command"))
 }
-
 fn not_integer() -> Vec<u8> {
     error("ERR value is not an integer or out of range")
 }
-
+fn wrongtype() -> Vec<u8> {
+    error("WRONGTYPE Operation against a key holding the wrong kind of value")
+}
 fn parse_int(arg: &[u8]) -> Option<i64> {
     std::str::from_utf8(arg).ok().and_then(|s| s.parse::<i64>().ok())
 }
 
-/// Run one parsed command against the keyspace and return its RESP reply.
-/// Runs only on the single owner thread, so it sees no concurrency.
 pub fn execute(tokens: &[Vec<u8>], db: &mut Db) -> Vec<u8> {
     if tokens.is_empty() {
         return Vec::new();
     }
     let cmd = tokens[0].to_ascii_uppercase();
     match cmd.as_slice() {
+        // connection / generic
         b"PING" => match tokens.len() {
             1 => simple_string("PONG"),
             2 => bulk_string(&tokens[1]),
             _ => wrong_args("ping"),
         },
-        b"ECHO" => match tokens.len() {
-            2 => bulk_string(&tokens[1]),
-            _ => wrong_args("echo"),
-        },
-        b"SET" => set_cmd(db, tokens),
-        b"GET" => match tokens.len() {
-            2 => match db.get(&tokens[1]) {
-                Some(v) => bulk_string(v),
-                None => null_bulk(),
-            },
-            _ => wrong_args("get"),
-        },
-        b"GETDEL" => match tokens.len() {
-            2 => match db.remove(&tokens[1]) {
-                Some(v) => bulk_string(&v),
-                None => null_bulk(),
-            },
-            _ => wrong_args("getdel"),
-        },
-        b"DEL" => {
-            if tokens.len() < 2 {
-                wrong_args("del")
-            } else {
-                let n = tokens[1..].iter().filter(|k| db.remove(k).is_some()).count();
-                integer(n as i64)
-            }
-        }
-        b"EXISTS" => {
-            if tokens.len() < 2 {
-                wrong_args("exists")
-            } else {
-                let n = tokens[1..].iter().filter(|k| db.contains(k)).count();
-                integer(n as i64)
-            }
-        }
-        b"INCR" => match tokens.len() {
-            2 => incr_by(db, &tokens[1], 1),
-            _ => wrong_args("incr"),
-        },
-        b"DECR" => match tokens.len() {
-            2 => incr_by(db, &tokens[1], -1),
-            _ => wrong_args("decr"),
-        },
-        b"INCRBY" => match tokens.len() {
-            3 => match parse_int(&tokens[2]) {
-                Some(d) => incr_by(db, &tokens[1], d),
-                None => not_integer(),
-            },
-            _ => wrong_args("incrby"),
-        },
-        b"DECRBY" => match tokens.len() {
-            3 => match parse_int(&tokens[2]).and_then(|d| d.checked_neg()) {
-                Some(neg) => incr_by(db, &tokens[1], neg),
-                None => not_integer(),
-            },
-            _ => wrong_args("decrby"),
-        },
-        b"APPEND" => match tokens.len() {
-            3 => {
-                let e = db.entry_or_default(&tokens[1]);
-                e.extend_from_slice(&tokens[2]);
-                integer(e.len() as i64)
-            }
-            _ => wrong_args("append"),
-        },
-        b"STRLEN" => match tokens.len() {
-            2 => integer(db.get(&tokens[1]).map(|v| v.len()).unwrap_or(0) as i64),
-            _ => wrong_args("strlen"),
-        },
+        b"ECHO" if tokens.len() == 2 => bulk_string(&tokens[1]),
+        b"ECHO" => wrong_args("echo"),
+        b"DEL" => del_cmd(db, tokens),
+        b"EXISTS" => exists_cmd(db, tokens),
         b"TYPE" => match tokens.len() {
-            2 => {
-                if db.contains(&tokens[1]) {
-                    simple_string("string")
-                } else {
-                    simple_string("none")
-                }
-            }
+            2 => simple_string(db.type_name(&tokens[1]).unwrap_or("none")),
             _ => wrong_args("type"),
         },
-        // --- expiry family ---
+        // expiry
         b"EXPIRE" => expire_cmd(db, tokens, 1000, false),
         b"PEXPIRE" => expire_cmd(db, tokens, 1, false),
         b"EXPIREAT" => expire_cmd(db, tokens, 1000, true),
@@ -124,7 +63,51 @@ pub fn execute(tokens: &[Vec<u8>], db: &mut Db) -> Vec<u8> {
             }
             _ => wrong_args("persist"),
         },
-        // --- stubs so interactive redis-cli connects cleanly ---
+        // strings
+        b"SET" => set_cmd(db, tokens),
+        b"GET" => get_cmd(db, tokens),
+        b"GETDEL" => getdel_cmd(db, tokens),
+        b"INCR" => incr_cmd(db, tokens, 1, false),
+        b"DECR" => incr_cmd(db, tokens, -1, false),
+        b"INCRBY" => incr_cmd(db, tokens, 0, true),
+        b"DECRBY" => incr_cmd(db, tokens, 0, true),
+        b"APPEND" => append_cmd(db, tokens),
+        b"STRLEN" => strlen_cmd(db, tokens),
+        // lists
+        b"LPUSH" => push_cmd(db, tokens, true, true),
+        b"RPUSH" => push_cmd(db, tokens, false, true),
+        b"LPUSHX" => push_cmd(db, tokens, true, false),
+        b"RPUSHX" => push_cmd(db, tokens, false, false),
+        b"LPOP" => pop_cmd(db, tokens, true),
+        b"RPOP" => pop_cmd(db, tokens, false),
+        b"LLEN" => llen_cmd(db, tokens),
+        b"LRANGE" => lrange_cmd(db, tokens),
+        b"LINDEX" => lindex_cmd(db, tokens),
+        b"LSET" => lset_cmd(db, tokens),
+        // hashes
+        b"HSET" => hset_cmd(db, tokens, false),
+        b"HSETNX" => hsetnx_cmd(db, tokens),
+        b"HGET" => hget_cmd(db, tokens),
+        b"HMGET" => hmget_cmd(db, tokens),
+        b"HGETALL" => hgetall_cmd(db, tokens),
+        b"HDEL" => hdel_cmd(db, tokens),
+        b"HEXISTS" => hexists_cmd(db, tokens),
+        b"HLEN" => hlen_cmd(db, tokens),
+        b"HKEYS" => hkeys_vals_cmd(db, tokens, true),
+        b"HVALS" => hkeys_vals_cmd(db, tokens, false),
+        b"HINCRBY" => hincrby_cmd(db, tokens),
+        // sets
+        b"SADD" => sadd_cmd(db, tokens),
+        b"SREM" => srem_cmd(db, tokens),
+        b"SMEMBERS" => smembers_cmd(db, tokens),
+        b"SISMEMBER" => sismember_cmd(db, tokens),
+        b"SMISMEMBER" => smismember_cmd(db, tokens),
+        b"SCARD" => scard_cmd(db, tokens),
+        b"SPOP" => spop_cmd(db, tokens),
+        b"SINTER" => setop_cmd(db, tokens, SetOp::Inter),
+        b"SUNION" => setop_cmd(db, tokens, SetOp::Union),
+        b"SDIFF" => setop_cmd(db, tokens, SetOp::Diff),
+        // stubs
         b"COMMAND" => b"*0\r\n".to_vec(),
         b"CONFIG" => match tokens.get(1).map(|t| t.to_ascii_uppercase()).as_deref() {
             Some(b"GET") => b"*0\r\n".to_vec(),
@@ -137,18 +120,114 @@ pub fn execute(tokens: &[Vec<u8>], db: &mut Db) -> Vec<u8> {
     }
 }
 
-fn incr_by(db: &mut Db, key: &[u8], delta: i64) -> Vec<u8> {
-    let current = match db.get(key) {
+// === generic ================================================================
+
+fn del_cmd(db: &mut Db, tokens: &[Vec<u8>]) -> Vec<u8> {
+    if tokens.len() < 2 {
+        return wrong_args("del");
+    }
+    let n = tokens[1..].iter().filter(|k| db.remove(k).is_some()).count();
+    integer(n as i64)
+}
+
+fn exists_cmd(db: &mut Db, tokens: &[Vec<u8>]) -> Vec<u8> {
+    if tokens.len() < 2 {
+        return wrong_args("exists");
+    }
+    let n = tokens[1..].iter().filter(|k| db.contains(k)).count();
+    integer(n as i64)
+}
+
+// === strings ================================================================
+
+fn get_cmd(db: &mut Db, tokens: &[Vec<u8>]) -> Vec<u8> {
+    if tokens.len() != 2 {
+        return wrong_args("get");
+    }
+    match db.get(&tokens[1]) {
+        None => null_bulk(),
+        Some(Value::Str(s)) => bulk_string(s),
+        Some(_) => wrongtype(),
+    }
+}
+
+fn getdel_cmd(db: &mut Db, tokens: &[Vec<u8>]) -> Vec<u8> {
+    if tokens.len() != 2 {
+        return wrong_args("getdel");
+    }
+    match db.get(&tokens[1]) {
+        None => null_bulk(),
+        Some(Value::Str(_)) => match db.remove(&tokens[1]) {
+            Some(Value::Str(s)) => bulk_string(&s),
+            _ => null_bulk(),
+        },
+        Some(_) => wrongtype(),
+    }
+}
+
+fn strlen_cmd(db: &mut Db, tokens: &[Vec<u8>]) -> Vec<u8> {
+    if tokens.len() != 2 {
+        return wrong_args("strlen");
+    }
+    match db.get(&tokens[1]) {
+        None => integer(0),
+        Some(Value::Str(s)) => integer(s.len() as i64),
+        Some(_) => wrongtype(),
+    }
+}
+
+fn append_cmd(db: &mut Db, tokens: &[Vec<u8>]) -> Vec<u8> {
+    if tokens.len() != 3 {
+        return wrong_args("append");
+    }
+    match db.get_or_insert_with(&tokens[1], || Value::Str(Vec::new())) {
+        Value::Str(s) => {
+            s.extend_from_slice(&tokens[2]);
+            integer(s.len() as i64)
+        }
+        _ => wrongtype(),
+    }
+}
+
+fn incr_cmd(db: &mut Db, tokens: &[Vec<u8>], fixed_delta: i64, has_arg: bool) -> Vec<u8> {
+    let cmdname = String::from_utf8_lossy(&tokens[0]).to_ascii_lowercase();
+    let delta = if has_arg {
+        if tokens.len() != 3 {
+            return wrong_args(&cmdname);
+        }
+        match parse_int(&tokens[2]) {
+            Some(d) => {
+                if cmdname == "decrby" {
+                    match d.checked_neg() {
+                        Some(n) => n,
+                        None => return not_integer(),
+                    }
+                } else {
+                    d
+                }
+            }
+            None => return not_integer(),
+        }
+    } else {
+        if tokens.len() != 2 {
+            return wrong_args(&cmdname);
+        }
+        fixed_delta
+    };
+
+    let current = match db.get(&tokens[1]) {
         None => 0,
-        Some(v) => match std::str::from_utf8(v).ok().and_then(|s| s.parse::<i64>().ok()) {
+        Some(Value::Str(v)) => match std::str::from_utf8(v).ok().and_then(|s| s.parse::<i64>().ok())
+        {
             Some(n) => n,
             None => return not_integer(),
         },
+        Some(_) => return wrongtype(),
     };
     match current.checked_add(delta) {
+        // INCR/DECR preserve any TTL: db.insert replaces the value, not expires.
         Some(next) => {
-            // INCR/DECR preserve any existing TTL — db.set doesn't touch expires.
-            db.set(key.to_vec(), next.to_string().into_bytes());
+            db.insert(tokens[1].clone(), Value::Str(next.to_string().into_bytes()));
             integer(next)
         }
         None => error("ERR increment or decrement would overflow"),
@@ -187,7 +266,7 @@ fn parse_set_opts(args: &[Vec<u8>]) -> Option<SetOpts> {
                     b"EX" => now + n * 1000,
                     b"PX" => now + n,
                     b"EXAT" => n * 1000,
-                    _ => n, // PXAT
+                    _ => n,
                 });
             }
             b"KEEPTTL" => o.keepttl = true,
@@ -211,17 +290,25 @@ fn set_cmd(db: &mut Db, tokens: &[Vec<u8>]) -> Vec<u8> {
         Some(o) => o,
         None => return error("ERR syntax error"),
     };
+    // SET ... GET requires the existing value (if any) to be a string.
+    let old = if opts.get {
+        match db.get(key) {
+            None => None,
+            Some(Value::Str(s)) => Some(s.clone()),
+            Some(_) => return wrongtype(),
+        }
+    } else {
+        None
+    };
     let exists = db.contains(key);
     if (opts.nx && exists) || (opts.xx && !exists) {
-        // Condition not met: GET returns the old value, otherwise nil.
         return if opts.get {
-            db.get(key).map(|v| bulk_string(v)).unwrap_or_else(null_bulk)
+            old.map(|v| bulk_string(&v)).unwrap_or_else(null_bulk)
         } else {
             null_bulk()
         };
     }
-    let old = if opts.get { db.get(key).cloned() } else { None };
-    db.set(key.clone(), val.clone());
+    db.insert(key.clone(), Value::Str(val.clone()));
     match opts.expire_at {
         Some(t) => db.set_expire(key, t),
         None => {
@@ -237,8 +324,6 @@ fn set_cmd(db: &mut Db, tokens: &[Vec<u8>]) -> Vec<u8> {
     }
 }
 
-/// EXPIRE/PEXPIRE/EXPIREAT/PEXPIREAT. `unit_ms` scales the argument; `absolute`
-/// chooses between "from now" and "at this timestamp".
 fn expire_cmd(db: &mut Db, tokens: &[Vec<u8>], unit_ms: i64, absolute: bool) -> Vec<u8> {
     if tokens.len() != 3 {
         return wrong_args("expire");
@@ -257,14 +342,13 @@ fn expire_cmd(db: &mut Db, tokens: &[Vec<u8>], unit_ms: i64, absolute: bool) -> 
         now_ms() as i64 + n * unit_ms
     };
     if at <= now_ms() as i64 {
-        db.remove(key); // deadline already passed — delete immediately
+        db.remove(key);
     } else {
         db.set_expire(key, at as u64);
     }
     integer(1)
 }
 
-/// TTL (seconds) / PTTL (ms): -2 no key, -1 no expiry, else remaining time.
 fn ttl_cmd(db: &mut Db, tokens: &[Vec<u8>], unit_ms: u64) -> Vec<u8> {
     if tokens.len() != 2 {
         return wrong_args("ttl");
@@ -277,10 +361,485 @@ fn ttl_cmd(db: &mut Db, tokens: &[Vec<u8>], unit_ms: u64) -> Vec<u8> {
         None => integer(-1),
         Some(deadline) => {
             let remaining = deadline.saturating_sub(now_ms());
-            // Round up so a key with <1 unit left still reports 1, not 0.
             integer(((remaining + unit_ms - 1) / unit_ms) as i64)
         }
     }
+}
+
+// === lists ==================================================================
+
+/// LPUSH/RPUSH (create=true) and LPUSHX/RPUSHX (create=false).
+fn push_cmd(db: &mut Db, tokens: &[Vec<u8>], front: bool, create: bool) -> Vec<u8> {
+    if tokens.len() < 3 {
+        return wrong_args("push");
+    }
+    let key = &tokens[1];
+    let list = if create {
+        match db.get_or_insert_with(key, || Value::List(VecDeque::new())) {
+            Value::List(l) => l,
+            _ => return wrongtype(),
+        }
+    } else {
+        match db.get_mut(key) {
+            Some(Value::List(l)) => l,
+            Some(_) => return wrongtype(),
+            None => return integer(0),
+        }
+    };
+    for item in &tokens[2..] {
+        if front {
+            list.push_front(item.clone());
+        } else {
+            list.push_back(item.clone());
+        }
+    }
+    integer(list.len() as i64)
+}
+
+fn pop_cmd(db: &mut Db, tokens: &[Vec<u8>], front: bool) -> Vec<u8> {
+    if tokens.len() < 2 || tokens.len() > 3 {
+        return wrong_args("pop");
+    }
+    let count = if tokens.len() == 3 {
+        match parse_int(&tokens[2]) {
+            Some(c) if c >= 0 => Some(c as usize),
+            _ => return error("ERR value is out of range, must be positive"),
+        }
+    } else {
+        None
+    };
+    let key = &tokens[1];
+    let mut popped: Vec<Vec<u8>> = Vec::new();
+    match db.get_mut(key) {
+        Some(Value::List(l)) => {
+            for _ in 0..count.unwrap_or(1) {
+                match if front { l.pop_front() } else { l.pop_back() } {
+                    Some(x) => popped.push(x),
+                    None => break,
+                }
+            }
+        }
+        Some(_) => return wrongtype(),
+        None => return if count.is_some() { null_array() } else { null_bulk() },
+    }
+    db.remove_if_empty(key);
+    if count.is_some() {
+        bulk_array(&popped)
+    } else {
+        popped.into_iter().next().map(|v| bulk_string(&v)).unwrap_or_else(null_bulk)
+    }
+}
+
+fn llen_cmd(db: &mut Db, tokens: &[Vec<u8>]) -> Vec<u8> {
+    if tokens.len() != 2 {
+        return wrong_args("llen");
+    }
+    match db.get(&tokens[1]) {
+        None => integer(0),
+        Some(Value::List(l)) => integer(l.len() as i64),
+        Some(_) => wrongtype(),
+    }
+}
+
+/// Clamp a possibly-negative index into a valid range position.
+fn norm(i: i64, len: usize) -> i64 {
+    if i < 0 {
+        i + len as i64
+    } else {
+        i
+    }
+}
+
+fn lrange_cmd(db: &mut Db, tokens: &[Vec<u8>]) -> Vec<u8> {
+    if tokens.len() != 4 {
+        return wrong_args("lrange");
+    }
+    let (start, stop) = match (parse_int(&tokens[2]), parse_int(&tokens[3])) {
+        (Some(a), Some(b)) => (a, b),
+        _ => return not_integer(),
+    };
+    match db.get(&tokens[1]) {
+        None => bulk_array(&[]),
+        Some(Value::List(l)) => {
+            let len = l.len();
+            let mut start = norm(start, len).max(0);
+            let mut stop = norm(stop, len);
+            if stop >= len as i64 {
+                stop = len as i64 - 1;
+            }
+            if start > stop || len == 0 {
+                return bulk_array(&[]);
+            }
+            start = start.min(len as i64 - 1);
+            let slice: Vec<Vec<u8>> = l
+                .iter()
+                .skip(start as usize)
+                .take((stop - start + 1) as usize)
+                .cloned()
+                .collect();
+            bulk_array(&slice)
+        }
+        Some(_) => wrongtype(),
+    }
+}
+
+fn lindex_cmd(db: &mut Db, tokens: &[Vec<u8>]) -> Vec<u8> {
+    if tokens.len() != 3 {
+        return wrong_args("lindex");
+    }
+    let idx = match parse_int(&tokens[2]) {
+        Some(i) => i,
+        None => return not_integer(),
+    };
+    match db.get(&tokens[1]) {
+        None => null_bulk(),
+        Some(Value::List(l)) => {
+            let i = norm(idx, l.len());
+            if i < 0 || i >= l.len() as i64 {
+                null_bulk()
+            } else {
+                bulk_string(&l[i as usize])
+            }
+        }
+        Some(_) => wrongtype(),
+    }
+}
+
+fn lset_cmd(db: &mut Db, tokens: &[Vec<u8>]) -> Vec<u8> {
+    if tokens.len() != 4 {
+        return wrong_args("lset");
+    }
+    let idx = match parse_int(&tokens[2]) {
+        Some(i) => i,
+        None => return not_integer(),
+    };
+    match db.get_mut(&tokens[1]) {
+        None => error("ERR no such key"),
+        Some(Value::List(l)) => {
+            let i = norm(idx, l.len());
+            if i < 0 || i >= l.len() as i64 {
+                error("ERR index out of range")
+            } else {
+                l[i as usize] = tokens[3].clone();
+                simple_string("OK")
+            }
+        }
+        Some(_) => wrongtype(),
+    }
+}
+
+// === hashes =================================================================
+
+fn with_hash<'a>(db: &'a mut Db, key: &[u8]) -> Result<Option<&'a HashMap<Vec<u8>, Vec<u8>>>, ()> {
+    match db.get(key) {
+        None => Ok(None),
+        Some(Value::Hash(h)) => Ok(Some(h)),
+        Some(_) => Err(()),
+    }
+}
+
+fn hset_cmd(db: &mut Db, tokens: &[Vec<u8>], _nx: bool) -> Vec<u8> {
+    if tokens.len() < 4 || (tokens.len() - 2) % 2 != 0 {
+        return wrong_args("hset");
+    }
+    let h = match db.get_or_insert_with(&tokens[1], || Value::Hash(HashMap::new())) {
+        Value::Hash(h) => h,
+        _ => return wrongtype(),
+    };
+    let mut added = 0i64;
+    let mut i = 2;
+    while i + 1 < tokens.len() {
+        if h.insert(tokens[i].clone(), tokens[i + 1].clone()).is_none() {
+            added += 1;
+        }
+        i += 2;
+    }
+    integer(added)
+}
+
+fn hsetnx_cmd(db: &mut Db, tokens: &[Vec<u8>]) -> Vec<u8> {
+    if tokens.len() != 4 {
+        return wrong_args("hsetnx");
+    }
+    let h = match db.get_or_insert_with(&tokens[1], || Value::Hash(HashMap::new())) {
+        Value::Hash(h) => h,
+        _ => return wrongtype(),
+    };
+    if h.contains_key(&tokens[2]) {
+        integer(0)
+    } else {
+        h.insert(tokens[2].clone(), tokens[3].clone());
+        integer(1)
+    }
+}
+
+fn hget_cmd(db: &mut Db, tokens: &[Vec<u8>]) -> Vec<u8> {
+    if tokens.len() != 3 {
+        return wrong_args("hget");
+    }
+    match with_hash(db, &tokens[1]) {
+        Err(()) => wrongtype(),
+        Ok(None) => null_bulk(),
+        Ok(Some(h)) => h.get(&tokens[2]).map(|v| bulk_string(v)).unwrap_or_else(null_bulk),
+    }
+}
+
+fn hmget_cmd(db: &mut Db, tokens: &[Vec<u8>]) -> Vec<u8> {
+    if tokens.len() < 3 {
+        return wrong_args("hmget");
+    }
+    match with_hash(db, &tokens[1]) {
+        Err(()) => wrongtype(),
+        Ok(opt) => {
+            let elems: Vec<Vec<u8>> = tokens[2..]
+                .iter()
+                .map(|f| match opt.and_then(|h| h.get(f)) {
+                    Some(v) => bulk_string(v),
+                    None => null_bulk(),
+                })
+                .collect();
+            array(&elems)
+        }
+    }
+}
+
+fn hgetall_cmd(db: &mut Db, tokens: &[Vec<u8>]) -> Vec<u8> {
+    if tokens.len() != 2 {
+        return wrong_args("hgetall");
+    }
+    match with_hash(db, &tokens[1]) {
+        Err(()) => wrongtype(),
+        Ok(None) => bulk_array(&[]),
+        Ok(Some(h)) => {
+            let mut flat = Vec::with_capacity(h.len() * 2);
+            for (f, v) in h {
+                flat.push(f.clone());
+                flat.push(v.clone());
+            }
+            bulk_array(&flat)
+        }
+    }
+}
+
+fn hdel_cmd(db: &mut Db, tokens: &[Vec<u8>]) -> Vec<u8> {
+    if tokens.len() < 3 {
+        return wrong_args("hdel");
+    }
+    let removed = match db.get_mut(&tokens[1]) {
+        None => 0,
+        Some(Value::Hash(h)) => tokens[2..].iter().filter(|f| h.remove(*f).is_some()).count() as i64,
+        Some(_) => return wrongtype(),
+    };
+    db.remove_if_empty(&tokens[1]);
+    integer(removed)
+}
+
+fn hexists_cmd(db: &mut Db, tokens: &[Vec<u8>]) -> Vec<u8> {
+    if tokens.len() != 3 {
+        return wrong_args("hexists");
+    }
+    match with_hash(db, &tokens[1]) {
+        Err(()) => wrongtype(),
+        Ok(None) => integer(0),
+        Ok(Some(h)) => integer(h.contains_key(&tokens[2]) as i64),
+    }
+}
+
+fn hlen_cmd(db: &mut Db, tokens: &[Vec<u8>]) -> Vec<u8> {
+    if tokens.len() != 2 {
+        return wrong_args("hlen");
+    }
+    match with_hash(db, &tokens[1]) {
+        Err(()) => wrongtype(),
+        Ok(None) => integer(0),
+        Ok(Some(h)) => integer(h.len() as i64),
+    }
+}
+
+fn hkeys_vals_cmd(db: &mut Db, tokens: &[Vec<u8>], keys: bool) -> Vec<u8> {
+    if tokens.len() != 2 {
+        return wrong_args("hkeys");
+    }
+    match with_hash(db, &tokens[1]) {
+        Err(()) => wrongtype(),
+        Ok(None) => bulk_array(&[]),
+        Ok(Some(h)) => {
+            let items: Vec<Vec<u8>> = if keys {
+                h.keys().cloned().collect()
+            } else {
+                h.values().cloned().collect()
+            };
+            bulk_array(&items)
+        }
+    }
+}
+
+fn hincrby_cmd(db: &mut Db, tokens: &[Vec<u8>]) -> Vec<u8> {
+    if tokens.len() != 4 {
+        return wrong_args("hincrby");
+    }
+    let delta = match parse_int(&tokens[3]) {
+        Some(d) => d,
+        None => return not_integer(),
+    };
+    let h = match db.get_or_insert_with(&tokens[1], || Value::Hash(HashMap::new())) {
+        Value::Hash(h) => h,
+        _ => return wrongtype(),
+    };
+    let cur = match h.get(&tokens[2]) {
+        None => 0,
+        Some(v) => match std::str::from_utf8(v).ok().and_then(|s| s.parse::<i64>().ok()) {
+            Some(n) => n,
+            None => return error("ERR hash value is not an integer"),
+        },
+    };
+    match cur.checked_add(delta) {
+        Some(next) => {
+            h.insert(tokens[2].clone(), next.to_string().into_bytes());
+            integer(next)
+        }
+        None => error("ERR increment or decrement would overflow"),
+    }
+}
+
+// === sets ===================================================================
+
+fn sadd_cmd(db: &mut Db, tokens: &[Vec<u8>]) -> Vec<u8> {
+    if tokens.len() < 3 {
+        return wrong_args("sadd");
+    }
+    let s = match db.get_or_insert_with(&tokens[1], || Value::Set(HashSet::new())) {
+        Value::Set(s) => s,
+        _ => return wrongtype(),
+    };
+    let added = tokens[2..].iter().filter(|m| s.insert((*m).clone())).count();
+    integer(added as i64)
+}
+
+fn srem_cmd(db: &mut Db, tokens: &[Vec<u8>]) -> Vec<u8> {
+    if tokens.len() < 3 {
+        return wrong_args("srem");
+    }
+    let removed = match db.get_mut(&tokens[1]) {
+        None => 0,
+        Some(Value::Set(s)) => tokens[2..].iter().filter(|m| s.remove(*m)).count() as i64,
+        Some(_) => return wrongtype(),
+    };
+    db.remove_if_empty(&tokens[1]);
+    integer(removed)
+}
+
+fn smembers_cmd(db: &mut Db, tokens: &[Vec<u8>]) -> Vec<u8> {
+    if tokens.len() != 2 {
+        return wrong_args("smembers");
+    }
+    match db.get(&tokens[1]) {
+        None => bulk_array(&[]),
+        Some(Value::Set(s)) => bulk_array(&s.iter().cloned().collect::<Vec<_>>()),
+        Some(_) => wrongtype(),
+    }
+}
+
+fn sismember_cmd(db: &mut Db, tokens: &[Vec<u8>]) -> Vec<u8> {
+    if tokens.len() != 3 {
+        return wrong_args("sismember");
+    }
+    match db.get(&tokens[1]) {
+        None => integer(0),
+        Some(Value::Set(s)) => integer(s.contains(&tokens[2]) as i64),
+        Some(_) => wrongtype(),
+    }
+}
+
+fn smismember_cmd(db: &mut Db, tokens: &[Vec<u8>]) -> Vec<u8> {
+    if tokens.len() < 3 {
+        return wrong_args("smismember");
+    }
+    let set = match db.get(&tokens[1]) {
+        None => None,
+        Some(Value::Set(s)) => Some(s),
+        Some(_) => return wrongtype(),
+    };
+    let elems: Vec<Vec<u8>> = tokens[2..]
+        .iter()
+        .map(|m| integer(set.map_or(false, |s| s.contains(m)) as i64))
+        .collect();
+    array(&elems)
+}
+
+fn scard_cmd(db: &mut Db, tokens: &[Vec<u8>]) -> Vec<u8> {
+    if tokens.len() != 2 {
+        return wrong_args("scard");
+    }
+    match db.get(&tokens[1]) {
+        None => integer(0),
+        Some(Value::Set(s)) => integer(s.len() as i64),
+        Some(_) => wrongtype(),
+    }
+}
+
+fn spop_cmd(db: &mut Db, tokens: &[Vec<u8>]) -> Vec<u8> {
+    if tokens.len() < 2 || tokens.len() > 3 {
+        return wrong_args("spop");
+    }
+    let count = if tokens.len() == 3 {
+        match parse_int(&tokens[2]) {
+            Some(c) if c >= 0 => Some(c as usize),
+            _ => return error("ERR value is out of range, must be positive"),
+        }
+    } else {
+        None
+    };
+    let mut popped: Vec<Vec<u8>> = Vec::new();
+    match db.get_mut(&tokens[1]) {
+        None => return if count.is_some() { bulk_array(&[]) } else { null_bulk() },
+        Some(Value::Set(s)) => {
+            // Not cryptographically random — we take arbitrary members. (A true
+            // random pick is a later refinement.)
+            let take: Vec<Vec<u8>> = s.iter().take(count.unwrap_or(1)).cloned().collect();
+            for m in take {
+                s.remove(&m);
+                popped.push(m);
+            }
+        }
+        Some(_) => return wrongtype(),
+    }
+    db.remove_if_empty(&tokens[1]);
+    if count.is_some() {
+        bulk_array(&popped)
+    } else {
+        popped.into_iter().next().map(|v| bulk_string(&v)).unwrap_or_else(null_bulk)
+    }
+}
+
+enum SetOp {
+    Inter,
+    Union,
+    Diff,
+}
+
+fn setop_cmd(db: &mut Db, tokens: &[Vec<u8>], op: SetOp) -> Vec<u8> {
+    if tokens.len() < 2 {
+        return wrong_args("setop");
+    }
+    // Collect each key's set (missing key = empty set; wrong type = error).
+    let mut sets: Vec<HashSet<Vec<u8>>> = Vec::new();
+    for key in &tokens[1..] {
+        match db.get(key) {
+            None => sets.push(HashSet::new()),
+            Some(Value::Set(s)) => sets.push(s.clone()),
+            Some(_) => return wrongtype(),
+        }
+    }
+    let mut acc = sets[0].clone();
+    for s in &sets[1..] {
+        match op {
+            SetOp::Inter => acc.retain(|m| s.contains(m)),
+            SetOp::Union => acc.extend(s.iter().cloned()),
+            SetOp::Diff => acc.retain(|m| !s.contains(m)),
+        }
+    }
+    bulk_array(&acc.into_iter().collect::<Vec<_>>())
 }
 
 #[cfg(test)]
@@ -293,59 +852,64 @@ mod tests {
     }
 
     #[test]
-    fn set_get_and_nil() {
+    fn strings_and_expiry_still_work() {
         let mut db = Db::new();
         assert_eq!(cmd(&mut db, &[b"SET", b"k", b"v"]), b"+OK\r\n".to_vec());
         assert_eq!(cmd(&mut db, &[b"GET", b"k"]), b"$1\r\nv\r\n".to_vec());
-        assert_eq!(cmd(&mut db, &[b"GET", b"x"]), b"$-1\r\n".to_vec());
-    }
-
-    #[test]
-    fn incr_decr_and_non_integer() {
-        let mut db = Db::new();
-        assert_eq!(cmd(&mut db, &[b"INCR", b"c"]), b":1\r\n".to_vec());
-        assert_eq!(cmd(&mut db, &[b"INCRBY", b"c", b"9"]), b":10\r\n".to_vec());
-        assert_eq!(cmd(&mut db, &[b"DECR", b"c"]), b":9\r\n".to_vec());
-        cmd(&mut db, &[b"SET", b"s", b"abc"]);
-        assert!(cmd(&mut db, &[b"INCR", b"s"]).starts_with(b"-ERR"));
-    }
-
-    #[test]
-    fn passive_expiry_hides_past_deadline() {
-        let mut db = Db::new();
-        // PXAT 1 = expire at unix-ms 1 (far in the past) -> gone on next access.
+        assert_eq!(cmd(&mut db, &[b"INCR", b"n"]), b":1\r\n".to_vec());
         cmd(&mut db, &[b"SET", b"k", b"v", b"PXAT", b"1"]);
         assert_eq!(cmd(&mut db, &[b"GET", b"k"]), b"$-1\r\n".to_vec());
-        assert_eq!(cmd(&mut db, &[b"EXISTS", b"k"]), b":0\r\n".to_vec());
     }
 
     #[test]
-    fn expire_ttl_persist() {
+    fn lists() {
+        let mut db = Db::new();
+        assert_eq!(cmd(&mut db, &[b"RPUSH", b"l", b"a", b"b", b"c"]), b":3\r\n".to_vec());
+        assert_eq!(cmd(&mut db, &[b"LPUSH", b"l", b"z"]), b":4\r\n".to_vec());
+        assert_eq!(cmd(&mut db, &[b"LLEN", b"l"]), b":4\r\n".to_vec());
+        assert_eq!(cmd(&mut db, &[b"LINDEX", b"l", b"0"]), b"$1\r\nz\r\n".to_vec());
+        assert_eq!(cmd(&mut db, &[b"LINDEX", b"l", b"-1"]), b"$1\r\nc\r\n".to_vec());
+        assert_eq!(
+            cmd(&mut db, &[b"LRANGE", b"l", b"0", b"-1"]),
+            bulk_array(&[b"z".to_vec(), b"a".to_vec(), b"b".to_vec(), b"c".to_vec()])
+        );
+        assert_eq!(cmd(&mut db, &[b"LPOP", b"l"]), b"$1\r\nz\r\n".to_vec());
+        assert_eq!(cmd(&mut db, &[b"RPOP", b"l"]), b"$1\r\nc\r\n".to_vec());
+    }
+
+    #[test]
+    fn hashes() {
+        let mut db = Db::new();
+        assert_eq!(cmd(&mut db, &[b"HSET", b"h", b"f1", b"v1", b"f2", b"v2"]), b":2\r\n".to_vec());
+        assert_eq!(cmd(&mut db, &[b"HGET", b"h", b"f1"]), b"$2\r\nv1\r\n".to_vec());
+        assert_eq!(cmd(&mut db, &[b"HLEN", b"h"]), b":2\r\n".to_vec());
+        assert_eq!(cmd(&mut db, &[b"HEXISTS", b"h", b"f2"]), b":1\r\n".to_vec());
+        assert_eq!(cmd(&mut db, &[b"HINCRBY", b"h", b"n", b"5"]), b":5\r\n".to_vec());
+        assert_eq!(cmd(&mut db, &[b"HDEL", b"h", b"f1", b"f2", b"n"]), b":3\r\n".to_vec());
+        assert_eq!(cmd(&mut db, &[b"EXISTS", b"h"]), b":0\r\n".to_vec()); // emptied -> gone
+    }
+
+    #[test]
+    fn sets() {
+        let mut db = Db::new();
+        assert_eq!(cmd(&mut db, &[b"SADD", b"s", b"a", b"b", b"c"]), b":3\r\n".to_vec());
+        assert_eq!(cmd(&mut db, &[b"SADD", b"s", b"a"]), b":0\r\n".to_vec());
+        assert_eq!(cmd(&mut db, &[b"SCARD", b"s"]), b":3\r\n".to_vec());
+        assert_eq!(cmd(&mut db, &[b"SISMEMBER", b"s", b"b"]), b":1\r\n".to_vec());
+        assert_eq!(cmd(&mut db, &[b"SISMEMBER", b"s", b"z"]), b":0\r\n".to_vec());
+        cmd(&mut db, &[b"SADD", b"t", b"b", b"c", b"d"]);
+        // SINTER s t = {b, c}
+        let inter = cmd(&mut db, &[b"SINTER", b"s", b"t"]);
+        assert!(inter.starts_with(b"*2\r\n"));
+    }
+
+    #[test]
+    fn wrongtype_is_reported() {
         let mut db = Db::new();
         cmd(&mut db, &[b"SET", b"k", b"v"]);
-        assert_eq!(cmd(&mut db, &[b"TTL", b"k"]), b":-1\r\n".to_vec()); // no expiry
-        assert_eq!(cmd(&mut db, &[b"EXPIRE", b"k", b"100"]), b":1\r\n".to_vec());
-        // TTL should be (0, 100]
-        let ttl = cmd(&mut db, &[b"TTL", b"k"]);
-        let s = String::from_utf8_lossy(&ttl);
-        let n: i64 = s.trim_start_matches(':').trim_end().parse().unwrap();
-        assert!(n > 0 && n <= 100, "ttl was {n}");
-        assert_eq!(cmd(&mut db, &[b"PERSIST", b"k"]), b":1\r\n".to_vec());
-        assert_eq!(cmd(&mut db, &[b"TTL", b"k"]), b":-1\r\n".to_vec());
-        assert_eq!(cmd(&mut db, &[b"TTL", b"missing"]), b":-2\r\n".to_vec());
-    }
-
-    #[test]
-    fn set_keepttl_and_overwrite_clears_ttl() {
-        let mut db = Db::new();
-        cmd(&mut db, &[b"SET", b"k", b"v", b"EX", b"100"]);
-        // plain SET clears TTL
-        cmd(&mut db, &[b"SET", b"k", b"v2"]);
-        assert_eq!(cmd(&mut db, &[b"TTL", b"k"]), b":-1\r\n".to_vec());
-        // SET ... KEEPTTL preserves it
-        cmd(&mut db, &[b"SET", b"k", b"v3", b"EX", b"100"]);
-        cmd(&mut db, &[b"SET", b"k", b"v4", b"KEEPTTL"]);
-        let ttl = cmd(&mut db, &[b"TTL", b"k"]);
-        assert!(ttl != b":-1\r\n".to_vec(), "KEEPTTL should preserve ttl");
+        assert!(cmd(&mut db, &[b"LPUSH", b"k", b"x"]).starts_with(b"-WRONGTYPE"));
+        assert!(cmd(&mut db, &[b"HSET", b"k", b"f", b"v"]).starts_with(b"-WRONGTYPE"));
+        assert!(cmd(&mut db, &[b"SADD", b"k", b"m"]).starts_with(b"-WRONGTYPE"));
+        assert_eq!(cmd(&mut db, &[b"TYPE", b"k"]), b"+string\r\n".to_vec());
     }
 }

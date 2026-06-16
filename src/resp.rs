@@ -139,6 +139,30 @@ pub fn null_bulk() -> Vec<u8> {
     b"$-1\r\n".to_vec()
 }
 
+/// The null array `*-1\r\n` (e.g. LPOP key count on a missing key).
+pub fn null_array() -> Vec<u8> {
+    b"*-1\r\n".to_vec()
+}
+
+/// An array of already-encoded elements: `*<n>\r\n` + each element verbatim.
+/// Use this when elements are a mix (e.g. some bulk strings, some nils).
+pub fn array(elements: &[Vec<u8>]) -> Vec<u8> {
+    let mut out = format!("*{}\r\n", elements.len()).into_bytes();
+    for e in elements {
+        out.extend_from_slice(e);
+    }
+    out
+}
+
+/// An array of bulk strings (the common case: LRANGE, SMEMBERS, HVALS, ...).
+pub fn bulk_array(items: &[Vec<u8>]) -> Vec<u8> {
+    let mut out = format!("*{}\r\n", items.len()).into_bytes();
+    for it in items {
+        out.extend_from_slice(&bulk_string(it));
+    }
+    out
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
