@@ -309,7 +309,9 @@ fn changefeed_snapshot_then_live_changes() {
         snap.contains("cdc-snapshot") && snap.contains("user:1") && snap.contains("alice"),
         "snapshot entry: {snap}"
     );
-    assert_eq!(feed.read_reply(), "[cdc-snapshot-done, 1]");
+    // snapshot-done now carries the count and the high-water offset (0 = none yet,
+    // since the pre-subscribe writes weren't retained on a default server).
+    assert_eq!(feed.read_reply(), "[cdc-snapshot-done, 1, 0]");
 
     // Live change on a matching key is pushed with its new value.
     w.cmd(&["SET", "user:2", "bob"]);
@@ -336,6 +338,52 @@ fn changefeed_snapshot_then_live_changes() {
     // ...but CDCUNSUBSCRIBE leaves push mode and restores normal commands.
     assert_eq!(feed.cmd(&["CDCUNSUBSCRIBE"]), "[cdc-unsubscribe]");
     assert_eq!(feed.cmd(&["GET", "user:2"]), "bob");
+}
+
+#[test]
+fn changefeed_offsets_retention_and_catchup() {
+    let s = Server::start_inner(&[("LOCUS_CDC_MAXLEN", "100")]);
+    let mut w = s.connect();
+    w.cmd(&["SET", "a", "1"]); // offset 1
+    w.cmd(&["SET", "b", "2"]); // offset 2
+    w.cmd(&["DEL", "a"]); // offset 3
+
+    let mut rd = s.connect();
+    // Full read from 0 returns all retained records in order, with offsets+values.
+    assert_eq!(
+        rd.cmd(&["CDCREAD", "0"]),
+        "[[1, write, a, 1], [2, write, b, 2], [3, del, a, (nil)]]"
+    );
+    // COUNT limits; PREFIX filters; catch-up reads only what's after an offset.
+    assert_eq!(
+        rd.cmd(&["CDCREAD", "0", "COUNT", "1"]),
+        "[[1, write, a, 1]]"
+    );
+    assert_eq!(
+        rd.cmd(&["CDCREAD", "0", "PREFIX", "b"]),
+        "[[2, write, b, 2]]"
+    );
+    assert_eq!(rd.cmd(&["CDCREAD", "2"]), "[[3, del, a, (nil)]]");
+    // Retention disabled on a default server -> error.
+    let s2 = Server::start();
+    assert!(s2.connect().cmd(&["CDCREAD", "0"]).starts_with("-ERR"));
+}
+
+#[test]
+fn changefeed_offset_out_of_range_when_truncated() {
+    let s = Server::start_inner(&[("LOCUS_CDC_MAXLEN", "2")]);
+    let mut w = s.connect();
+    for i in 0..5 {
+        w.cmd(&["SET", &format!("k{i}"), "v"]); // offsets 1..5, ring keeps last 2 (4,5)
+    }
+    let mut rd = s.connect();
+    // Reading from 0 fails: records 1..3 were dropped (consumer fell behind).
+    assert!(
+        rd.cmd(&["CDCREAD", "0"])
+            .starts_with("-ERR offset out of range")
+    );
+    // Reading from a still-retained offset works.
+    assert_eq!(rd.cmd(&["CDCREAD", "4"]), "[[5, write, k4, v]]");
 }
 
 // === pub/sub ================================================================

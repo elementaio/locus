@@ -12,6 +12,11 @@ All notable changes to Locus are documented here. The format is based on
   no gap or duplication (guaranteed by single-threaded execution). Values are inlined for string keys.
   Fed from the same modification choke points as WATCH/AOF/replication, so it never misses a write and
   never reports a no-op. The foundation for live-query and geofencing.
+- **Changefeed offsets + retention + `CDCREAD`** — every change carries a monotonic offset;
+  `CDCREAD <offset> [COUNT n] [PREFIX p]` pulls retained changes after an offset for reconnect catch-up.
+  Retention is opt-in via `LOCUS_CDC_MAXLEN` (a ring buffer); falling behind the retained window returns
+  `offset out of range`. `CDCSUBSCRIBE`'s `snapshot-done` now reports the high-water offset, and live
+  `cdc-change` messages now include their offset.
 
 ### Added (commands)
 - String commands: `MGET`, `MSET`, `MSETNX`, `SETNX`, `SETEX`, `PSETEX`, `GETSET`, `GETRANGE`,

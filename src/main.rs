@@ -19,7 +19,7 @@ mod rdb;
 mod resp;
 mod streams;
 
-use std::collections::{HashMap, HashSet};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::io::{self, Read, Write};
 use std::net::{TcpListener, TcpStream};
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -104,6 +104,18 @@ struct Hub {
     maxmemory: Option<usize>,
     // changefeed subscribers: client id -> key prefix (empty = all keys)
     changefeeds: HashMap<u64, Vec<u8>>,
+    // retained change-log (for CDCREAD catch-up); empty/unused when maxlen == 0
+    cdc_log: VecDeque<ChangeRecord>,
+    cdc_next_offset: u64,
+    cdc_maxlen: usize,
+}
+
+/// One retained keyspace change, addressable by a monotonic offset.
+struct ChangeRecord {
+    offset: u64,
+    event: Vec<u8>, // "write" | "del" | "expire"
+    key: Vec<u8>,
+    value: Option<Vec<u8>>, // new value for string writes; None otherwise
 }
 
 /// A client parked on a blocking XREAD.
@@ -166,6 +178,12 @@ impl Hub {
                 .and_then(|s| parse_mem(&s))
                 .filter(|&m| m > 0),
             changefeeds: HashMap::new(),
+            cdc_log: VecDeque::new(),
+            cdc_next_offset: 1, // offset 0 means "nothing yet"
+            cdc_maxlen: std::env::var("LOCUS_CDC_MAXLEN")
+                .ok()
+                .and_then(|s| s.trim().parse::<usize>().ok())
+                .unwrap_or(0),
         }
     }
 
@@ -378,6 +396,7 @@ impl Hub {
             b"PUBSUB" => self.handle_pubsub_introspect(id, &tokens),
             b"CDCSUBSCRIBE" => self.handle_cdc_subscribe(id, &tokens),
             b"CDCUNSUBSCRIBE" => self.handle_cdc_unsubscribe(id),
+            b"CDCREAD" => self.handle_cdc_read(id, &tokens),
             b"XREAD" => self.handle_xread(id, &tokens),
             b"HELLO" => self.handle_hello(id, &tokens),
 
@@ -515,11 +534,15 @@ impl Hub {
                 ]),
             );
         }
+        // The high-water offset tells the subscriber where live changes resume
+        // from, so it can CDCREAD that offset to catch up after a disconnect.
+        let hwm = self.cdc_next_offset.saturating_sub(1);
         self.send(
             id,
             resp::array(&[
                 resp::bulk_string(b"cdc-snapshot-done"),
                 resp::integer(n as i64),
+                resp::integer(hwm as i64),
             ]),
         );
     }
@@ -529,44 +552,153 @@ impl Hub {
         self.send(id, resp::array(&[resp::bulk_string(b"cdc-unsubscribe")]));
     }
 
-    /// Push a change to every changefeed subscriber whose prefix matches `key`.
-    fn push_change(&self, event: &[u8], key: &[u8], value: Option<&[u8]>) {
-        if self.changefeeds.is_empty() {
+    /// Record one keyspace change: assign an offset, push it live to matching
+    /// changefeed subscribers (with the offset), and retain it in the ring for
+    /// CDCREAD catch-up (when retention is enabled). No-op when there are neither
+    /// subscribers nor retention, so it costs nothing unless the feature is used.
+    fn record_change(&mut self, event: &[u8], key: &[u8], value: Option<Vec<u8>>) {
+        if self.changefeeds.is_empty() && self.cdc_maxlen == 0 {
             return;
         }
-        let val = match value {
-            Some(v) => resp::bulk_string(v),
-            None => resp::null_bulk(),
-        };
-        let msg = resp::array(&[
-            resp::bulk_string(b"cdc-change"),
-            resp::bulk_string(event),
-            resp::bulk_string(key),
-            val,
-        ]);
-        for (cid, prefix) in &self.changefeeds {
-            if key.starts_with(prefix) {
-                self.send(*cid, msg.clone());
+        let offset = self.cdc_next_offset;
+        self.cdc_next_offset += 1;
+        if !self.changefeeds.is_empty() {
+            let val = match &value {
+                Some(v) => resp::bulk_string(v),
+                None => resp::null_bulk(),
+            };
+            let msg = resp::array(&[
+                resp::bulk_string(b"cdc-change"),
+                resp::integer(offset as i64),
+                resp::bulk_string(event),
+                resp::bulk_string(key),
+                val,
+            ]);
+            for (cid, prefix) in &self.changefeeds {
+                if key.starts_with(prefix) {
+                    self.send(*cid, msg.clone());
+                }
             }
         }
+        if self.cdc_maxlen > 0 {
+            self.cdc_log.push_back(ChangeRecord {
+                offset,
+                event: event.to_vec(),
+                key: key.to_vec(),
+                value,
+            });
+            while self.cdc_log.len() > self.cdc_maxlen {
+                self.cdc_log.pop_front();
+            }
+        }
+    }
+
+    /// CDCREAD <offset> [COUNT n] [PREFIX p] — pull retained changes after an
+    /// offset (for catch-up after a disconnect). Non-blocking.
+    fn handle_cdc_read(&mut self, id: u64, tokens: &[Vec<u8>]) {
+        if tokens.len() < 2 {
+            return self.send(
+                id,
+                resp::error("ERR wrong number of arguments for 'cdcread' command"),
+            );
+        }
+        if self.cdc_maxlen == 0 {
+            return self.send(
+                id,
+                resp::error("ERR changefeed retention disabled (set LOCUS_CDC_MAXLEN)"),
+            );
+        }
+        let from = match std::str::from_utf8(&tokens[1])
+            .ok()
+            .and_then(|s| s.parse::<u64>().ok())
+        {
+            Some(o) => o,
+            None => {
+                return self.send(
+                    id,
+                    resp::error("ERR value is not an integer or out of range"),
+                );
+            }
+        };
+        let mut count: Option<usize> = None;
+        let mut prefix: Vec<u8> = Vec::new();
+        let mut i = 2;
+        while i < tokens.len() {
+            match tokens[i].to_ascii_uppercase().as_slice() {
+                b"COUNT" => {
+                    i += 1;
+                    count = match tokens
+                        .get(i)
+                        .and_then(|t| std::str::from_utf8(t).ok())
+                        .and_then(|s| s.parse::<usize>().ok())
+                    {
+                        Some(c) => Some(c),
+                        None => {
+                            return self.send(
+                                id,
+                                resp::error("ERR value is not an integer or out of range"),
+                            );
+                        }
+                    };
+                }
+                b"PREFIX" => {
+                    i += 1;
+                    prefix = match tokens.get(i) {
+                        Some(p) => p.clone(),
+                        None => return self.send(id, resp::error("ERR syntax error")),
+                    };
+                }
+                _ => return self.send(id, resp::error("ERR syntax error")),
+            }
+            i += 1;
+        }
+        // If the oldest retained record is newer than from+1, records were
+        // dropped — the consumer fell behind and must re-snapshot.
+        if let Some(front) = self.cdc_log.front()
+            && front.offset > from.saturating_add(1)
+        {
+            return self.send(
+                id,
+                resp::error("ERR offset out of range (changefeed history truncated)"),
+            );
+        }
+        let mut out: Vec<Vec<u8>> = Vec::new();
+        for rec in &self.cdc_log {
+            if rec.offset > from && rec.key.starts_with(&prefix) {
+                let val = match &rec.value {
+                    Some(v) => resp::bulk_string(v),
+                    None => resp::null_bulk(),
+                };
+                out.push(resp::array(&[
+                    resp::integer(rec.offset as i64),
+                    resp::bulk_string(&rec.event),
+                    resp::bulk_string(&rec.key),
+                    val,
+                ]));
+                if count.is_some_and(|c| c > 0 && out.len() >= c) {
+                    break;
+                }
+            }
+        }
+        self.send(id, resp::array(&out));
     }
 
     /// Emit changefeed events for the keys a write touched (called from exec_one
     /// after a confirmed modification). `Del` if the key is now gone, else
     /// `Write` (with the new value for strings).
     fn emit_write_changes(&mut self, tokens: &[Vec<u8>]) {
-        if self.changefeeds.is_empty() {
+        if self.changefeeds.is_empty() && self.cdc_maxlen == 0 {
             return;
         }
         let keys: Vec<Vec<u8>> = write_keys(tokens).iter().map(|k| k.to_vec()).collect();
         for key in keys {
-            // Read the post-command state, then push (no db borrow held across send).
+            // Read the post-command state, then record (no db borrow held across send).
             let (event, value): (&[u8], Option<Vec<u8>>) = match self.db.get(&key) {
                 Some(Value::Str(s)) => (b"write", Some(s.clone())),
                 Some(_) => (b"write", None), // non-string: change-only, client re-fetches
                 None => (b"del", None),
             };
-            self.push_change(event, &key, value.as_deref());
+            self.record_change(event, &key, value);
         }
     }
 
@@ -708,7 +840,7 @@ impl Hub {
     fn dirty_expired_watchers(&mut self) {
         for key in self.db.take_expired() {
             self.dirty_watchers(&key);
-            self.push_change(b"expire", &key, None);
+            self.record_change(b"expire", &key, None);
         }
     }
 
@@ -726,7 +858,7 @@ impl Hub {
             match self.db.evict_one() {
                 Some(key) => {
                     self.dirty_watchers(&key);
-                    self.push_change(b"del", &key, None);
+                    self.record_change(b"del", &key, None);
                     self.propagate(&[b"DEL".to_vec(), key]);
                 }
                 None => break, // keyspace empty — nothing left to evict

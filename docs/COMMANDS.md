@@ -104,11 +104,16 @@ single-threaded hub guarantees it). The connection enters push mode (like pub/su
 
 | Command | Notes |
 |---|---|
-| `CDCSUBSCRIBE [prefix]` | snapshot (`["cdc-snapshot", key, value]` …, then `["cdc-snapshot-done", count]`), then live `["cdc-change", write\|del\|expire, key, value]` |
+| `CDCSUBSCRIBE [prefix]` | snapshot (`["cdc-snapshot", key, value]` …, then `["cdc-snapshot-done", count, offset]`), then live `["cdc-change", offset, write\|del\|expire, key, value]` |
 | `CDCUNSUBSCRIBE` | leave push mode |
+| `CDCREAD <offset> [COUNT n] [PREFIX p]` | pull retained changes after `offset` (catch-up after a disconnect); each entry `[offset, event, key, value]` |
 
-Values are inlined for string keys; for other types the event signals the change and the client
-re-fetches. (Offsets / reconnect catch-up / consumer groups / geo-region filters are the next phases.)
+Every change carries a **monotonic offset**. Retention for `CDCREAD` is opt-in via
+`LOCUS_CDC_MAXLEN=<records>` (a ring buffer); reading from an offset older than what's retained returns
+`offset out of range` so a consumer knows to re-snapshot. `CDCSUBSCRIBE`'s `snapshot-done` reports the
+high-water offset, so a dropped subscriber can reconnect and `CDCREAD` that offset to catch up, then
+resubscribe. Values are inlined for string keys; other types signal change-only (client re-fetches).
+(Consumer groups / geo-region filters are the next phases.)
 
 ## Transactions
 
