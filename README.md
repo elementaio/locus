@@ -12,9 +12,19 @@ built around the same core idea that makes Redis elegant — **one thread execut
 every command is atomic by construction** — and it ships with no third-party crates: just the Rust
 standard library.
 
-> **Status:** v0.1.0 — a complete, working core (data types, persistence, replication, pub/sub,
-> transactions, streams). It is young and **not yet production-hardened**; treat it as a solid
-> foundation and a faithful, readable implementation rather than a drop-in production Redis.
+On top of that Redis-compatible core, Locus adds a **reactive, geo-first** layer that a vanilla Redis
+can't cleanly offer — because the single-threaded hub sees every mutation's before/after at one ordered
+point:
+
+- a reliable, ordered **[changefeed](docs/CHANGEFEED.md)** (snapshot + live deltas, offsets, consumer
+  groups) — keyspace notifications done right;
+- **[geo-first](docs/GEO.md)** objects with `GEOSEARCH` and **live geofencing** over the changefeed;
+- mergeable **[sketches](docs/SKETCHES.md)** (Bloom, Count-Min, Top-K, t-digest);
+- **CAS** write verbs and a drift-free **secondary index** (query by field).
+
+> **Status:** pre-1.0 and **not yet production-hardened** (no AUTH/TLS; single node). It is a faithful,
+> readable implementation with a complete data-type core *and* the full reactive/geo differentiator set
+> — a solid foundation rather than a drop-in production Redis. ~8k lines of `std`-only Rust, 9 modules.
 
 ```console
 $ cargo run
@@ -30,22 +40,37 @@ $ redis-cli -p 6379 get hello
 
 ## Features
 
-- **Data types:** strings, lists, hashes, sets, sorted sets, and streams — with full per-type command
-  sets and `WRONGTYPE` checks.
+**Redis-compatible core**
+
+- **Data types:** strings, lists, hashes, sets, sorted sets, streams, bitmaps — broad per-type command
+  coverage with `WRONGTYPE` checks. ~115 commands; see [docs/COMMANDS.md](docs/COMMANDS.md).
 - **Key expiration:** `SET ... EX/PX/EXAT/PXAT/NX/XX/KEEPTTL`, `EXPIRE`/`TTL`/`PERSIST`, with both
   passive (on-access) and active (background sampling) expiry.
+- **`maxmemory` + eviction:** soft memory cap with arbitrary-key eviction and `OOM` rejection.
 - **Persistence:** RDB-style binary snapshots (`SAVE`/`BGSAVE`) and an append-only file (AOF) with
   crash-safe, torn-tail-tolerant replay and `BGREWRITEAOF` compaction.
 - **Replication:** `REPLICAOF` master/replica with full-sync snapshot transfer + live command
-  streaming; read-only replicas; `INFO replication`.
-- **Pub/Sub:** `SUBSCRIBE`/`PSUBSCRIBE`/`PUBLISH` with glob pattern matching.
-- **Transactions:** `MULTI`/`EXEC`/`DISCARD` and `WATCH`/`UNWATCH` optimistic locking.
+  streaming; read-only replicas; `INFO`.
+- **Pub/Sub:** `SUBSCRIBE`/`PSUBSCRIBE`/`PUBLISH` with glob patterns.
+- **Transactions:** `MULTI`/`EXEC`/`DISCARD` and `WATCH`/`UNWATCH` (with correct EXECABORT + WATCH-on-expiry).
 - **Streams:** `XADD`/`XRANGE`/`XREAD`, including **blocking `XREAD`**.
 - **Protocol:** RESP2 + `HELLO` RESP3 negotiation; pipelining.
-- **Zero dependencies.** Pure `std`. One small, readable codebase (~3.8k lines across 8 modules).
 
-See [docs/COMMANDS.md](docs/COMMANDS.md) for the full command reference and
-[docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) for how it works inside.
+**Reactive + geo differentiators**
+
+- **[Changefeed](docs/CHANGEFEED.md):** `CDCSUBSCRIBE` (snapshot + live deltas, no gap/dup), offsets +
+  `CDCREAD` catch-up, and consumer groups — a reliable, ordered keyspace feed.
+- **[Geo-first](docs/GEO.md):** `GEOSET`/`GEOPOS`/`GEODIST`/`GEOSEARCH`, plus **live geofencing** via
+  `CDCSUBSCRIBE REGION`.
+- **[Sketches](docs/SKETCHES.md):** Bloom (dedup), Count-Min (trending), Top-K (heavy hitters),
+  t-digest (live percentiles).
+- **CAS verbs:** `CAS`/`CADEL`/`SETMAX`/`INCRCAP` — atomic check-and-write.
+- **Secondary index:** `IDXCREATE`/`IDXGET`/`IDXRANGE` — query by hash field, auto-maintained (no drift).
+
+**Zero dependencies.** Pure `std`, ~8k lines across 9 modules.
+
+See [docs/COMMANDS.md](docs/COMMANDS.md) for the full command reference, the guides above for the
+differentiators, and [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) for how it works inside.
 
 ---
 
@@ -80,6 +105,7 @@ Locus is configured entirely through environment variables (minimal config by de
 | `LOCUS_RDB` | `locus.rdb` | RDB snapshot file path |
 | `LOCUS_AOF` | _(off)_ | Set to a path (or `1`) to enable append-only persistence |
 | `LOCUS_MAXMEMORY` | _(unlimited)_ | Soft memory cap; accepts bytes or `kb`/`mb`/`gb` (e.g. `256mb`). Over the cap, a master evicts keys; writes get `OOM` only if the cap still can't be met |
+| `LOCUS_CDC_MAXLEN` | _(off)_ | Retained changefeed log size (records) for `CDCREAD` catch-up / consumer groups; `0`/unset = off (live `CDCSUBSCRIBE` still works) |
 
 ```console
 LOCUS_AOF=1 cargo run --release          # durable, append-only mode
@@ -148,18 +174,20 @@ sharding** (each shard its own single-threaded hub), which is on the roadmap rat
 
 ## Project status & roadmap
 
-The core is built and verified in twelve milestones (M0–M12); see [docs/ROADMAP.md](docs/ROADMAP.md).
+The Redis-compatible core was built in twelve milestones (M0–M12); the reactive + geo differentiator
+layer followed. See [docs/ROADMAP.md](docs/ROADMAP.md) for the full ledger.
 
-**Implemented:** strings · lists · hashes · sets · sorted sets · streams · expiry · RDB · AOF +
-recovery · pub/sub · replication · transactions · RESP3 negotiation · pipelining.
+**Implemented:** the Redis-compatible core (data types incl. bitmaps · expiry · `maxmemory` · RDB ·
+AOF + recovery · pub/sub · replication · transactions · streams · RESP3 negotiation · pipelining) **plus**
+the differentiators (changefeed with offsets/groups/geofencing · geo-first index · Bloom/Count-Min/Top-K/
+t-digest sketches · CAS verbs · secondary index).
 
-**Not yet implemented (deliberately deferred):** streams consumer groups; replication's deep tail
-(PSYNC partial resync, backlog, `WAIT`, automatic failover); a skiplist for O(log n) sorted-set ops;
-full RESP3 typing of every reply; thread-per-core multi-core execution.
+**Deliberately deferred:** AUTH/TLS; replication's deep tail (PSYNC partial resync, backlog, `WAIT`,
+failover); a skiplist for O(log n) sorted-set ops; a real S2/R-tree geo index + combined filters +
+spatial clustering; thread-per-core execution; multiple logical DBs.
 
-Locus is evolving toward a **geo-first, reactive** datastore — first-class geospatial indexing with
-combined attribute filters, and a change-log / changefeed primitive for live queries. Those are the
-next phase.
+The next major arc is **geo phase 3** — a real spatial index, combined attribute filters, and the
+horizontal **spatial clustering** that nobody in the in-memory-geo space has packaged simply.
 
 ---
 

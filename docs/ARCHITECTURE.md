@@ -1,7 +1,8 @@
 # Architecture
 
 Locus is small on purpose. This document explains how it's put together and the design choices behind
-it. The whole server is ~3.8k lines of `std`-only Rust across 8 modules.
+it. The whole server is ~8k lines of `std`-only Rust across 9 modules — a Redis-compatible core plus a
+reactive/geo differentiator layer, all on one single-threaded hub.
 
 ## Design philosophy
 
@@ -38,9 +39,13 @@ client ─┤  read + parse     │── Msg::Command ─▶ chan ─▶│    
   channel. *Every* byte sent to a client — command replies, pub/sub messages, replicated writes — goes
   through this one writer, so writes never interleave.
 - **The hub (one thread for the whole server):** owns the keyspace, the pub/sub registry, replication
-  state, per-client transaction state, and parked blocking-readers. It processes one message at a time:
-  a new connection, a command, a disconnect, or a replica snapshot. Because all command execution
-  funnels through here, it's serialized — atomic by construction.
+  state, per-client transaction state, parked blocking-readers, the changefeed (subscribers + retained
+  log + consumer groups), and the secondary indexes. It processes one message at a time: a new
+  connection, a command, a disconnect, or a replica snapshot. Because all command execution funnels
+  through here, it's serialized — atomic by construction. This single choke point is also *why* the
+  reactive layer is correct: every mutation passes one ordered point that holds old+new state, so the
+  changefeed, the geo-key index, and the secondary indexes can be kept in lockstep with the data with no
+  races and no drift.
 
 This is the Redis bet expressed in Rust: trade multi-core throughput for simplicity and predictable
 latency. The borrow checker actively reinforces it — the moment you reach for shared mutable state you
@@ -51,18 +56,22 @@ feel why the single-owner model is cleaner.
 | Module | Responsibility |
 |---|---|
 | `resp` | RESP2 wire protocol: the resumable parser and the reply encoders. |
-| `db` | The keyspace, the typed `Value` enum, and key expiration (passive + active). |
-| `commands` | Command dispatch and the per-type implementations (strings, lists, hashes, sets, sorted sets). |
+| `db` | The keyspace, the typed `Value` enum, key expiration (passive + active), memory accounting, and the geo-key index. |
+| `commands` | Command dispatch, the single command table (arity + write-flag), and the per-type implementations (strings, keyspace, lists, sets, sorted sets, bitmaps, geo, sketches, CAS). |
 | `streams` | The stream type and its commands (XADD/XRANGE/XREAD). |
+| `sketch` | Probabilistic sketches: Bloom, Count-Min, Top-K, t-digest. |
 | `pubsub` | The publish/subscribe registry, glob matching, and message encoders. |
 | `rdb` | Binary snapshot serialization (save/load + in-memory serialize for replication). |
 | `aof` | The append-only log: append, replay, rewrite, and command rewriting for determinism. |
-| `main` | The hub, the connection threads, and replication. |
+| `main` | The hub, the connection threads, replication, the changefeed, and secondary indexes. |
 
 ## Values and expiry
 
-A key maps to a `Value` — one of `Str`, `List`, `Hash`, `Set`, `ZSet`, or `Stream`. Commands type-check
-and return `WRONGTYPE` on a mismatch. Empty collections are removed automatically (as in Redis).
+A key maps to a `Value` — one of `Str`, `List`, `Hash`, `Set`, `ZSet`, `Stream`, `Geo` (a lon/lat
+point), `Bloom`, `Cms`, `TopK`, or `TDigest`. Commands type-check and return `WRONGTYPE` on a mismatch.
+Empty collections are removed automatically (as in Redis). Every value kind serializes in the RDB
+format and survives AOF rewrite (sketches restore via a raw-load command, since they can't be rebuilt
+from their add-history).
 
 Expiry deadlines live in a separate map (`key -> expire-at-ms`):
 
@@ -116,3 +125,52 @@ dirty, and `EXEC` then aborts to nil. As in Redis, there is no rollback on a run
 `XADD` arrives, the hub re-checks parked readers and wakes any that can now read; on the hub's periodic
 tick, readers past their `BLOCK` deadline are woken with nil. The same parking pattern is how blocking
 commands avoid tying up a thread per blocked client.
+
+## Memory accounting & eviction
+
+`maxmemory` (`LOCUS_MAXMEMORY`) bounds dataset growth. The keyspace keeps an approximate `used_memory`
+total: a per-key size estimate is folded in by `resync_size` after every write (so in-place collection
+growth counts) and dropped on every removal path. Before a write on a master, the hub evicts arbitrary
+keys until under the cap; if it still can't fit, the write is rejected with `OOM`. Evictions are
+streamed to replicas/AOF as `DEL` and dirty WATCHers — exactly like a client delete, so snapshots and
+replicas stay consistent. Accounting is deliberately coarse (no allocator introspection in zero-deps
+`std`) — enough to bound growth, not byte-exact. `INFO` exposes `used_memory` and `maxmemory`.
+
+## The changefeed (reactive layer)
+
+The hub records every keyspace mutation through one `record_change` call, fed from the **same choke
+points** as WATCH/AOF/replication (writes via the modified-key set, plus expiry and eviction). From that
+one ordered stream it serves three consumption modes — broadcast push (`CDCSUBSCRIBE`), offset-addressed
+pull (`CDCREAD`, backed by an optional retained ring), and load-balanced consumer groups
+(`CDCREADGROUP`) — and live geofencing (`CDCSUBSCRIBE REGION`). Because subscriber registration and the
+initial snapshot happen in the same hub turn, snapshot-then-tail is gap-free and dup-free without
+offsets. Full details in [CHANGEFEED.md](CHANGEFEED.md).
+
+## Geo
+
+A geo object is its own key holding a `Geo(lon, lat)` value; the keyspace maintains a set of geo keys as
+the `GEOSEARCH` candidate set. Search filters candidates by true haversine distance (a real S2/R-tree
+index is the documented next phase; the interface won't change). Because geo writes flow through the
+changefeed like any other, a *region* filter yields live geofencing. See [GEO.md](GEO.md).
+
+## Sketches
+
+Bloom, Count-Min, Top-K, and t-digest live in the `sketch` module as `Value` variants. They're
+zero-dep (hashing via `std`'s fixed-key `DefaultHasher`, so they're deterministic across runs),
+auto-sized, and RDB/AOF-persistent. AOF rewrite restores each via a raw-load command, since a sketch
+can't be rebuilt from its add-history. See [SKETCHES.md](SKETCHES.md).
+
+## Secondary indexes
+
+A named index over a hash field is `{ forward: BTreeMap<value → keys>, reverse: key → value }`. After
+every write (and on expiry/eviction) the hub re-indexes the touched key from its current state — remove
+the old bucket entry, add the new one — in the same hub turn as the write. So the index can never drift
+from the data and there is no crash-time reconciliation, the failure mode hand-rolled Redis indexes
+suffer. `IDXGET` is an equality lookup; `IDXRANGE` is a lexicographic range over the `BTreeMap`.
+In-memory (rebuilt by `IDXCREATE` after a restart).
+
+## Conditional writes (CAS)
+
+`CAS`/`CADEL`/`SETMAX`/`INCRCAP` are atomic check-and-write: because the check and the write happen in
+one hub turn, there's no race and no need for `WATCH`/Lua. They log their concrete *effect* to the AOF
+(`SET`/`DEL`) so replay and replication stay deterministic.

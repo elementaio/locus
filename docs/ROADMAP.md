@@ -21,25 +21,34 @@ Locus was built in twelve incremental milestones, each one shippable and verifie
 | M11 | Streams — `XADD`/`XRANGE`/`XREAD` + blocking |
 | M12 | RESP3 (`HELLO`), pipelining, benchmarking |
 
+## Built — beyond the core (the differentiator layer)
+
+On top of M0–M12, the reactive + geo-first vision is now implemented:
+
+| Area | What |
+|---|---|
+| Hardening | TTL-overflow fix, transaction correctness (EXECABORT, WATCH-on-expiry, no-op-WATCH), `maxmemory` + eviction, parser DoS bounds, single command table |
+| Command coverage | strings, keyspace, lists, sets, sorted sets, bitmaps, random — a broad Redis-compatible surface |
+| **Changefeed** | `CDCSUBSCRIBE` (snapshot + live, no gap/dup), offsets + `CDCREAD` catch-up, consumer groups |
+| **Geo** | `GEOSET`/`GEOPOS`/`GEODIST`/`GEOSEARCH` + **live geofencing** (`CDCSUBSCRIBE REGION`) |
+| **Sketches** | Bloom, Count-Min, Top-K, t-digest |
+| **CAS verbs** | `CAS`/`CADEL`/`SETMAX`/`INCRCAP` |
+| **Secondary index** | `IDXCREATE`/`IDXGET`/`IDXRANGE` — query by field, auto-maintained |
+
+See [CHANGEFEED.md](CHANGEFEED.md), [GEO.md](GEO.md), [SKETCHES.md](SKETCHES.md).
+
 ## Deferred (known, intentional)
 
-These are real features left out to keep each milestone complete and the codebase honest:
-
-- Streams **consumer groups** (`XGROUP`/`XREADGROUP`/`XACK`)
 - Replication's deep tail: **PSYNC partial resync**, replication backlog, `WAIT`, automatic **failover**
 - A **skiplist** for O(log n) sorted-set rank/range (currently correct sort-on-demand)
+- **AUTH / ACL / TLS**; multiple logical DBs (only DB 0)
 - **Full RESP3 typing** of every reply (we negotiate `HELLO` but keep RESP2-compatible encoders)
 - **Thread-per-core** execution for multi-core throughput
 
-## Future direction
+## Next major arc — geo phase 3 & clustering
 
-Locus is evolving toward a **geo-first, reactive** datastore:
-
-- **First-class geospatial indexing** with combined attribute filters and sort-by-distance — the kind
-  of "nearby + filter + sort + paginate" query that's painful elsewhere.
-- A **change-log / changefeed** primitive: subscribe to a key-prefix (or region) and receive a snapshot
-  followed by live deltas.
-- **Compare-and-swap** write verbs and **mergeable probabilistic sketches** (Count-Min, Top-K,
-  t-digest) as first-class, dependency-light primitives.
-
-The Redis-compatible core in this repo is the foundation those build on.
+- A real **S2-cell / R-tree** spatial index (sub-linear `GEOSEARCH`) with **combined attribute filters**
+  (`nearby AND status=…`) and keyset pagination.
+- **Spatial clustering** — horizontal sharding that preserves locality — the empty market intersection
+  (in-memory · geo-first · clustered) that even Tile38 leaves open.
+- Adopt-later primitives: per-element TTL, per-command durability, time-based changefeed retention.
