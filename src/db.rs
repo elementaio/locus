@@ -26,6 +26,10 @@ pub enum Value {
     /// a skiplist for O(log n) rank/range is the documented later optimization.
     ZSet(HashMap<Vec<u8>, f64>),
     Stream(Stream),
+    /// A geo point `(lon, lat)`. Each geo object is its own key (the geo-first
+    /// model): a spatial index over these keys powers GEOSEARCH and, later, the
+    /// region changefeed.
+    Geo(f64, f64),
 }
 
 /// A stream entry id: (milliseconds, sequence).
@@ -58,6 +62,7 @@ impl Value {
             Value::Set(_) => "set",
             Value::ZSet(_) => "zset",
             Value::Stream(_) => "stream",
+            Value::Geo(..) => "geo",
         }
     }
 
@@ -68,7 +73,7 @@ impl Value {
             Value::Set(s) => s.is_empty(),
             Value::ZSet(z) => z.is_empty(),
             Value::Stream(s) => s.entries.is_empty(),
-            Value::Str(_) => false,
+            Value::Str(_) | Value::Geo(..) => false,
         }
     }
 }
@@ -86,6 +91,9 @@ pub struct Db {
     /// `estimate_size`) — enough to bound growth, not byte-exact like Redis.
     mem_used: usize,
     sizes: HashMap<Vec<u8>, usize>,
+    /// The set of keys holding a geo point — the candidate set for GEOSEARCH.
+    /// Maintained on insert and on every removal (via `forget_size`).
+    geo_keys: HashSet<Vec<u8>>,
 }
 
 impl Db {
@@ -96,6 +104,7 @@ impl Db {
             expired: Vec::new(),
             mem_used: 0,
             sizes: HashMap::new(),
+            geo_keys: HashSet::new(),
         }
     }
 
@@ -142,10 +151,19 @@ impl Db {
         }
     }
 
+    /// Drop per-key tracking when a key is removed (called from every removal
+    /// path): memory accounting and the geo-key index.
     fn forget_size(&mut self, key: &[u8]) {
         if let Some(sz) = self.sizes.remove(key) {
             self.mem_used = self.mem_used.saturating_sub(sz);
         }
+        self.geo_keys.remove(key);
+    }
+
+    /// Candidate keys for GEOSEARCH (those holding a geo point). The caller
+    /// re-reads each via `get` (which skips expired keys).
+    pub fn geo_keys(&self) -> Vec<Vec<u8>> {
+        self.geo_keys.iter().cloned().collect()
     }
 
     /// Evict one arbitrary key (HashMap order — not true LRU/random; that's a
@@ -170,6 +188,11 @@ impl Db {
     }
 
     pub fn insert(&mut self, key: Vec<u8>, value: Value) {
+        if matches!(value, Value::Geo(..)) {
+            self.geo_keys.insert(key.clone());
+        } else {
+            self.geo_keys.remove(&key); // overwriting a geo key with another type
+        }
         self.data.insert(key, value);
     }
 
@@ -277,6 +300,7 @@ impl Db {
         self.expires.clear();
         self.sizes.clear();
         self.mem_used = 0;
+        self.geo_keys.clear();
     }
 
     // --- persistence support (used by the RDB snapshot module) ---
@@ -292,6 +316,9 @@ impl Db {
     pub fn insert_with_expire(&mut self, key: Vec<u8>, value: Value, expire: Option<u64>) {
         if let Some(deadline) = expire {
             self.expires.insert(key.clone(), deadline);
+        }
+        if matches!(value, Value::Geo(..)) {
+            self.geo_keys.insert(key.clone());
         }
         self.data.insert(key.clone(), value);
         self.resync_size(&key); // loaded data counts toward used memory
@@ -322,6 +349,7 @@ fn estimate_size(key_len: usize, v: &Value) -> usize {
                     + 24
             })
             .sum(),
+        Value::Geo(..) => 16, // two f64
     };
     KEY_OVH + key_len + val
 }

@@ -292,6 +292,101 @@ fn keys_and_dbsize_over_the_wire() {
     );
 }
 
+// === geo ====================================================================
+
+#[test]
+fn geo_search_and_distance() {
+    let s = Server::start();
+    let mut c = s.connect();
+    // Palermo & Catania — Redis's canonical example.
+    assert_eq!(
+        c.cmd(&["GEOSET", "Palermo", "13.361389", "38.115556"]),
+        "OK"
+    );
+    assert_eq!(
+        c.cmd(&["GEOSET", "Catania", "15.087269", "37.502669"]),
+        "OK"
+    );
+    assert_eq!(c.cmd(&["TYPE", "Palermo"]), "geo");
+
+    // GEOPOS round-trips the stored coordinates; missing -> nil.
+    let pos = c.cmd(&["GEOPOS", "Palermo", "missing"]);
+    assert!(
+        pos.contains("13.3613") && pos.contains("38.1155") && pos.contains("(nil)"),
+        "geopos: {pos}"
+    );
+
+    // GEODIST ~166 km (within tolerance of Redis's 166274.1516 m).
+    let m: f64 = c.cmd(&["GEODIST", "Palermo", "Catania"]).parse().unwrap();
+    assert!((m - 166274.0).abs() < 500.0, "dist m: {m}");
+    let km: f64 = c
+        .cmd(&["GEODIST", "Palermo", "Catania", "km"])
+        .parse()
+        .unwrap();
+    assert!((km - 166.27).abs() < 1.0, "dist km: {km}");
+    assert_eq!(c.cmd(&["GEODIST", "Palermo", "nope"]), "(nil)");
+
+    // GEOSEARCH BYRADIUS: 200km finds both (ASC by distance), 100km only Palermo.
+    assert_eq!(
+        c.cmd(&[
+            "GEOSEARCH",
+            "FROMKEY",
+            "Palermo",
+            "BYRADIUS",
+            "200",
+            "km",
+            "ASC"
+        ]),
+        "[Palermo, Catania]"
+    );
+    assert_eq!(
+        c.cmd(&[
+            "GEOSEARCH",
+            "FROMLONLAT",
+            "13.361389",
+            "38.115556",
+            "BYRADIUS",
+            "100",
+            "km"
+        ]),
+        "[Palermo]"
+    );
+    // WITHDIST: closest first, distance in the search unit (km).
+    let wd = c.cmd(&[
+        "GEOSEARCH",
+        "FROMKEY",
+        "Palermo",
+        "BYRADIUS",
+        "200",
+        "km",
+        "ASC",
+        "WITHDIST",
+    ]);
+    assert!(wd.starts_with("[[Palermo, 0.0000]"), "withdist: {wd}");
+    // BYBOX (400km square) covers both.
+    let bx = c.cmd(&[
+        "GEOSEARCH",
+        "FROMKEY",
+        "Palermo",
+        "BYBOX",
+        "400",
+        "400",
+        "km",
+        "ASC",
+    ]);
+    assert!(
+        bx.contains("Palermo") && bx.contains("Catania"),
+        "bybox: {bx}"
+    );
+
+    // WRONGTYPE on a non-geo key.
+    c.cmd(&["SET", "str", "x"]);
+    assert!(
+        c.cmd(&["GEODIST", "str", "Palermo"])
+            .starts_with("-WRONGTYPE")
+    );
+}
+
 // === changefeed =============================================================
 
 #[test]

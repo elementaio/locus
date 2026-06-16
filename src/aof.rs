@@ -283,6 +283,12 @@ fn reconstruct(key: &[u8], value: &Value) -> Vec<Vec<Vec<u8>>> {
                 c
             })
             .collect(),
+        Value::Geo(lon, lat) => vec![vec![
+            b"GEOSET".to_vec(),
+            k,
+            format!("{lon}").into_bytes(),
+            format!("{lat}").into_bytes(),
+        ]],
     }
 }
 

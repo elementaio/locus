@@ -6,6 +6,12 @@ All notable changes to Locus are documented here. The format is based on
 
 ## [Unreleased]
 
+### Added (geo — the geo-first differentiator)
+- **Geo commands** `GEOSET`, `GEOPOS`, `GEODIST`, `GEOSEARCH` (`BYRADIUS`/`BYBOX`, `FROMLONLAT`/`FROMKEY`,
+  `ASC`/`DESC`, `COUNT`, `WITHCOORD`/`WITHDIST`). Geo-first model: each object is its own key
+  (`Value::Geo`), with a geo-key index for search and full RDB/AOF persistence. Haversine distance.
+  (Next: live region geofencing over the changefeed; a real S2/R-tree index with combined filters.)
+
 ### Added (changefeed — the reactive differentiator)
 - **`CDCSUBSCRIBE [prefix]` / `CDCUNSUBSCRIBE`** — a reliable, ordered keyspace changefeed: an atomic
   snapshot of matching keys followed by a live stream of every change (`write`/`del`/`expire`), with

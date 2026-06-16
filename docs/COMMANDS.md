@@ -53,6 +53,21 @@ works. This is a curated subset of Redis — the common, useful commands per typ
 `LINDEX` `LSET` `LINSERT key BEFORE|AFTER pivot value` `LREM key count value` `LTRIM key start stop`
 `LPOS key value [RANK r] [COUNT n]` `RPOPLPUSH src dst` `LMOVE src dst LEFT|RIGHT LEFT|RIGHT`
 
+## Geo (geo-first)
+
+Each geo object is its **own key** holding a point (the geo-first model, not Redis's members-in-a-zset).
+A spatial index over geo keys powers search; persists via RDB/AOF.
+
+| Command | Notes |
+|---|---|
+| `GEOSET key <lon> <lat>` | set/overwrite a key's point (lon ∈ ±180, lat ∈ ±85.05) |
+| `GEOPOS key [key ...]` | `[lon, lat]` per key (nil if missing / not geo) |
+| `GEODIST key1 key2 [m\|km\|mi\|ft]` | great-circle (haversine) distance |
+| `GEOSEARCH FROMLONLAT lon lat \| FROMKEY key  BYRADIUS r unit \| BYBOX w h unit  [ASC\|DESC] [COUNT n] [WITHCOORD] [WITHDIST]` | keys within a radius/box, optionally sorted by distance |
+
+(Live geofencing — `CDCSUBSCRIBE REGION …` over the changefeed — and a real S2/R-tree index with
+combined attribute filters are the next phases.)
+
 ## Bitmaps
 
 `SETBIT key offset 0|1` `GETBIT key offset` `BITCOUNT key [start end [BYTE\|BIT]]`

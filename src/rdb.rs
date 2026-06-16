@@ -61,6 +61,7 @@ fn write_value<W: Write>(w: &mut W, key: &[u8], v: &Value) -> io::Result<()> {
         Value::Set(_) => 3,
         Value::ZSet(_) => 4,
         Value::Stream(_) => 5,
+        Value::Geo(..) => 6,
     };
     w.write_all(&[tag])?;
     write_bytes(w, key)?;
@@ -105,6 +106,10 @@ fn write_value<W: Write>(w: &mut W, key: &[u8], v: &Value) -> io::Result<()> {
                     write_bytes(w, v)?;
                 }
             }
+        }
+        Value::Geo(lon, lat) => {
+            w.write_all(&lon.to_le_bytes())?;
+            w.write_all(&lat.to_le_bytes())?;
         }
     }
     Ok(())
@@ -239,6 +244,7 @@ fn read_value<R: Read>(r: &mut R, tag: u8) -> io::Result<Value> {
             }
             Value::Stream(Stream { entries, last_id })
         }
+        6 => Value::Geo(read_f64(r)?, read_f64(r)?),
         _ => {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidData,

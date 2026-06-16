@@ -210,6 +210,11 @@ pub fn execute(tokens: &[Vec<u8>], db: &mut Db) -> Vec<u8> {
         b"ZREMRANGEBYSCORE" => zremrangebyscore_cmd(db, tokens),
         b"ZUNIONSTORE" => zstore_cmd(db, tokens, false),
         b"ZINTERSTORE" => zstore_cmd(db, tokens, true),
+        // geo (geo-first: each object is its own key)
+        b"GEOSET" => geoset_cmd(db, tokens),
+        b"GEOPOS" => geopos_cmd(db, tokens),
+        b"GEODIST" => geodist_cmd(db, tokens),
+        b"GEOSEARCH" => geosearch_cmd(db, tokens),
         // streams (XREAD is handled in the hub for blocking support)
         b"XADD" => streams::xadd(db, tokens),
         b"XLEN" => streams::xlen(db, tokens),
@@ -270,7 +275,7 @@ pub fn command_meta(cmd: &[u8]) -> Option<CmdMeta> {
         | b"HLEN" | b"HKEYS" | b"HVALS" | b"SMEMBERS" | b"SCARD" | b"ZCARD" | b"XLEN"
         | b"EXISTS" | b"TOUCH" | b"KEYS" | b"MGET" | b"SINTER" | b"SUNION" | b"SDIFF"
         | b"WATCH" | b"SUBSCRIBE" | b"PSUBSCRIBE" | b"PUBSUB" | b"BITCOUNT" | b"SRANDMEMBER"
-        | b"SELECT" | b"CDCREAD" | b"CDCPENDING" => (2, false),
+        | b"SELECT" | b"CDCREAD" | b"CDCPENDING" | b"GEOPOS" => (2, false),
         // arity 2 writes
         b"PERSIST" | b"INCR" | b"DECR" | b"GETDEL" | b"LPOP" | b"RPOP" | b"SPOP" | b"ZPOPMIN"
         | b"ZPOPMAX" | b"DEL" | b"UNLINK" => (2, true),
@@ -278,7 +283,7 @@ pub fn command_meta(cmd: &[u8]) -> Option<CmdMeta> {
         b"LINDEX" | b"HGET" | b"HEXISTS" | b"HMGET" | b"SISMEMBER" | b"SMISMEMBER" | b"ZSCORE"
         | b"ZMSCORE" | b"ZRANK" | b"ZREVRANK" | b"PUBLISH" | b"REPLICAOF" | b"SLAVEOF"
         | b"LPOS" | b"SINTERCARD" | b"GETBIT" | b"BITPOS" | b"CDCGROUP" | b"CDCREADGROUP"
-        | b"CDCACK" => (3, false),
+        | b"CDCACK" | b"GEODIST" => (3, false),
         // arity 3 writes
         b"INCRBY" | b"DECRBY" | b"APPEND" | b"HDEL" | b"SADD" | b"SREM" | b"ZREM" | b"EXPIRE"
         | b"PEXPIRE" | b"EXPIREAT" | b"PEXPIREAT" | b"LPUSH" | b"RPUSH" | b"LPUSHX" | b"RPUSHX"
@@ -290,9 +295,12 @@ pub fn command_meta(cmd: &[u8]) -> Option<CmdMeta> {
         // arity 4 writes
         b"LSET" | b"HSET" | b"HSETNX" | b"HINCRBY" | b"ZADD" | b"ZINCRBY" | b"SETEX"
         | b"PSETEX" | b"SETRANGE" | b"LREM" | b"LTRIM" | b"SMOVE" | b"ZREMRANGEBYRANK"
-        | b"ZREMRANGEBYSCORE" | b"ZUNIONSTORE" | b"ZINTERSTORE" | b"SETBIT" | b"BITOP" => (4, true),
+        | b"ZREMRANGEBYSCORE" | b"ZUNIONSTORE" | b"ZINTERSTORE" | b"SETBIT" | b"BITOP"
+        | b"GEOSET" => (4, true),
         // arity 5 writes
         b"XADD" | b"LINSERT" | b"LMOVE" => (5, true),
+        // geosearch: GEOSEARCH FROMKEY k BYRADIUS r unit (6) is the shortest form
+        b"GEOSEARCH" => (6, false),
         _ => return None,
     };
     Some(CmdMeta { min_arity, write })
@@ -2578,6 +2586,258 @@ fn zstore_cmd(db: &mut Db, tokens: &[Vec<u8>], inter: bool) -> Vec<u8> {
     integer(n as i64)
 }
 
+// === geo ====================================================================
+//
+// Geo-first model: each object is its own key holding a `Value::Geo(lon, lat)`.
+// GEOSEARCH scans the keyspace's geo-key candidate set (see `Db::geo_keys`).
+
+const EARTH_R_M: f64 = 6_372_797.560_856; // Redis's earth radius, in meters
+
+fn geo_unit(u: &[u8]) -> Option<f64> {
+    match u.to_ascii_lowercase().as_slice() {
+        b"m" => Some(1.0),
+        b"km" => Some(1000.0),
+        b"mi" => Some(1609.34),
+        b"ft" => Some(0.3048),
+        _ => None,
+    }
+}
+
+/// Great-circle distance in meters (haversine).
+fn haversine_m(lon1: f64, lat1: f64, lon2: f64, lat2: f64) -> f64 {
+    let (p1, p2) = (lat1.to_radians(), lat2.to_radians());
+    let dlat = (lat2 - lat1).to_radians();
+    let dlon = (lon2 - lon1).to_radians();
+    let a = (dlat / 2.0).sin().powi(2) + p1.cos() * p2.cos() * (dlon / 2.0).sin().powi(2);
+    2.0 * EARTH_R_M * a.sqrt().min(1.0).asin()
+}
+
+fn fmt_coord(x: f64) -> Vec<u8> {
+    format!("{x}").into_bytes()
+}
+
+/// Fetch a key's geo point. `Err(())` = the key holds a non-geo value.
+fn geo_point(db: &mut Db, key: &[u8]) -> Result<Option<(f64, f64)>, ()> {
+    match db.get(key) {
+        None => Ok(None),
+        Some(Value::Geo(lon, lat)) => Ok(Some((*lon, *lat))),
+        Some(_) => Err(()),
+    }
+}
+
+fn geoset_cmd(db: &mut Db, tokens: &[Vec<u8>]) -> Vec<u8> {
+    if tokens.len() != 4 {
+        return wrong_args("geoset");
+    }
+    let (lon, lat) = match (
+        parse_finite_float(&tokens[2]),
+        parse_finite_float(&tokens[3]),
+    ) {
+        (Some(a), Some(b)) => (a, b),
+        _ => return error("ERR value is not a valid float"),
+    };
+    if !(-180.0..=180.0).contains(&lon) || !(-85.051_128_78..=85.051_128_78).contains(&lat) {
+        return error("ERR invalid longitude,latitude pair");
+    }
+    db.insert(tokens[1].clone(), Value::Geo(lon, lat));
+    simple_string("OK")
+}
+
+fn geopos_cmd(db: &mut Db, tokens: &[Vec<u8>]) -> Vec<u8> {
+    if tokens.len() < 2 {
+        return wrong_args("geopos");
+    }
+    let mut out = Vec::new();
+    for key in &tokens[1..] {
+        match geo_point(db, key) {
+            Ok(Some((lon, lat))) => out.push(array(&[
+                bulk_string(&fmt_coord(lon)),
+                bulk_string(&fmt_coord(lat)),
+            ])),
+            _ => out.push(null_array()), // missing or wrong type -> nil (like MGET)
+        }
+    }
+    array(&out)
+}
+
+fn geodist_cmd(db: &mut Db, tokens: &[Vec<u8>]) -> Vec<u8> {
+    if tokens.len() < 3 || tokens.len() > 4 {
+        return wrong_args("geodist");
+    }
+    let unit = match tokens.get(3) {
+        None => 1.0,
+        Some(u) => match geo_unit(u) {
+            Some(d) => d,
+            None => return error("ERR unsupported unit provided. please use M, KM, FT, MI"),
+        },
+    };
+    let p1 = match geo_point(db, &tokens[1]) {
+        Ok(Some(p)) => p,
+        Ok(None) => return null_bulk(),
+        Err(()) => return wrongtype(),
+    };
+    let p2 = match geo_point(db, &tokens[2]) {
+        Ok(Some(p)) => p,
+        Ok(None) => return null_bulk(),
+        Err(()) => return wrongtype(),
+    };
+    let d = haversine_m(p1.0, p1.1, p2.0, p2.1) / unit;
+    bulk_string(format!("{d:.4}").as_bytes())
+}
+
+enum GeoShape {
+    Radius(f64),   // meters
+    Box(f64, f64), // width, height in meters
+}
+
+fn geosearch_cmd(db: &mut Db, tokens: &[Vec<u8>]) -> Vec<u8> {
+    let bad = || error("ERR syntax error");
+    let (mut center, mut from_key): (Option<(f64, f64)>, Option<Vec<u8>>) = (None, None);
+    let (mut radius, mut bbox): (Option<f64>, Option<(f64, f64)>) = (None, None);
+    let mut unit_div = 1.0f64; // meters-per-unit of the search shape, for WITHDIST
+    let mut order: Option<bool> = None; // Some(true)=ASC, Some(false)=DESC
+    let mut count: Option<usize> = None;
+    let (mut withcoord, mut withdist) = (false, false);
+    let mut i = 1;
+    while i < tokens.len() {
+        match tokens[i].to_ascii_uppercase().as_slice() {
+            b"FROMLONLAT" => {
+                let (lon, lat) = match (
+                    tokens.get(i + 1).and_then(|t| parse_finite_float(t)),
+                    tokens.get(i + 2).and_then(|t| parse_finite_float(t)),
+                ) {
+                    (Some(a), Some(b)) => (a, b),
+                    _ => return bad(),
+                };
+                center = Some((lon, lat));
+                i += 3;
+            }
+            b"FROMMEMBER" | b"FROMKEY" => {
+                from_key = match tokens.get(i + 1) {
+                    Some(k) => Some(k.clone()),
+                    None => return bad(),
+                };
+                i += 2;
+            }
+            b"BYRADIUS" => {
+                let r = match tokens.get(i + 1).and_then(|t| parse_finite_float(t)) {
+                    Some(r) => r,
+                    None => return bad(),
+                };
+                let u = match tokens.get(i + 2).and_then(|t| geo_unit(t)) {
+                    Some(u) => u,
+                    None => return bad(),
+                };
+                unit_div = u;
+                radius = Some(r * u);
+                i += 3;
+            }
+            b"BYBOX" => {
+                let (w, h) = match (
+                    tokens.get(i + 1).and_then(|t| parse_finite_float(t)),
+                    tokens.get(i + 2).and_then(|t| parse_finite_float(t)),
+                ) {
+                    (Some(a), Some(b)) => (a, b),
+                    _ => return bad(),
+                };
+                let u = match tokens.get(i + 3).and_then(|t| geo_unit(t)) {
+                    Some(u) => u,
+                    None => return bad(),
+                };
+                unit_div = u;
+                bbox = Some((w * u, h * u));
+                i += 4;
+            }
+            b"ASC" => {
+                order = Some(true);
+                i += 1;
+            }
+            b"DESC" => {
+                order = Some(false);
+                i += 1;
+            }
+            b"COUNT" => {
+                count = match tokens.get(i + 1).and_then(|t| parse_int(t)) {
+                    Some(c) if c > 0 => Some(c as usize),
+                    _ => return error("ERR COUNT must be > 0"),
+                };
+                i += 2;
+            }
+            b"WITHCOORD" => {
+                withcoord = true;
+                i += 1;
+            }
+            b"WITHDIST" => {
+                withdist = true;
+                i += 1;
+            }
+            _ => return bad(),
+        }
+    }
+    let center = match (center, from_key) {
+        (Some(c), None) => c,
+        (None, Some(k)) => match geo_point(db, &k) {
+            Ok(Some(p)) => p,
+            Ok(None) => return error("ERR could not decode requested geo member"),
+            Err(()) => return wrongtype(),
+        },
+        _ => return error("ERR exactly one of FROMMEMBER or FROMLONLAT can be specified"),
+    };
+    let shape = match (radius, bbox) {
+        (Some(r), None) => GeoShape::Radius(r),
+        (None, Some((w, h))) => GeoShape::Box(w, h),
+        _ => return error("ERR exactly one of BYRADIUS and BYBOX can be specified"),
+    };
+    // Scan the geo-key candidate set and keep the matches.
+    let mut hits: Vec<(Vec<u8>, f64, f64, f64)> = Vec::new(); // (key, dist_m, lon, lat)
+    for key in db.geo_keys() {
+        if let Ok(Some((lon, lat))) = geo_point(db, &key) {
+            let d = haversine_m(center.0, center.1, lon, lat);
+            let matches = match shape {
+                GeoShape::Radius(r) => d <= r,
+                GeoShape::Box(w, h) => {
+                    let ew = haversine_m(center.0, center.1, lon, center.1);
+                    let ns = haversine_m(center.0, center.1, center.0, lat);
+                    ew <= w / 2.0 && ns <= h / 2.0
+                }
+            };
+            if matches {
+                hits.push((key, d, lon, lat));
+            }
+        }
+    }
+    if let Some(asc) = order {
+        hits.sort_by(|a, b| {
+            if asc {
+                a.1.total_cmp(&b.1)
+            } else {
+                b.1.total_cmp(&a.1)
+            }
+        });
+    }
+    if let Some(c) = count {
+        hits.truncate(c);
+    }
+    if !withcoord && !withdist {
+        return bulk_array(&hits.into_iter().map(|(k, ..)| k).collect::<Vec<_>>());
+    }
+    let mut out = Vec::new();
+    for (k, d, lon, lat) in hits {
+        let mut elem = vec![bulk_string(&k)];
+        if withdist {
+            elem.push(bulk_string(format!("{:.4}", d / unit_div).as_bytes()));
+        }
+        if withcoord {
+            elem.push(array(&[
+                bulk_string(&fmt_coord(lon)),
+                bulk_string(&fmt_coord(lat)),
+            ]));
+        }
+        out.push(array(&elem));
+    }
+    array(&out)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -3247,6 +3507,52 @@ mod tests {
     }
 
     #[test]
+    fn geo_basics() {
+        let mut db = Db::new();
+        assert_eq!(
+            cmd(&mut db, &[b"GEOSET", b"p", b"13.361389", b"38.115556"]),
+            b"+OK\r\n".to_vec()
+        );
+        assert_eq!(cmd(&mut db, &[b"TYPE", b"p"]), b"+geo\r\n".to_vec());
+        // out-of-range latitude is rejected
+        assert!(cmd(&mut db, &[b"GEOSET", b"q", b"0", b"100"]).starts_with(b"-ERR"));
+        // distance between identical points is 0
+        cmd(&mut db, &[b"GEOSET", b"p2", b"13.361389", b"38.115556"]);
+        assert_eq!(
+            cmd(&mut db, &[b"GEODIST", b"p", b"p2"]),
+            bulk_string(b"0.0000")
+        );
+        // search finds both points within radius
+        assert!(
+            cmd(
+                &mut db,
+                &[b"GEOSEARCH", b"FROMKEY", b"p", b"BYRADIUS", b"1", b"km"]
+            )
+            .starts_with(b"*2\r\n")
+        );
+        // wrong type on a non-geo key
+        cmd(&mut db, &[b"SET", b"s", b"x"]);
+        assert!(cmd(&mut db, &[b"GEODIST", b"s", b"p"]).starts_with(b"-WRONGTYPE"));
+        // deleting geo keys removes them from the index
+        cmd(&mut db, &[b"DEL", b"p", b"p2"]);
+        assert_eq!(
+            cmd(
+                &mut db,
+                &[
+                    b"GEOSEARCH",
+                    b"FROMLONLAT",
+                    b"13.361389",
+                    b"38.115556",
+                    b"BYRADIUS",
+                    b"1",
+                    b"km"
+                ]
+            ),
+            b"*0\r\n".to_vec()
+        );
+    }
+
+    #[test]
     fn command_table_write_set_is_exact() {
         // The exact set of write commands. A change here is a deliberate decision,
         // not an accident — guards the AOF/replication write-detection.
@@ -3311,6 +3617,7 @@ mod tests {
             b"ZINTERSTORE",
             b"SETBIT",
             b"BITOP",
+            b"GEOSET",
             b"XADD",
         ];
         for w in writes {
@@ -3331,6 +3638,9 @@ mod tests {
             b"GETBIT".as_slice(),
             b"BITCOUNT".as_slice(),
             b"BITPOS".as_slice(),
+            b"GEOPOS".as_slice(),
+            b"GEODIST".as_slice(),
+            b"GEOSEARCH".as_slice(),
             b"SRANDMEMBER".as_slice(),
             b"RANDOMKEY".as_slice(),
             b"SMEMBERS".as_slice(),
