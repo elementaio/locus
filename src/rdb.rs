@@ -126,6 +126,48 @@ pub fn load(path: &str) -> io::Result<Db> {
     Ok(db)
 }
 
+/// Serialize the whole dataset to an in-memory buffer (for replication sync).
+pub fn serialize(db: &Db) -> Vec<u8> {
+    let mut buf = Vec::new();
+    buf.extend_from_slice(MAGIC);
+    buf.extend_from_slice(&(db.entries().count() as u64).to_le_bytes());
+    for (key, value) in db.entries() {
+        match db.raw_expire(key) {
+            Some(deadline) => {
+                buf.push(1);
+                buf.extend_from_slice(&deadline.to_le_bytes());
+            }
+            None => buf.push(0),
+        }
+        write_value(&mut buf, key, value).expect("writing to a Vec is infallible");
+    }
+    buf
+}
+
+/// Rebuild a dataset from a serialized buffer (the replica side of sync).
+pub fn deserialize(bytes: &[u8]) -> io::Result<Db> {
+    let mut r: &[u8] = bytes;
+    let mut magic = [0u8; 9];
+    r.read_exact(&mut magic)?;
+    if &magic != MAGIC {
+        return Err(io::Error::new(io::ErrorKind::InvalidData, "bad RDB magic"));
+    }
+    let count = read_u64(&mut r)?;
+    let mut db = Db::new();
+    for _ in 0..count {
+        let expire = if read_u8(&mut r)? == 1 {
+            Some(read_u64(&mut r)?)
+        } else {
+            None
+        };
+        let tag = read_u8(&mut r)?;
+        let key = read_bytes(&mut r)?;
+        let value = read_value(&mut r, tag)?;
+        db.insert_with_expire(key, value, expire);
+    }
+    Ok(db)
+}
+
 fn read_value<R: Read>(r: &mut R, tag: u8) -> io::Result<Value> {
     Ok(match tag {
         0 => Value::Str(read_bytes(r)?),

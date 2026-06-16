@@ -163,6 +163,11 @@ pub fn bulk_array(items: &[Vec<u8>]) -> Vec<u8> {
     out
 }
 
+/// Encode a command as a RESP multibulk (used to stream commands to replicas).
+pub fn command(parts: &[Vec<u8>]) -> Vec<u8> {
+    bulk_array(parts)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
