@@ -155,4 +155,21 @@ impl Db {
             }
         }
     }
+
+    // --- persistence support (used by the RDB snapshot module) ---
+
+    pub fn entries(&self) -> std::collections::hash_map::Iter<'_, Vec<u8>, Value> {
+        self.data.iter()
+    }
+
+    pub fn raw_expire(&self, key: &[u8]) -> Option<u64> {
+        self.expires.get(key).copied()
+    }
+
+    pub fn insert_with_expire(&mut self, key: Vec<u8>, value: Value, expire: Option<u64>) {
+        if let Some(deadline) = expire {
+            self.expires.insert(key.clone(), deadline);
+        }
+        self.data.insert(key, value);
+    }
 }

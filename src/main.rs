@@ -10,6 +10,7 @@
 
 mod commands;
 mod db;
+mod rdb;
 mod resp;
 
 use std::io::{self, Read, Write};
@@ -56,7 +57,14 @@ fn main() -> io::Result<()> {
 /// The single keyspace owner: runs commands one at a time, and — when idle or
 /// periodically — runs an active-expiration pass to reclaim TTL'd memory.
 fn run_keyspace(rx: mpsc::Receiver<Request>) {
-    let mut db = Db::new();
+    let path = rdb::configured_path();
+    let mut db = match rdb::load(&path) {
+        Ok(db) => db,
+        Err(e) => {
+            eprintln!("failed to load {path}: {e} — starting with an empty dataset");
+            Db::new()
+        }
+    };
     let mut since_expire = 0u32;
     loop {
         match rx.recv_timeout(Duration::from_millis(100)) {

@@ -7,6 +7,7 @@
 use std::collections::{HashMap, HashSet, VecDeque};
 
 use crate::db::{now_ms, Db, Value};
+use crate::rdb;
 use crate::resp::{
     array, bulk_array, bulk_string, error, integer, null_array, null_bulk, simple_string,
 };
@@ -123,6 +124,15 @@ pub fn execute(tokens: &[Vec<u8>], db: &mut Db) -> Vec<u8> {
         b"ZCOUNT" => zcount_cmd(db, tokens),
         b"ZPOPMIN" => zpop_cmd(db, tokens, false),
         b"ZPOPMAX" => zpop_cmd(db, tokens, true),
+        // persistence
+        b"SAVE" => match rdb::save(db, &rdb::configured_path()) {
+            Ok(()) => simple_string("OK"),
+            Err(e) => error(&format!("ERR {e}")),
+        },
+        b"BGSAVE" => match rdb::save(db, &rdb::configured_path()) {
+            Ok(()) => simple_string("Background saving started"),
+            Err(e) => error(&format!("ERR {e}")),
+        },
         // stubs
         b"COMMAND" => b"*0\r\n".to_vec(),
         b"CONFIG" => match tokens.get(1).map(|t| t.to_ascii_uppercase()).as_deref() {
