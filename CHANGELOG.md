@@ -15,6 +15,8 @@ All notable changes to Locus are documented here. The format is based on
 - Sorted-set commands: `ZREMRANGEBYRANK`, `ZREMRANGEBYSCORE`, `ZUNIONSTORE`, `ZINTERSTORE`
   (with `WEIGHTS`/`AGGREGATE`; set sources score 1.0).
 - Bitmap commands: `SETBIT`, `GETBIT`, `BITCOUNT` (incl. `BYTE`/`BIT` ranges), `BITPOS`, `BITOP`.
+- Randomized commands: `SRANDMEMBER` (negative count = with repeats), `RANDOMKEY`, backed by a small
+  zero-deps xorshift PRNG. `SPOP` now selects truly random members (was arbitrary iteration order).
 
 ### Fixed
 - WATCH now dirties **all** keys touched by multi-key writes (`MSET`/`MSETNX`/`RENAME`) and by

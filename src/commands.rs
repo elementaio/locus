@@ -5,6 +5,7 @@
 //! different type.
 
 use std::collections::{HashMap, HashSet, VecDeque};
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use crate::db::{Db, Value, now_ms};
 use crate::rdb;
@@ -17,6 +18,41 @@ use crate::streams;
 type HashVal = HashMap<Vec<u8>, Vec<u8>>;
 
 // --- shared helpers ---------------------------------------------------------
+
+/// A tiny non-cryptographic PRNG (xorshift64) for SRANDMEMBER/RANDOMKEY/SPOP —
+/// zero-deps, lazily seeded from the clock. Good enough for "pick something
+/// arbitrary", not for anything security-sensitive.
+static RNG_STATE: AtomicU64 = AtomicU64::new(0);
+
+fn next_rand() -> u64 {
+    let mut s = RNG_STATE.load(Ordering::Relaxed);
+    if s == 0 {
+        s = now_ms() ^ 0x9E37_79B9_7F4A_7C15; // never zero
+    }
+    s ^= s << 13;
+    s ^= s >> 7;
+    s ^= s << 17;
+    RNG_STATE.store(s, Ordering::Relaxed);
+    s
+}
+
+/// A uniform-ish index in `0..n` (n must be > 0).
+fn rand_index(n: usize) -> usize {
+    (next_rand() % n as u64) as usize
+}
+
+/// Pick `k` distinct indices from `0..n` (k clamped to n) via partial
+/// Fisher-Yates shuffle.
+fn distinct_indices(n: usize, k: usize) -> Vec<usize> {
+    let k = k.min(n);
+    let mut idx: Vec<usize> = (0..n).collect();
+    for i in 0..k {
+        let j = i + rand_index(n - i);
+        idx.swap(i, j);
+    }
+    idx.truncate(k);
+    idx
+}
 
 fn wrong_args(cmd: &str) -> Vec<u8> {
     error(&format!(
@@ -56,6 +92,7 @@ pub fn execute(tokens: &[Vec<u8>], db: &mut Db) -> Vec<u8> {
         b"TOUCH" => exists_cmd(db, tokens), // no LRU, so equivalent to EXISTS
         b"KEYS" => keys_cmd(db, tokens),
         b"DBSIZE" => dbsize_cmd(db, tokens),
+        b"RANDOMKEY" => randomkey_cmd(db, tokens),
         b"RENAME" => rename_cmd(db, tokens, false),
         b"RENAMENX" => rename_cmd(db, tokens, true),
         b"FLUSHDB" | b"FLUSHALL" => flush_cmd(db, tokens),
@@ -143,6 +180,7 @@ pub fn execute(tokens: &[Vec<u8>], db: &mut Db) -> Vec<u8> {
         b"SMISMEMBER" => smismember_cmd(db, tokens),
         b"SCARD" => scard_cmd(db, tokens),
         b"SPOP" => spop_cmd(db, tokens),
+        b"SRANDMEMBER" => srandmember_cmd(db, tokens),
         b"SINTER" => setop_cmd(db, tokens, SetOp::Inter),
         b"SUNION" => setop_cmd(db, tokens, SetOp::Union),
         b"SDIFF" => setop_cmd(db, tokens, SetOp::Diff),
@@ -222,16 +260,17 @@ pub fn command_meta(cmd: &[u8]) -> Option<CmdMeta> {
         // arity 1 reads — bare commands / all-optional args
         b"PING" | b"QUIT" | b"COMMAND" | b"CONFIG" | b"SAVE" | b"BGSAVE" | b"BGREWRITEAOF"
         | b"MULTI" | b"EXEC" | b"DISCARD" | b"UNWATCH" | b"RESET" | b"INFO" | b"HELLO"
-        | b"REPLCONF" | b"PSYNC" | b"SYNC" | b"UNSUBSCRIBE" | b"PUNSUBSCRIBE" | b"DBSIZE" => {
-            (1, false)
-        }
+        | b"REPLCONF" | b"PSYNC" | b"SYNC" | b"UNSUBSCRIBE" | b"PUNSUBSCRIBE" | b"DBSIZE"
+        | b"RANDOMKEY" => (1, false),
         // arity 1 writes
         b"FLUSHDB" | b"FLUSHALL" => (1, true),
         // arity 2 reads
         b"ECHO" | b"TYPE" | b"TTL" | b"PTTL" | b"GET" | b"STRLEN" | b"LLEN" | b"HGETALL"
         | b"HLEN" | b"HKEYS" | b"HVALS" | b"SMEMBERS" | b"SCARD" | b"ZCARD" | b"XLEN"
         | b"EXISTS" | b"TOUCH" | b"KEYS" | b"MGET" | b"SINTER" | b"SUNION" | b"SDIFF"
-        | b"WATCH" | b"SUBSCRIBE" | b"PSUBSCRIBE" | b"PUBSUB" | b"BITCOUNT" => (2, false),
+        | b"WATCH" | b"SUBSCRIBE" | b"PSUBSCRIBE" | b"PUBSUB" | b"BITCOUNT" | b"SRANDMEMBER" => {
+            (2, false)
+        }
         // arity 2 writes
         b"PERSIST" | b"INCR" | b"DECR" | b"GETDEL" | b"LPOP" | b"RPOP" | b"SPOP" | b"ZPOPMIN"
         | b"ZPOPMAX" | b"DEL" | b"UNLINK" => (2, true),
@@ -1702,12 +1741,10 @@ fn spop_cmd(db: &mut Db, tokens: &[Vec<u8>]) -> Vec<u8> {
             };
         }
         Some(Value::Set(s)) => {
-            // Not cryptographically random — we take arbitrary members. (A true
-            // random pick is a later refinement.)
-            let take: Vec<Vec<u8>> = s.iter().take(count.unwrap_or(1)).cloned().collect();
-            for m in take {
-                s.remove(&m);
-                popped.push(m);
+            let members: Vec<Vec<u8>> = s.iter().cloned().collect();
+            for i in distinct_indices(members.len(), count.unwrap_or(1)) {
+                s.remove(&members[i]);
+                popped.push(members[i].clone());
             }
         }
         Some(_) => return wrongtype(),
@@ -1721,6 +1758,62 @@ fn spop_cmd(db: &mut Db, tokens: &[Vec<u8>]) -> Vec<u8> {
             .next()
             .map(|v| bulk_string(&v))
             .unwrap_or_else(null_bulk)
+    }
+}
+
+fn srandmember_cmd(db: &mut Db, tokens: &[Vec<u8>]) -> Vec<u8> {
+    if tokens.len() < 2 || tokens.len() > 3 {
+        return wrong_args("srandmember");
+    }
+    let with_count = tokens.len() == 3;
+    let count = if with_count {
+        match parse_int(&tokens[2]) {
+            Some(c) => c,
+            None => return not_integer(),
+        }
+    } else {
+        1
+    };
+    let members: Vec<Vec<u8>> = match db.get(&tokens[1]) {
+        None => vec![],
+        Some(Value::Set(s)) => s.iter().cloned().collect(),
+        Some(_) => return wrongtype(),
+    };
+    if !with_count {
+        // A single random member, like Redis (nil on a missing key).
+        return if members.is_empty() {
+            null_bulk()
+        } else {
+            bulk_string(&members[rand_index(members.len())])
+        };
+    }
+    if members.is_empty() || count == 0 {
+        return bulk_array(&[]);
+    }
+    let picked: Vec<Vec<u8>> = if count > 0 {
+        // Distinct members, up to `count`.
+        distinct_indices(members.len(), count as usize)
+            .into_iter()
+            .map(|i| members[i].clone())
+            .collect()
+    } else {
+        // Exactly |count| members, with possible repeats.
+        (0..(-count) as usize)
+            .map(|_| members[rand_index(members.len())].clone())
+            .collect()
+    };
+    bulk_array(&picked)
+}
+
+fn randomkey_cmd(db: &mut Db, tokens: &[Vec<u8>]) -> Vec<u8> {
+    if tokens.len() != 1 {
+        return wrong_args("randomkey");
+    }
+    let keys = db.live_keys();
+    if keys.is_empty() {
+        null_bulk()
+    } else {
+        bulk_string(&keys[rand_index(keys.len())])
     }
 }
 
@@ -3098,6 +3191,40 @@ mod tests {
     }
 
     #[test]
+    fn random_commands() {
+        let mut db = Db::new();
+        cmd(&mut db, &[b"SADD", b"s", b"a", b"b", b"c", b"d", b"e"]);
+        // single random member is a 1-byte bulk (members are "a".."e")
+        assert!(cmd(&mut db, &[b"SRANDMEMBER", b"s"]).starts_with(b"$1\r\n"));
+        // positive count -> distinct, capped at set size
+        assert!(cmd(&mut db, &[b"SRANDMEMBER", b"s", b"3"]).starts_with(b"*3\r\n"));
+        assert!(cmd(&mut db, &[b"SRANDMEMBER", b"s", b"100"]).starts_with(b"*5\r\n"));
+        // negative count -> exactly |count|, repeats allowed
+        assert!(cmd(&mut db, &[b"SRANDMEMBER", b"s", b"-10"]).starts_with(b"*10\r\n"));
+        // count 0 / missing key
+        assert_eq!(
+            cmd(&mut db, &[b"SRANDMEMBER", b"s", b"0"]),
+            b"*0\r\n".to_vec()
+        );
+        assert_eq!(cmd(&mut db, &[b"SRANDMEMBER", b"nope"]), null_bulk());
+        assert_eq!(
+            cmd(&mut db, &[b"SRANDMEMBER", b"nope", b"3"]),
+            b"*0\r\n".to_vec()
+        );
+        // SRANDMEMBER must not modify the set
+        assert_eq!(cmd(&mut db, &[b"SCARD", b"s"]), b":5\r\n".to_vec());
+        // RANDOMKEY returns an existing key; nil on an empty DB
+        assert!(cmd(&mut db, &[b"RANDOMKEY"]).starts_with(b"$"));
+        assert_eq!(cmd(&mut Db::new(), &[b"RANDOMKEY"]), null_bulk());
+        // SPOP now removes random members (count honored)
+        assert!(cmd(&mut db, &[b"SPOP", b"s", b"2"]).starts_with(b"*2\r\n"));
+        assert_eq!(cmd(&mut db, &[b"SCARD", b"s"]), b":3\r\n".to_vec());
+        // WRONGTYPE
+        cmd(&mut db, &[b"SET", b"str", b"x"]);
+        assert!(cmd(&mut db, &[b"SRANDMEMBER", b"str"]).starts_with(b"-WRONGTYPE"));
+    }
+
+    #[test]
     fn command_table_write_set_is_exact() {
         // The exact set of write commands. A change here is a deliberate decision,
         // not an accident — guards the AOF/replication write-detection.
@@ -3182,6 +3309,8 @@ mod tests {
             b"GETBIT".as_slice(),
             b"BITCOUNT".as_slice(),
             b"BITPOS".as_slice(),
+            b"SRANDMEMBER".as_slice(),
+            b"RANDOMKEY".as_slice(),
             b"SMEMBERS".as_slice(),
             b"ZRANGE".as_slice(),
             b"XRANGE".as_slice(),

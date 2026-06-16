@@ -24,6 +24,7 @@ works. This is a curated subset of Redis — the common, useful commands per typ
 | `EXISTS key [key ...]` / `TOUCH key [key ...]` | counts each occurrence (no LRU, so TOUCH == EXISTS) |
 | `KEYS pattern` | keys matching a glob (`*`/`?`) |
 | `DBSIZE` | number of keys |
+| `RANDOMKEY` | a random key (nil if empty) |
 | `RENAME key newkey` / `RENAMENX key newkey` | move value+TTL; RENAMENX fails if dest exists |
 | `FLUSHDB` / `FLUSHALL` | empty the keyspace (single logical DB) |
 | `TYPE key` | `string`/`list`/`hash`/`set`/`zset`/`stream`/`none` |
@@ -63,7 +64,8 @@ works. This is a curated subset of Redis — the common, useful commands per typ
 
 ## Sets
 
-`SADD` `SREM` `SMEMBERS` `SISMEMBER` `SMISMEMBER` `SCARD` `SPOP [count]` `SINTER` `SUNION` `SDIFF`
+`SADD` `SREM` `SMEMBERS` `SISMEMBER` `SMISMEMBER` `SCARD` `SPOP [count]` (random)
+`SRANDMEMBER key [count]` (negative count = with repeats) `SINTER` `SUNION` `SDIFF`
 `SMOVE src dst member` `SINTERSTORE dst key...` `SUNIONSTORE dst key...` `SDIFFSTORE dst key...`
 `SINTERCARD numkeys key... [LIMIT n]`
 
