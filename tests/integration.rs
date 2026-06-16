@@ -262,6 +262,36 @@ fn noop_write_does_not_abort_watch() {
     );
 }
 
+#[test]
+fn flushall_aborts_watch() {
+    let s = Server::start();
+    let (mut c1, mut c2) = (s.connect(), s.connect());
+    c1.cmd(&["SET", "k", "1"]);
+    assert_eq!(c1.cmd(&["WATCH", "k"]), "OK");
+    c1.cmd(&["MULTI"]);
+    c1.cmd(&["SET", "k", "2"]);
+    // FLUSHALL removes the watched key on another connection.
+    assert_eq!(c2.cmd(&["FLUSHALL"]), "OK");
+    assert_eq!(
+        c1.cmd(&["EXEC"]),
+        "(nil)",
+        "FLUSHALL of a watched key must abort EXEC"
+    );
+}
+
+#[test]
+fn keys_and_dbsize_over_the_wire() {
+    let s = Server::start();
+    let mut c = s.connect();
+    c.cmd(&["MSET", "a:1", "x", "a:2", "y", "b:1", "z"]);
+    assert_eq!(c.cmd(&["DBSIZE"]), "3");
+    let keys = c.cmd(&["KEYS", "a:*"]);
+    assert!(
+        keys.contains("a:1") && keys.contains("a:2") && !keys.contains("b:1"),
+        "got {keys}"
+    );
+}
+
 // === pub/sub ================================================================
 
 #[test]

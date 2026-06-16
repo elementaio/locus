@@ -740,11 +740,21 @@ fn is_tx_control(cmd: &[u8]) -> bool {
     )
 }
 
-/// Keys a write command modifies (for WATCH dirtying): all args for DEL,
-/// otherwise the single key at position 1.
+/// Keys a write command modifies (for WATCH dirtying + memory resync). Most
+/// commands touch a single key at position 1; the multi-key writes are spelled
+/// out. FLUSHDB/FLUSHALL touch every key — handled separately via the keyspace's
+/// expired-key log, not here.
 fn write_keys(tokens: &[Vec<u8>]) -> Vec<&[u8]> {
     match tokens[0].to_ascii_uppercase().as_slice() {
-        b"DEL" => tokens[1..].iter().map(|k| k.as_slice()).collect(),
+        b"DEL" | b"UNLINK" => tokens[1..].iter().map(|k| k.as_slice()).collect(),
+        // MSET key val key val ... -> the keys are at odd positions.
+        b"MSET" | b"MSETNX" => tokens[1..]
+            .iter()
+            .step_by(2)
+            .map(|k| k.as_slice())
+            .collect(),
+        // RENAME src dst -> both source and destination change.
+        b"RENAME" | b"RENAMENX" => tokens[1..3].iter().map(|k| k.as_slice()).collect(),
         _ => tokens
             .get(1)
             .map(|k| vec![k.as_slice()])
@@ -763,9 +773,9 @@ fn write_modified(cmd: &[u8], reply: &[u8]) -> bool {
     let nil = reply == b"$-1\r\n"; // null bulk
     match cmd {
         // "count of elements changed" commands: 0 means nothing changed.
-        b"DEL" | b"SREM" | b"HDEL" | b"ZREM" | b"SADD" | b"HSETNX" | b"LPUSHX" | b"RPUSHX"
-        | b"PERSIST" | b"EXPIRE" | b"PEXPIRE" | b"EXPIREAT" | b"PEXPIREAT" | b"SETNX"
-        | b"MSETNX" => !zero,
+        b"DEL" | b"UNLINK" | b"SREM" | b"HDEL" | b"ZREM" | b"SADD" | b"HSETNX" | b"LPUSHX"
+        | b"RPUSHX" | b"PERSIST" | b"EXPIRE" | b"PEXPIRE" | b"EXPIREAT" | b"PEXPIREAT"
+        | b"SETNX" | b"MSETNX" | b"RENAMENX" => !zero,
         // ZADD: 0 added/changed, or nil from an aborted INCR (NX/XX/GT/LT).
         b"ZADD" => !(zero || nil),
         // Conditional write / delete: nil means it didn't happen.

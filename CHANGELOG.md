@@ -9,6 +9,11 @@ All notable changes to Locus are documented here. The format is based on
 ### Added (commands)
 - String commands: `MGET`, `MSET`, `MSETNX`, `SETNX`, `SETEX`, `PSETEX`, `GETSET`, `GETRANGE`,
   `SETRANGE`, `INCRBYFLOAT`.
+- Keyspace commands: `KEYS`, `DBSIZE`, `RENAME`, `RENAMENX`, `TOUCH`, `UNLINK`, `FLUSHDB`, `FLUSHALL`.
+
+### Fixed
+- WATCH now dirties **all** keys touched by multi-key writes (`MSET`/`MSETNX`/`RENAME`) and by
+  `FLUSHDB`/`FLUSHALL`, not just the first key.
 
 ### Changed (internal)
 - Consolidated command metadata (existence, minimum arity, write-or-read) into a single

@@ -20,8 +20,12 @@ works. This is a curated subset of Redis — the common, useful commands per typ
 
 | Command | Notes |
 |---|---|
-| `DEL key [key ...]` | returns count removed |
-| `EXISTS key [key ...]` | counts each occurrence |
+| `DEL key [key ...]` / `UNLINK key [key ...]` | returns count removed (UNLINK is synchronous here) |
+| `EXISTS key [key ...]` / `TOUCH key [key ...]` | counts each occurrence (no LRU, so TOUCH == EXISTS) |
+| `KEYS pattern` | keys matching a glob (`*`/`?`) |
+| `DBSIZE` | number of keys |
+| `RENAME key newkey` / `RENAMENX key newkey` | move value+TTL; RENAMENX fails if dest exists |
+| `FLUSHDB` / `FLUSHALL` | empty the keyspace (single logical DB) |
 | `TYPE key` | `string`/`list`/`hash`/`set`/`zset`/`stream`/`none` |
 | `EXPIRE` / `PEXPIRE` / `EXPIREAT` / `PEXPIREAT key n` | set TTL |
 | `TTL` / `PTTL key` | `-2` no key, `-1` no expiry |

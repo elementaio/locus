@@ -51,7 +51,14 @@ pub fn execute(tokens: &[Vec<u8>], db: &mut Db) -> Vec<u8> {
         b"ECHO" => wrong_args("echo"),
         b"QUIT" => simple_string("OK"),
         b"DEL" => del_cmd(db, tokens),
+        b"UNLINK" => del_cmd(db, tokens), // synchronous here, like DEL
         b"EXISTS" => exists_cmd(db, tokens),
+        b"TOUCH" => exists_cmd(db, tokens), // no LRU, so equivalent to EXISTS
+        b"KEYS" => keys_cmd(db, tokens),
+        b"DBSIZE" => dbsize_cmd(db, tokens),
+        b"RENAME" => rename_cmd(db, tokens, false),
+        b"RENAMENX" => rename_cmd(db, tokens, true),
+        b"FLUSHDB" | b"FLUSHALL" => flush_cmd(db, tokens),
         b"TYPE" => match tokens.len() {
             2 => simple_string(db.type_name(&tokens[1]).unwrap_or("none")),
             _ => wrong_args("type"),
@@ -191,18 +198,22 @@ pub struct CmdMeta {
 pub fn command_meta(cmd: &[u8]) -> Option<CmdMeta> {
     // (min_arity, is_write)
     let (min_arity, write) = match cmd {
-        // arity 1 — bare commands / all-optional args (none are writes)
+        // arity 1 reads — bare commands / all-optional args
         b"PING" | b"QUIT" | b"COMMAND" | b"CONFIG" | b"SAVE" | b"BGSAVE" | b"BGREWRITEAOF"
         | b"MULTI" | b"EXEC" | b"DISCARD" | b"UNWATCH" | b"RESET" | b"INFO" | b"HELLO"
-        | b"REPLCONF" | b"PSYNC" | b"SYNC" | b"UNSUBSCRIBE" | b"PUNSUBSCRIBE" => (1, false),
+        | b"REPLCONF" | b"PSYNC" | b"SYNC" | b"UNSUBSCRIBE" | b"PUNSUBSCRIBE" | b"DBSIZE" => {
+            (1, false)
+        }
+        // arity 1 writes
+        b"FLUSHDB" | b"FLUSHALL" => (1, true),
         // arity 2 reads
         b"ECHO" | b"TYPE" | b"TTL" | b"PTTL" | b"GET" | b"STRLEN" | b"LLEN" | b"HGETALL"
         | b"HLEN" | b"HKEYS" | b"HVALS" | b"SMEMBERS" | b"SCARD" | b"ZCARD" | b"XLEN"
-        | b"EXISTS" | b"MGET" | b"SINTER" | b"SUNION" | b"SDIFF" | b"WATCH" | b"SUBSCRIBE"
-        | b"PSUBSCRIBE" | b"PUBSUB" => (2, false),
+        | b"EXISTS" | b"TOUCH" | b"KEYS" | b"MGET" | b"SINTER" | b"SUNION" | b"SDIFF"
+        | b"WATCH" | b"SUBSCRIBE" | b"PSUBSCRIBE" | b"PUBSUB" => (2, false),
         // arity 2 writes
         b"PERSIST" | b"INCR" | b"DECR" | b"GETDEL" | b"LPOP" | b"RPOP" | b"SPOP" | b"ZPOPMIN"
-        | b"ZPOPMAX" | b"DEL" => (2, true),
+        | b"ZPOPMAX" | b"DEL" | b"UNLINK" => (2, true),
         // arity 3 reads
         b"LINDEX" | b"HGET" | b"HEXISTS" | b"HMGET" | b"SISMEMBER" | b"SMISMEMBER" | b"ZSCORE"
         | b"ZMSCORE" | b"ZRANK" | b"ZREVRANK" | b"PUBLISH" | b"REPLICAOF" | b"SLAVEOF" => {
@@ -211,7 +222,8 @@ pub fn command_meta(cmd: &[u8]) -> Option<CmdMeta> {
         // arity 3 writes
         b"INCRBY" | b"DECRBY" | b"APPEND" | b"HDEL" | b"SADD" | b"SREM" | b"ZREM" | b"EXPIRE"
         | b"PEXPIRE" | b"EXPIREAT" | b"PEXPIREAT" | b"LPUSH" | b"RPUSH" | b"LPUSHX" | b"RPUSHX"
-        | b"SET" | b"SETNX" | b"GETSET" | b"MSET" | b"MSETNX" | b"INCRBYFLOAT" => (3, true),
+        | b"SET" | b"SETNX" | b"GETSET" | b"MSET" | b"MSETNX" | b"INCRBYFLOAT" | b"RENAME"
+        | b"RENAMENX" => (3, true),
         // arity 4 reads
         b"LRANGE" | b"ZRANGE" | b"ZREVRANGE" | b"ZRANGEBYSCORE" | b"ZREVRANGEBYSCORE"
         | b"ZCOUNT" | b"XRANGE" | b"XREVRANGE" | b"XREAD" | b"GETRANGE" => (4, false),
@@ -237,9 +249,14 @@ pub fn is_write(cmd: &[u8]) -> bool {
 
 // === generic ================================================================
 
+fn cmd_name(tokens: &[Vec<u8>]) -> String {
+    String::from_utf8_lossy(&tokens[0]).to_ascii_lowercase()
+}
+
 fn del_cmd(db: &mut Db, tokens: &[Vec<u8>]) -> Vec<u8> {
+    // Shared by DEL and UNLINK (synchronous here).
     if tokens.len() < 2 {
-        return wrong_args("del");
+        return wrong_args(&cmd_name(tokens));
     }
     let n = tokens[1..]
         .iter()
@@ -249,11 +266,70 @@ fn del_cmd(db: &mut Db, tokens: &[Vec<u8>]) -> Vec<u8> {
 }
 
 fn exists_cmd(db: &mut Db, tokens: &[Vec<u8>]) -> Vec<u8> {
+    // Shared by EXISTS and TOUCH (no LRU to bump).
     if tokens.len() < 2 {
-        return wrong_args("exists");
+        return wrong_args(&cmd_name(tokens));
     }
     let n = tokens[1..].iter().filter(|k| db.contains(k)).count();
     integer(n as i64)
+}
+
+fn keys_cmd(db: &mut Db, tokens: &[Vec<u8>]) -> Vec<u8> {
+    if tokens.len() != 2 {
+        return wrong_args("keys");
+    }
+    let matched: Vec<Vec<u8>> = db
+        .live_keys()
+        .into_iter()
+        .filter(|k| crate::pubsub::glob_match(&tokens[1], k))
+        .collect();
+    bulk_array(&matched)
+}
+
+fn dbsize_cmd(db: &mut Db, tokens: &[Vec<u8>]) -> Vec<u8> {
+    if tokens.len() != 1 {
+        return wrong_args("dbsize");
+    }
+    integer(db.dbsize() as i64)
+}
+
+fn flush_cmd(db: &mut Db, tokens: &[Vec<u8>]) -> Vec<u8> {
+    // FLUSHDB / FLUSHALL — we have a single logical DB, so they're equivalent.
+    // An optional ASYNC/SYNC modifier is accepted and ignored.
+    if tokens.len() > 2 {
+        return wrong_args(&cmd_name(tokens));
+    }
+    db.clear();
+    simple_string("OK")
+}
+
+fn rename_cmd(db: &mut Db, tokens: &[Vec<u8>], nx: bool) -> Vec<u8> {
+    if tokens.len() != 3 {
+        return wrong_args(&cmd_name(tokens));
+    }
+    if !db.contains(&tokens[1]) {
+        return error("ERR no such key");
+    }
+    if tokens[1] == tokens[2] {
+        // Renaming a key to itself is a no-op (RENAMENX still reports dst exists).
+        return if nx { integer(0) } else { simple_string("OK") };
+    }
+    if nx && db.contains(&tokens[2]) {
+        return integer(0);
+    }
+    let ttl = db.expire_at(&tokens[1]);
+    let val = match db.remove(&tokens[1]) {
+        Some(v) => v,
+        None => return error("ERR no such key"),
+    };
+    db.insert(tokens[2].clone(), val);
+    match ttl {
+        Some(t) => db.set_expire(&tokens[2], t),
+        None => {
+            db.clear_expire(&tokens[2]);
+        }
+    }
+    if nx { integer(1) } else { simple_string("OK") }
 }
 
 // === strings ================================================================
@@ -1911,6 +1987,55 @@ mod tests {
     }
 
     #[test]
+    fn keyspace_commands() {
+        let mut db = Db::new();
+        cmd(
+            &mut db,
+            &[b"MSET", b"user:1", b"a", b"user:2", b"b", b"other", b"c"],
+        );
+        assert_eq!(cmd(&mut db, &[b"DBSIZE"]), b":3\r\n".to_vec());
+
+        // KEYS with a glob (order is unspecified -> check membership + count).
+        let keys = cmd(&mut db, &[b"KEYS", b"user:*"]);
+        assert!(keys.starts_with(b"*2\r\n"));
+        assert!(keys.windows(6).any(|w| w == b"user:1"));
+        assert!(keys.windows(6).any(|w| w == b"user:2"));
+        assert!(!keys.windows(5).any(|w| w == b"other"));
+
+        // TOUCH counts existing keys; UNLINK removes like DEL.
+        assert_eq!(
+            cmd(&mut db, &[b"TOUCH", b"user:1", b"nope"]),
+            b":1\r\n".to_vec()
+        );
+        assert_eq!(
+            cmd(&mut db, &[b"UNLINK", b"user:1", b"nope"]),
+            b":1\r\n".to_vec()
+        );
+        assert_eq!(cmd(&mut db, &[b"EXISTS", b"user:1"]), b":0\r\n".to_vec());
+
+        // RENAME moves the value (and TTL); RENAMENX respects an existing dst.
+        cmd(&mut db, &[b"SET", b"src", b"v", b"EX", b"100"]);
+        assert_eq!(
+            cmd(&mut db, &[b"RENAME", b"src", b"dst"]),
+            b"+OK\r\n".to_vec()
+        );
+        assert_eq!(cmd(&mut db, &[b"GET", b"dst"]), b"$1\r\nv\r\n".to_vec());
+        assert!(matches!(
+            cmd(&mut db, &[b"TTL", b"dst"]).as_slice(),
+            b":100\r\n" | b":99\r\n"
+        ));
+        assert!(cmd(&mut db, &[b"RENAME", b"missing", b"x"]).starts_with(b"-ERR no such key"));
+        assert_eq!(
+            cmd(&mut db, &[b"RENAMENX", b"dst", b"other"]),
+            b":0\r\n".to_vec()
+        ); // other exists
+
+        // FLUSHALL empties the keyspace.
+        assert_eq!(cmd(&mut db, &[b"FLUSHALL"]), b"+OK\r\n".to_vec());
+        assert_eq!(cmd(&mut db, &[b"DBSIZE"]), b":0\r\n".to_vec());
+    }
+
+    #[test]
     fn command_table_write_set_is_exact() {
         // The exact set of write commands. A change here is a deliberate decision,
         // not an accident — guards the AOF/replication write-detection.
@@ -1926,6 +2051,11 @@ mod tests {
             b"INCRBYFLOAT",
             b"GETDEL",
             b"DEL",
+            b"UNLINK",
+            b"RENAME",
+            b"RENAMENX",
+            b"FLUSHDB",
+            b"FLUSHALL",
             b"EXPIRE",
             b"PEXPIRE",
             b"EXPIREAT",
@@ -1974,6 +2104,9 @@ mod tests {
             b"ZRANGE".as_slice(),
             b"XRANGE".as_slice(),
             b"EXISTS".as_slice(),
+            b"TOUCH".as_slice(),
+            b"KEYS".as_slice(),
+            b"DBSIZE".as_slice(),
             b"PING".as_slice(),
             b"INFO".as_slice(),
             b"SUBSCRIBE".as_slice(),

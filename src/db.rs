@@ -248,6 +248,37 @@ impl Db {
         }
     }
 
+    /// Live (non-expired) keys, for KEYS/DBSIZE. Lazy: doesn't delete the
+    /// expired keys it skips (the active reaper handles reclamation).
+    pub fn live_keys(&self) -> Vec<Vec<u8>> {
+        let now = now_ms();
+        self.data
+            .keys()
+            .filter(|k| self.expires.get(*k).is_none_or(|&d| d > now))
+            .cloned()
+            .collect()
+    }
+
+    /// Count of live (non-expired) keys.
+    pub fn dbsize(&self) -> usize {
+        let now = now_ms();
+        self.data
+            .keys()
+            .filter(|k| self.expires.get(*k).is_none_or(|&d| d > now))
+            .count()
+    }
+
+    /// Remove every key (FLUSHDB/FLUSHALL). Cleared keys are pushed to the
+    /// expired log so the hub dirties their WATCHers.
+    pub fn clear(&mut self) {
+        let keys: Vec<Vec<u8>> = self.data.keys().cloned().collect();
+        self.expired.extend(keys);
+        self.data.clear();
+        self.expires.clear();
+        self.sizes.clear();
+        self.mem_used = 0;
+    }
+
     // --- persistence support (used by the RDB snapshot module) ---
 
     pub fn entries(&self) -> std::collections::hash_map::Iter<'_, Vec<u8>, Value> {
