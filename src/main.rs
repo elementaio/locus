@@ -777,7 +777,8 @@ fn write_modified(cmd: &[u8], reply: &[u8]) -> bool {
         // "count of elements changed" commands: 0 means nothing changed.
         b"DEL" | b"UNLINK" | b"SREM" | b"HDEL" | b"ZREM" | b"SADD" | b"HSETNX" | b"LPUSHX"
         | b"RPUSHX" | b"PERSIST" | b"EXPIRE" | b"PEXPIRE" | b"EXPIREAT" | b"PEXPIREAT"
-        | b"SETNX" | b"MSETNX" | b"RENAMENX" | b"LREM" | b"SMOVE" => !zero,
+        | b"SETNX" | b"MSETNX" | b"RENAMENX" | b"LREM" | b"SMOVE" | b"ZREMRANGEBYRANK"
+        | b"ZREMRANGEBYSCORE" => !zero,
         // ZADD: 0 added/changed, or nil from an aborted INCR (NX/XX/GT/LT).
         b"ZADD" => !(zero || nil),
         // LINSERT: 0 (no key) or -1 (pivot not found) means nothing was inserted.

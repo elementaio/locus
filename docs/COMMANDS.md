@@ -66,6 +66,9 @@ works. This is a curated subset of Redis — the common, useful commands per typ
 `ZADD [NX\|XX] [GT\|LT] [CH] [INCR]` `ZSCORE` `ZMSCORE` `ZCARD` `ZREM` `ZINCRBY` `ZRANK` `ZREVRANK`
 `ZRANGE [WITHSCORES] [REV]` `ZREVRANGE` `ZRANGEBYSCORE` / `ZREVRANGEBYSCORE` (exclusive `(` bounds,
 `inf`/`-inf`, `LIMIT`) `ZCOUNT` `ZPOPMIN [count]` `ZPOPMAX [count]`
+`ZREMRANGEBYRANK key start stop` `ZREMRANGEBYSCORE key min max`
+`ZUNIONSTORE dst numkeys key... [WEIGHTS w...] [AGGREGATE SUM|MIN|MAX]` `ZINTERSTORE` (same form;
+sources may be sets, scoring 1.0)
 
 ## Streams
 

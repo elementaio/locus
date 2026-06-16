@@ -161,6 +161,10 @@ pub fn execute(tokens: &[Vec<u8>], db: &mut Db) -> Vec<u8> {
         b"ZCOUNT" => zcount_cmd(db, tokens),
         b"ZPOPMIN" => zpop_cmd(db, tokens, false),
         b"ZPOPMAX" => zpop_cmd(db, tokens, true),
+        b"ZREMRANGEBYRANK" => zremrangebyrank_cmd(db, tokens),
+        b"ZREMRANGEBYSCORE" => zremrangebyscore_cmd(db, tokens),
+        b"ZUNIONSTORE" => zstore_cmd(db, tokens, false),
+        b"ZINTERSTORE" => zstore_cmd(db, tokens, true),
         // streams (XREAD is handled in the hub for blocking support)
         b"XADD" => streams::xadd(db, tokens),
         b"XLEN" => streams::xlen(db, tokens),
@@ -239,7 +243,8 @@ pub fn command_meta(cmd: &[u8]) -> Option<CmdMeta> {
         | b"ZCOUNT" | b"XRANGE" | b"XREVRANGE" | b"XREAD" | b"GETRANGE" => (4, false),
         // arity 4 writes
         b"LSET" | b"HSET" | b"HSETNX" | b"HINCRBY" | b"ZADD" | b"ZINCRBY" | b"SETEX"
-        | b"PSETEX" | b"SETRANGE" | b"LREM" | b"LTRIM" | b"SMOVE" => (4, true),
+        | b"PSETEX" | b"SETRANGE" | b"LREM" | b"LTRIM" | b"SMOVE" | b"ZREMRANGEBYRANK"
+        | b"ZREMRANGEBYSCORE" | b"ZUNIONSTORE" | b"ZINTERSTORE" => (4, true),
         // arity 5 writes
         b"XADD" | b"LINSERT" | b"LMOVE" => (5, true),
         _ => return None,
@@ -2075,6 +2080,168 @@ fn zpop_cmd(db: &mut Db, tokens: &[Vec<u8>], max: bool) -> Vec<u8> {
     bulk_array(&out)
 }
 
+fn zremrangebyrank_cmd(db: &mut Db, tokens: &[Vec<u8>]) -> Vec<u8> {
+    if tokens.len() != 4 {
+        return wrong_args("zremrangebyrank");
+    }
+    let (start, stop) = match (parse_int(&tokens[2]), parse_int(&tokens[3])) {
+        (Some(a), Some(b)) => (a, b),
+        _ => return not_integer(),
+    };
+    let z = match db.get_mut(&tokens[1]) {
+        None => return integer(0),
+        Some(Value::ZSet(z)) => z,
+        Some(_) => return wrongtype(),
+    };
+    let sorted = sorted_members(z);
+    let len = sorted.len();
+    let s = norm(start, len).max(0);
+    let mut e = norm(stop, len);
+    if e >= len as i64 {
+        e = len as i64 - 1;
+    }
+    if len == 0 || s > e || s >= len as i64 {
+        return integer(0);
+    }
+    let remove: Vec<Vec<u8>> = sorted[s as usize..=e as usize]
+        .iter()
+        .map(|(m, _)| m.clone())
+        .collect();
+    let n = remove.len();
+    for m in &remove {
+        z.remove(m);
+    }
+    db.remove_if_empty(&tokens[1]);
+    integer(n as i64)
+}
+
+fn zremrangebyscore_cmd(db: &mut Db, tokens: &[Vec<u8>]) -> Vec<u8> {
+    if tokens.len() != 4 {
+        return wrong_args("zremrangebyscore");
+    }
+    let (lo, lo_ex) = match parse_bound(&tokens[2]) {
+        Some(x) => x,
+        None => return error("ERR min or max is not a float"),
+    };
+    let (hi, hi_ex) = match parse_bound(&tokens[3]) {
+        Some(x) => x,
+        None => return error("ERR min or max is not a float"),
+    };
+    let z = match db.get_mut(&tokens[1]) {
+        None => return integer(0),
+        Some(Value::ZSet(z)) => z,
+        Some(_) => return wrongtype(),
+    };
+    let remove: Vec<Vec<u8>> = z
+        .iter()
+        .filter(|&(_, &s)| in_range(s, lo, lo_ex, hi, hi_ex))
+        .map(|(m, _)| m.clone())
+        .collect();
+    let n = remove.len();
+    for m in &remove {
+        z.remove(m);
+    }
+    db.remove_if_empty(&tokens[1]);
+    integer(n as i64)
+}
+
+#[derive(Clone, Copy)]
+enum Agg {
+    Sum,
+    Min,
+    Max,
+}
+
+fn aggregate(agg: Agg, a: f64, b: f64) -> f64 {
+    let r = match agg {
+        Agg::Sum => a + b,
+        Agg::Min => a.min(b),
+        Agg::Max => a.max(b),
+    };
+    if r.is_nan() { 0.0 } else { r } // e.g. inf + -inf
+}
+
+/// ZUNIONSTORE / ZINTERSTORE:
+/// `<cmd> dest numkeys key [key ...] [WEIGHTS w ...] [AGGREGATE SUM|MIN|MAX]`.
+/// Source keys may be sorted sets or plain sets (a set member scores 1.0).
+fn zstore_cmd(db: &mut Db, tokens: &[Vec<u8>], inter: bool) -> Vec<u8> {
+    if tokens.len() < 4 {
+        return wrong_args(&cmd_name(tokens));
+    }
+    let numkeys = match parse_int(&tokens[2]) {
+        Some(n) if n > 0 => n as usize,
+        Some(_) => return error("ERR at least 1 input key is needed"),
+        None => return not_integer(),
+    };
+    if tokens.len() < 3 + numkeys {
+        return error("ERR syntax error");
+    }
+    let keys = &tokens[3..3 + numkeys];
+    let rest = &tokens[3 + numkeys..];
+    let mut weights = vec![1.0f64; numkeys];
+    let mut agg = Agg::Sum;
+    let mut i = 0;
+    while i < rest.len() {
+        match rest[i].to_ascii_uppercase().as_slice() {
+            b"WEIGHTS" => {
+                if rest.len() < i + 1 + numkeys {
+                    return error("ERR syntax error");
+                }
+                for (j, w) in weights.iter_mut().enumerate() {
+                    *w = match parse_score(&rest[i + 1 + j]) {
+                        Some(v) => v,
+                        None => return error("ERR weight value is not a float"),
+                    };
+                }
+                i += 1 + numkeys;
+            }
+            b"AGGREGATE" => {
+                agg = match rest.get(i + 1).map(|a| a.to_ascii_uppercase()) {
+                    Some(a) if a == b"SUM" => Agg::Sum,
+                    Some(a) if a == b"MIN" => Agg::Min,
+                    Some(a) if a == b"MAX" => Agg::Max,
+                    _ => return error("ERR syntax error"),
+                };
+                i += 2;
+            }
+            _ => return error("ERR syntax error"),
+        }
+    }
+    let mut acc: HashMap<Vec<u8>, f64> = HashMap::new();
+    for (idx, key) in keys.iter().enumerate() {
+        let w = weights[idx];
+        let this: HashMap<Vec<u8>, f64> = match db.get(key) {
+            None => HashMap::new(),
+            Some(Value::ZSet(z)) => z.iter().map(|(m, &s)| (m.clone(), s * w)).collect(),
+            Some(Value::Set(s)) => s.iter().map(|m| (m.clone(), w)).collect(),
+            Some(_) => return wrongtype(),
+        };
+        if !inter {
+            for (m, v) in this {
+                acc.entry(m)
+                    .and_modify(|c| *c = aggregate(agg, *c, v))
+                    .or_insert(v);
+            }
+        } else if idx == 0 {
+            acc = this;
+        } else {
+            acc = acc
+                .iter()
+                .filter_map(|(m, v)| this.get(m).map(|tv| (m.clone(), aggregate(agg, *v, *tv))))
+                .collect();
+        }
+    }
+    let dest = &tokens[1];
+    let n = acc.len();
+    if acc.is_empty() {
+        db.remove(dest);
+    } else {
+        db.insert(dest.clone(), Value::ZSet(acc));
+        db.clear_expire(dest);
+    }
+    integer(n as i64)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2388,6 +2555,99 @@ mod tests {
     }
 
     #[test]
+    fn zset_range_and_store_commands() {
+        let mut db = Db::new();
+        cmd(
+            &mut db,
+            &[
+                b"ZADD", b"z", b"1", b"a", b"2", b"b", b"3", b"c", b"4", b"d",
+            ],
+        );
+        // ZREMRANGEBYRANK removes ranks [1,2] => b,c
+        assert_eq!(
+            cmd(&mut db, &[b"ZREMRANGEBYRANK", b"z", b"1", b"2"]),
+            b":2\r\n".to_vec()
+        );
+        assert_eq!(
+            cmd(&mut db, &[b"ZRANGE", b"z", b"0", b"-1"]),
+            bulk_array(&[b"a".to_vec(), b"d".to_vec()])
+        );
+        // ZREMRANGEBYSCORE
+        cmd(
+            &mut db,
+            &[b"ZADD", b"s", b"1", b"a", b"2", b"b", b"3", b"c"],
+        );
+        assert_eq!(
+            cmd(&mut db, &[b"ZREMRANGEBYSCORE", b"s", b"(1", b"3"]),
+            b":2\r\n".to_vec()
+        );
+        assert_eq!(
+            cmd(&mut db, &[b"ZRANGE", b"s", b"0", b"-1"]),
+            bulk_array(&[b"a".to_vec()])
+        );
+        // ZUNIONSTORE with WEIGHTS + AGGREGATE
+        cmd(&mut db, &[b"ZADD", b"z1", b"1", b"a", b"2", b"b"]);
+        cmd(&mut db, &[b"ZADD", b"z2", b"10", b"b", b"20", b"c"]);
+        assert_eq!(
+            cmd(&mut db, &[b"ZUNIONSTORE", b"out", b"2", b"z1", b"z2"]),
+            b":3\r\n".to_vec()
+        );
+        // b = 2 + 10 = 12
+        assert_eq!(cmd(&mut db, &[b"ZSCORE", b"out", b"b"]), bulk_string(b"12"));
+        // WEIGHTS: z1*2, z2*1 -> b = 4 + 10 = 14
+        assert_eq!(
+            cmd(
+                &mut db,
+                &[
+                    b"ZUNIONSTORE",
+                    b"w",
+                    b"2",
+                    b"z1",
+                    b"z2",
+                    b"WEIGHTS",
+                    b"2",
+                    b"1"
+                ]
+            ),
+            b":3\r\n".to_vec()
+        );
+        assert_eq!(cmd(&mut db, &[b"ZSCORE", b"w", b"b"]), bulk_string(b"14"));
+        // AGGREGATE MAX -> b = max(2,10) = 10
+        cmd(
+            &mut db,
+            &[
+                b"ZUNIONSTORE",
+                b"mx",
+                b"2",
+                b"z1",
+                b"z2",
+                b"AGGREGATE",
+                b"MAX",
+            ],
+        );
+        assert_eq!(cmd(&mut db, &[b"ZSCORE", b"mx", b"b"]), bulk_string(b"10"));
+        // ZINTERSTORE -> only b is in both; SUM = 12
+        assert_eq!(
+            cmd(&mut db, &[b"ZINTERSTORE", b"i", b"2", b"z1", b"z2"]),
+            b":1\r\n".to_vec()
+        );
+        assert_eq!(cmd(&mut db, &[b"ZSCORE", b"i", b"b"]), bulk_string(b"12"));
+        // empty intersection deletes dest
+        cmd(&mut db, &[b"ZADD", b"p", b"1", b"x"]);
+        cmd(&mut db, &[b"ZADD", b"q", b"1", b"y"]);
+        cmd(&mut db, &[b"SET", b"victim", b"old"]);
+        assert_eq!(
+            cmd(&mut db, &[b"ZINTERSTORE", b"victim", b"2", b"p", b"q"]),
+            b":0\r\n".to_vec()
+        );
+        assert_eq!(cmd(&mut db, &[b"EXISTS", b"victim"]), b":0\r\n".to_vec());
+        // WRONGTYPE
+        cmd(&mut db, &[b"SET", b"str", b"v"]);
+        assert!(cmd(&mut db, &[b"ZREMRANGEBYRANK", b"str", b"0", b"1"]).starts_with(b"-WRONGTYPE"));
+        assert!(cmd(&mut db, &[b"ZUNIONSTORE", b"d", b"1", b"str"]).starts_with(b"-WRONGTYPE"));
+    }
+
+    #[test]
     fn set_store_move_commands() {
         let mut db = Db::new();
         cmd(&mut db, &[b"SADD", b"a", b"1", b"2", b"3"]);
@@ -2598,6 +2858,10 @@ mod tests {
             b"ZINCRBY",
             b"ZPOPMIN",
             b"ZPOPMAX",
+            b"ZREMRANGEBYRANK",
+            b"ZREMRANGEBYSCORE",
+            b"ZUNIONSTORE",
+            b"ZINTERSTORE",
             b"XADD",
         ];
         for w in writes {
