@@ -22,6 +22,9 @@ pub enum Value {
     List(VecDeque<Vec<u8>>),
     Hash(HashMap<Vec<u8>, Vec<u8>>),
     Set(HashSet<Vec<u8>>),
+    /// Sorted set: member -> score. Kept correct-but-simple (sorted on demand);
+    /// a skiplist for O(log n) rank/range is the documented later optimization.
+    ZSet(HashMap<Vec<u8>, f64>),
 }
 
 impl Value {
@@ -31,6 +34,7 @@ impl Value {
             Value::List(_) => "list",
             Value::Hash(_) => "hash",
             Value::Set(_) => "set",
+            Value::ZSet(_) => "zset",
         }
     }
 
@@ -39,6 +43,7 @@ impl Value {
             Value::List(l) => l.is_empty(),
             Value::Hash(h) => h.is_empty(),
             Value::Set(s) => s.is_empty(),
+            Value::ZSet(z) => z.is_empty(),
             Value::Str(_) => false,
         }
     }

@@ -107,6 +107,22 @@ pub fn execute(tokens: &[Vec<u8>], db: &mut Db) -> Vec<u8> {
         b"SINTER" => setop_cmd(db, tokens, SetOp::Inter),
         b"SUNION" => setop_cmd(db, tokens, SetOp::Union),
         b"SDIFF" => setop_cmd(db, tokens, SetOp::Diff),
+        // sorted sets
+        b"ZADD" => zadd_cmd(db, tokens),
+        b"ZSCORE" => zscore_cmd(db, tokens),
+        b"ZMSCORE" => zmscore_cmd(db, tokens),
+        b"ZCARD" => zcard_cmd(db, tokens),
+        b"ZREM" => zrem_cmd(db, tokens),
+        b"ZINCRBY" => zincrby_cmd(db, tokens),
+        b"ZRANK" => zrank_cmd(db, tokens, false),
+        b"ZREVRANK" => zrank_cmd(db, tokens, true),
+        b"ZRANGE" => zrange_cmd(db, tokens),
+        b"ZREVRANGE" => zrevrange_cmd(db, tokens),
+        b"ZRANGEBYSCORE" => zrangebyscore_cmd(db, tokens, false),
+        b"ZREVRANGEBYSCORE" => zrangebyscore_cmd(db, tokens, true),
+        b"ZCOUNT" => zcount_cmd(db, tokens),
+        b"ZPOPMIN" => zpop_cmd(db, tokens, false),
+        b"ZPOPMAX" => zpop_cmd(db, tokens, true),
         // stubs
         b"COMMAND" => b"*0\r\n".to_vec(),
         b"CONFIG" => match tokens.get(1).map(|t| t.to_ascii_uppercase()).as_deref() {
@@ -842,6 +858,437 @@ fn setop_cmd(db: &mut Db, tokens: &[Vec<u8>], op: SetOp) -> Vec<u8> {
     bulk_array(&acc.into_iter().collect::<Vec<_>>())
 }
 
+// === sorted sets ============================================================
+
+fn parse_score(arg: &[u8]) -> Option<f64> {
+    let s = std::str::from_utf8(arg).ok()?.trim();
+    match s.to_ascii_lowercase().as_str() {
+        "inf" | "+inf" | "infinity" | "+infinity" => Some(f64::INFINITY),
+        "-inf" | "-infinity" => Some(f64::NEG_INFINITY),
+        _ => s.parse::<f64>().ok(),
+    }
+}
+
+/// Format a score like Redis: integers without a decimal point, infinities as
+/// inf/-inf, otherwise the shortest round-tripping form.
+fn fmt_score(s: f64) -> Vec<u8> {
+    if s.is_infinite() {
+        if s > 0.0 {
+            b"inf".to_vec()
+        } else {
+            b"-inf".to_vec()
+        }
+    } else {
+        format!("{s}").into_bytes()
+    }
+}
+
+/// Parse a range bound: "(x" is exclusive, otherwise inclusive.
+fn parse_bound(arg: &[u8]) -> Option<(f64, bool)> {
+    if arg.first() == Some(&b'(') {
+        parse_score(&arg[1..]).map(|v| (v, true))
+    } else {
+        parse_score(arg).map(|v| (v, false))
+    }
+}
+
+fn in_range(s: f64, lo: f64, lo_ex: bool, hi: f64, hi_ex: bool) -> bool {
+    let above = if lo_ex { s > lo } else { s >= lo };
+    let below = if hi_ex { s < hi } else { s <= hi };
+    above && below
+}
+
+/// Members sorted by (score, then member bytes), ascending.
+fn sorted_members(z: &HashMap<Vec<u8>, f64>) -> Vec<(Vec<u8>, f64)> {
+    let mut v: Vec<(Vec<u8>, f64)> = z.iter().map(|(m, s)| (m.clone(), *s)).collect();
+    v.sort_by(|a, b| a.1.total_cmp(&b.1).then_with(|| a.0.cmp(&b.0)));
+    v
+}
+
+fn get_zset<'a>(db: &'a mut Db, key: &[u8]) -> Result<Option<&'a HashMap<Vec<u8>, f64>>, ()> {
+    match db.get(key) {
+        None => Ok(None),
+        Some(Value::ZSet(z)) => Ok(Some(z)),
+        Some(_) => Err(()),
+    }
+}
+
+fn zadd_cmd(db: &mut Db, tokens: &[Vec<u8>]) -> Vec<u8> {
+    if tokens.len() < 4 {
+        return wrong_args("zadd");
+    }
+    let (mut nx, mut xx, mut ch, mut incr) = (false, false, false, false);
+    let mut i = 2;
+    while i < tokens.len() {
+        match tokens[i].to_ascii_uppercase().as_slice() {
+            b"NX" => nx = true,
+            b"XX" => xx = true,
+            b"CH" => ch = true,
+            b"INCR" => incr = true,
+            b"GT" | b"LT" => {} // accepted, treated as no-op for now
+            _ => break,
+        }
+        i += 1;
+    }
+    let pairs = &tokens[i..];
+    if pairs.is_empty() || pairs.len() % 2 != 0 {
+        return error("ERR syntax error");
+    }
+    if nx && xx {
+        return error("ERR XX and NX options at the same time are not compatible");
+    }
+    if incr && pairs.len() != 2 {
+        return error("ERR INCR option supports a single increment-element pair");
+    }
+    // Parse all scores up front so a bad float aborts without mutating anything.
+    let mut parsed: Vec<(f64, &Vec<u8>)> = Vec::with_capacity(pairs.len() / 2);
+    let mut j = 0;
+    while j < pairs.len() {
+        match parse_score(&pairs[j]) {
+            Some(s) => parsed.push((s, &pairs[j + 1])),
+            None => return error("ERR value is not a valid float"),
+        }
+        j += 2;
+    }
+    let key = &tokens[1];
+    let z = match db.get_or_insert_with(key, || Value::ZSet(HashMap::new())) {
+        Value::ZSet(z) => z,
+        _ => return wrongtype(),
+    };
+    if incr {
+        let (score, member) = parsed[0];
+        let existing = z.get(member).copied();
+        if (nx && existing.is_some()) || (xx && existing.is_none()) {
+            db.remove_if_empty(key);
+            return null_bulk();
+        }
+        let newv = existing.unwrap_or(0.0) + score;
+        z.insert(member.clone(), newv);
+        return bulk_string(&fmt_score(newv));
+    }
+    let mut added = 0i64;
+    let mut changed = 0i64;
+    for (score, member) in parsed {
+        let existing = z.get(member).copied();
+        if (nx && existing.is_some()) || (xx && existing.is_none()) {
+            continue;
+        }
+        match existing {
+            None => {
+                z.insert(member.clone(), score);
+                added += 1;
+                changed += 1;
+            }
+            Some(old) if old != score => {
+                z.insert(member.clone(), score);
+                changed += 1;
+            }
+            _ => {}
+        }
+    }
+    db.remove_if_empty(key);
+    integer(if ch { changed } else { added })
+}
+
+fn zscore_cmd(db: &mut Db, tokens: &[Vec<u8>]) -> Vec<u8> {
+    if tokens.len() != 3 {
+        return wrong_args("zscore");
+    }
+    match get_zset(db, &tokens[1]) {
+        Err(()) => wrongtype(),
+        Ok(None) => null_bulk(),
+        Ok(Some(z)) => z
+            .get(&tokens[2])
+            .map(|s| bulk_string(&fmt_score(*s)))
+            .unwrap_or_else(null_bulk),
+    }
+}
+
+fn zmscore_cmd(db: &mut Db, tokens: &[Vec<u8>]) -> Vec<u8> {
+    if tokens.len() < 3 {
+        return wrong_args("zmscore");
+    }
+    match get_zset(db, &tokens[1]) {
+        Err(()) => wrongtype(),
+        Ok(opt) => {
+            let elems: Vec<Vec<u8>> = tokens[2..]
+                .iter()
+                .map(|m| match opt.and_then(|z| z.get(m)) {
+                    Some(s) => bulk_string(&fmt_score(*s)),
+                    None => null_bulk(),
+                })
+                .collect();
+            array(&elems)
+        }
+    }
+}
+
+fn zcard_cmd(db: &mut Db, tokens: &[Vec<u8>]) -> Vec<u8> {
+    if tokens.len() != 2 {
+        return wrong_args("zcard");
+    }
+    match get_zset(db, &tokens[1]) {
+        Err(()) => wrongtype(),
+        Ok(None) => integer(0),
+        Ok(Some(z)) => integer(z.len() as i64),
+    }
+}
+
+fn zrem_cmd(db: &mut Db, tokens: &[Vec<u8>]) -> Vec<u8> {
+    if tokens.len() < 3 {
+        return wrong_args("zrem");
+    }
+    let removed = match db.get_mut(&tokens[1]) {
+        None => 0,
+        Some(Value::ZSet(z)) => tokens[2..].iter().filter(|m| z.remove(*m).is_some()).count() as i64,
+        Some(_) => return wrongtype(),
+    };
+    db.remove_if_empty(&tokens[1]);
+    integer(removed)
+}
+
+fn zincrby_cmd(db: &mut Db, tokens: &[Vec<u8>]) -> Vec<u8> {
+    if tokens.len() != 4 {
+        return wrong_args("zincrby");
+    }
+    let incr = match parse_score(&tokens[2]) {
+        Some(s) => s,
+        None => return error("ERR value is not a valid float"),
+    };
+    let z = match db.get_or_insert_with(&tokens[1], || Value::ZSet(HashMap::new())) {
+        Value::ZSet(z) => z,
+        _ => return wrongtype(),
+    };
+    let newv = z.get(&tokens[3]).copied().unwrap_or(0.0) + incr;
+    z.insert(tokens[3].clone(), newv);
+    bulk_string(&fmt_score(newv))
+}
+
+fn zrank_cmd(db: &mut Db, tokens: &[Vec<u8>], rev: bool) -> Vec<u8> {
+    if tokens.len() != 3 {
+        return wrong_args("zrank");
+    }
+    match get_zset(db, &tokens[1]) {
+        Err(()) => wrongtype(),
+        Ok(None) => null_bulk(),
+        Ok(Some(z)) => {
+            let mut sorted = sorted_members(z);
+            if rev {
+                sorted.reverse();
+            }
+            match sorted.iter().position(|(m, _)| m == &tokens[2]) {
+                Some(i) => integer(i as i64),
+                None => null_bulk(),
+            }
+        }
+    }
+}
+
+fn zrange_index(z: &HashMap<Vec<u8>, f64>, start: i64, stop: i64, withscores: bool, rev: bool) -> Vec<u8> {
+    let mut sorted = sorted_members(z);
+    if rev {
+        sorted.reverse();
+    }
+    let len = sorted.len();
+    let s = norm(start, len).max(0);
+    let mut e = norm(stop, len);
+    if e >= len as i64 {
+        e = len as i64 - 1;
+    }
+    if len == 0 || s > e || s >= len as i64 {
+        return bulk_array(&[]);
+    }
+    let mut out: Vec<Vec<u8>> = Vec::new();
+    for (m, sc) in &sorted[s as usize..=e as usize] {
+        out.push(m.clone());
+        if withscores {
+            out.push(fmt_score(*sc));
+        }
+    }
+    bulk_array(&out)
+}
+
+fn zrange_cmd(db: &mut Db, tokens: &[Vec<u8>]) -> Vec<u8> {
+    if tokens.len() < 4 {
+        return wrong_args("zrange");
+    }
+    let (start, stop) = match (parse_int(&tokens[2]), parse_int(&tokens[3])) {
+        (Some(a), Some(b)) => (a, b),
+        _ => return not_integer(),
+    };
+    let (mut withscores, mut rev) = (false, false);
+    for t in &tokens[4..] {
+        match t.to_ascii_uppercase().as_slice() {
+            b"WITHSCORES" => withscores = true,
+            b"REV" => rev = true,
+            _ => return error("ERR syntax error"),
+        }
+    }
+    match get_zset(db, &tokens[1]) {
+        Err(()) => wrongtype(),
+        Ok(None) => bulk_array(&[]),
+        Ok(Some(z)) => zrange_index(z, start, stop, withscores, rev),
+    }
+}
+
+fn zrevrange_cmd(db: &mut Db, tokens: &[Vec<u8>]) -> Vec<u8> {
+    if tokens.len() < 4 {
+        return wrong_args("zrevrange");
+    }
+    let (start, stop) = match (parse_int(&tokens[2]), parse_int(&tokens[3])) {
+        (Some(a), Some(b)) => (a, b),
+        _ => return not_integer(),
+    };
+    let mut withscores = false;
+    for t in &tokens[4..] {
+        match t.to_ascii_uppercase().as_slice() {
+            b"WITHSCORES" => withscores = true,
+            _ => return error("ERR syntax error"),
+        }
+    }
+    match get_zset(db, &tokens[1]) {
+        Err(()) => wrongtype(),
+        Ok(None) => bulk_array(&[]),
+        Ok(Some(z)) => zrange_index(z, start, stop, withscores, true),
+    }
+}
+
+fn zrangebyscore_cmd(db: &mut Db, tokens: &[Vec<u8>], rev: bool) -> Vec<u8> {
+    if tokens.len() < 4 {
+        return wrong_args("zrangebyscore");
+    }
+    // ZRANGEBYSCORE key min max ... ; ZREVRANGEBYSCORE key max min ...
+    let (lo_arg, hi_arg) = if rev {
+        (&tokens[3], &tokens[2])
+    } else {
+        (&tokens[2], &tokens[3])
+    };
+    let (lo, lo_ex) = match parse_bound(lo_arg) {
+        Some(x) => x,
+        None => return error("ERR min or max is not a float"),
+    };
+    let (hi, hi_ex) = match parse_bound(hi_arg) {
+        Some(x) => x,
+        None => return error("ERR min or max is not a float"),
+    };
+    let mut withscores = false;
+    let mut limit: Option<(i64, i64)> = None;
+    let mut i = 4;
+    while i < tokens.len() {
+        match tokens[i].to_ascii_uppercase().as_slice() {
+            b"WITHSCORES" => {
+                withscores = true;
+                i += 1;
+            }
+            b"LIMIT" => {
+                if i + 2 >= tokens.len() {
+                    return error("ERR syntax error");
+                }
+                let off = match parse_int(&tokens[i + 1]) {
+                    Some(n) => n,
+                    None => return not_integer(),
+                };
+                let cnt = match parse_int(&tokens[i + 2]) {
+                    Some(n) => n,
+                    None => return not_integer(),
+                };
+                limit = Some((off, cnt));
+                i += 3;
+            }
+            _ => return error("ERR syntax error"),
+        }
+    }
+    let z = match get_zset(db, &tokens[1]) {
+        Err(()) => return wrongtype(),
+        Ok(None) => return bulk_array(&[]),
+        Ok(Some(z)) => z,
+    };
+    let mut filtered: Vec<(Vec<u8>, f64)> = sorted_members(z)
+        .into_iter()
+        .filter(|(_, s)| in_range(*s, lo, lo_ex, hi, hi_ex))
+        .collect();
+    if rev {
+        filtered.reverse();
+    }
+    let slice: Vec<(Vec<u8>, f64)> = match limit {
+        Some((off, cnt)) => {
+            let it = filtered.into_iter().skip(off.max(0) as usize);
+            if cnt < 0 {
+                it.collect()
+            } else {
+                it.take(cnt as usize).collect()
+            }
+        }
+        None => filtered,
+    };
+    let mut out = Vec::new();
+    for (m, s) in slice {
+        out.push(m);
+        if withscores {
+            out.push(fmt_score(s));
+        }
+    }
+    bulk_array(&out)
+}
+
+fn zcount_cmd(db: &mut Db, tokens: &[Vec<u8>]) -> Vec<u8> {
+    if tokens.len() != 4 {
+        return wrong_args("zcount");
+    }
+    let (lo, lo_ex) = match parse_bound(&tokens[2]) {
+        Some(x) => x,
+        None => return error("ERR min or max is not a float"),
+    };
+    let (hi, hi_ex) = match parse_bound(&tokens[3]) {
+        Some(x) => x,
+        None => return error("ERR min or max is not a float"),
+    };
+    match get_zset(db, &tokens[1]) {
+        Err(()) => wrongtype(),
+        Ok(None) => integer(0),
+        Ok(Some(z)) => {
+            let n = z.values().filter(|s| in_range(**s, lo, lo_ex, hi, hi_ex)).count();
+            integer(n as i64)
+        }
+    }
+}
+
+fn zpop_cmd(db: &mut Db, tokens: &[Vec<u8>], max: bool) -> Vec<u8> {
+    if tokens.len() < 2 || tokens.len() > 3 {
+        return wrong_args("zpop");
+    }
+    let count = if tokens.len() == 3 {
+        match parse_int(&tokens[2]) {
+            Some(c) if c >= 0 => c as usize,
+            _ => return error("ERR value is out of range, must be positive"),
+        }
+    } else {
+        1
+    };
+    let mut popped: Vec<(Vec<u8>, f64)> = Vec::new();
+    match db.get_mut(&tokens[1]) {
+        None => return bulk_array(&[]),
+        Some(Value::ZSet(z)) => {
+            let mut sorted = sorted_members(z);
+            if max {
+                sorted.reverse();
+            }
+            for (m, s) in sorted.into_iter().take(count) {
+                z.remove(&m);
+                popped.push((m, s));
+            }
+        }
+        Some(_) => return wrongtype(),
+    }
+    db.remove_if_empty(&tokens[1]);
+    let mut out = Vec::new();
+    for (m, s) in popped {
+        out.push(m);
+        out.push(fmt_score(s));
+    }
+    bulk_array(&out)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -911,5 +1358,37 @@ mod tests {
         assert!(cmd(&mut db, &[b"HSET", b"k", b"f", b"v"]).starts_with(b"-WRONGTYPE"));
         assert!(cmd(&mut db, &[b"SADD", b"k", b"m"]).starts_with(b"-WRONGTYPE"));
         assert_eq!(cmd(&mut db, &[b"TYPE", b"k"]), b"+string\r\n".to_vec());
+    }
+
+    #[test]
+    fn zsets() {
+        let mut db = Db::new();
+        assert_eq!(
+            cmd(&mut db, &[b"ZADD", b"z", b"1", b"a", b"3", b"c", b"2", b"b"]),
+            b":3\r\n".to_vec()
+        );
+        assert_eq!(cmd(&mut db, &[b"ZCARD", b"z"]), b":3\r\n".to_vec());
+        assert_eq!(cmd(&mut db, &[b"ZSCORE", b"z", b"b"]), b"$1\r\n2\r\n".to_vec());
+        assert_eq!(cmd(&mut db, &[b"ZRANK", b"z", b"a"]), b":0\r\n".to_vec());
+        assert_eq!(cmd(&mut db, &[b"ZRANK", b"z", b"c"]), b":2\r\n".to_vec());
+        assert_eq!(cmd(&mut db, &[b"ZREVRANK", b"z", b"c"]), b":0\r\n".to_vec());
+        // ascending range
+        assert_eq!(
+            cmd(&mut db, &[b"ZRANGE", b"z", b"0", b"-1"]),
+            bulk_array(&[b"a".to_vec(), b"b".to_vec(), b"c".to_vec()])
+        );
+        // by score, exclusive lower bound
+        assert_eq!(
+            cmd(&mut db, &[b"ZRANGEBYSCORE", b"z", b"(1", b"3"]),
+            bulk_array(&[b"b".to_vec(), b"c".to_vec()])
+        );
+        assert_eq!(cmd(&mut db, &[b"ZINCRBY", b"z", b"5", b"a"]), b"$1\r\n6\r\n".to_vec());
+        assert_eq!(cmd(&mut db, &[b"ZRANK", b"z", b"a"]), b":2\r\n".to_vec()); // now highest
+        assert_eq!(cmd(&mut db, &[b"ZCOUNT", b"z", b"2", b"6"]), b":3\r\n".to_vec());
+        // ZPOPMIN removes the lowest
+        assert_eq!(
+            cmd(&mut db, &[b"ZPOPMIN", b"z"]),
+            bulk_array(&[b"b".to_vec(), b"2".to_vec()])
+        );
     }
 }
