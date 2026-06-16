@@ -58,6 +58,8 @@ works. This is a curated subset of Redis — the common, useful commands per typ
 ## Sets
 
 `SADD` `SREM` `SMEMBERS` `SISMEMBER` `SMISMEMBER` `SCARD` `SPOP [count]` `SINTER` `SUNION` `SDIFF`
+`SMOVE src dst member` `SINTERSTORE dst key...` `SUNIONSTORE dst key...` `SDIFFSTORE dst key...`
+`SINTERCARD numkeys key... [LIMIT n]`
 
 ## Sorted sets
 

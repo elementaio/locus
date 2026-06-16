@@ -140,6 +140,11 @@ pub fn execute(tokens: &[Vec<u8>], db: &mut Db) -> Vec<u8> {
         b"SINTER" => setop_cmd(db, tokens, SetOp::Inter),
         b"SUNION" => setop_cmd(db, tokens, SetOp::Union),
         b"SDIFF" => setop_cmd(db, tokens, SetOp::Diff),
+        b"SINTERSTORE" => setop_store_cmd(db, tokens, SetOp::Inter),
+        b"SUNIONSTORE" => setop_store_cmd(db, tokens, SetOp::Union),
+        b"SDIFFSTORE" => setop_store_cmd(db, tokens, SetOp::Diff),
+        b"SINTERCARD" => sintercard_cmd(db, tokens),
+        b"SMOVE" => smove_cmd(db, tokens),
         // sorted sets
         b"ZADD" => zadd_cmd(db, tokens),
         b"ZSCORE" => zscore_cmd(db, tokens),
@@ -223,18 +228,18 @@ pub fn command_meta(cmd: &[u8]) -> Option<CmdMeta> {
         // arity 3 reads
         b"LINDEX" | b"HGET" | b"HEXISTS" | b"HMGET" | b"SISMEMBER" | b"SMISMEMBER" | b"ZSCORE"
         | b"ZMSCORE" | b"ZRANK" | b"ZREVRANK" | b"PUBLISH" | b"REPLICAOF" | b"SLAVEOF"
-        | b"LPOS" => (3, false),
+        | b"LPOS" | b"SINTERCARD" => (3, false),
         // arity 3 writes
         b"INCRBY" | b"DECRBY" | b"APPEND" | b"HDEL" | b"SADD" | b"SREM" | b"ZREM" | b"EXPIRE"
         | b"PEXPIRE" | b"EXPIREAT" | b"PEXPIREAT" | b"LPUSH" | b"RPUSH" | b"LPUSHX" | b"RPUSHX"
         | b"SET" | b"SETNX" | b"GETSET" | b"MSET" | b"MSETNX" | b"INCRBYFLOAT" | b"RENAME"
-        | b"RENAMENX" | b"RPOPLPUSH" => (3, true),
+        | b"RENAMENX" | b"RPOPLPUSH" | b"SINTERSTORE" | b"SUNIONSTORE" | b"SDIFFSTORE" => (3, true),
         // arity 4 reads
         b"LRANGE" | b"ZRANGE" | b"ZREVRANGE" | b"ZRANGEBYSCORE" | b"ZREVRANGEBYSCORE"
         | b"ZCOUNT" | b"XRANGE" | b"XREVRANGE" | b"XREAD" | b"GETRANGE" => (4, false),
         // arity 4 writes
         b"LSET" | b"HSET" | b"HSETNX" | b"HINCRBY" | b"ZADD" | b"ZINCRBY" | b"SETEX"
-        | b"PSETEX" | b"SETRANGE" | b"LREM" | b"LTRIM" => (4, true),
+        | b"PSETEX" | b"SETRANGE" | b"LREM" | b"LTRIM" | b"SMOVE" => (4, true),
         // arity 5 writes
         b"XADD" | b"LINSERT" | b"LMOVE" => (5, true),
         _ => return None,
@@ -1485,23 +1490,22 @@ fn spop_cmd(db: &mut Db, tokens: &[Vec<u8>]) -> Vec<u8> {
     }
 }
 
+#[derive(Clone, Copy)]
 enum SetOp {
     Inter,
     Union,
     Diff,
 }
 
-fn setop_cmd(db: &mut Db, tokens: &[Vec<u8>], op: SetOp) -> Vec<u8> {
-    if tokens.len() < 2 {
-        return wrong_args("setop");
-    }
-    // Collect each key's set (missing key = empty set; wrong type = error).
+/// Compute INTER/UNION/DIFF over `keys` (missing key = empty set). Err = a key
+/// holds a non-set value (WRONGTYPE). `keys` must be non-empty.
+fn setop_compute(db: &mut Db, keys: &[Vec<u8>], op: SetOp) -> Result<HashSet<Vec<u8>>, ()> {
     let mut sets: Vec<HashSet<Vec<u8>>> = Vec::new();
-    for key in &tokens[1..] {
+    for key in keys {
         match db.get(key) {
             None => sets.push(HashSet::new()),
             Some(Value::Set(s)) => sets.push(s.clone()),
-            Some(_) => return wrongtype(),
+            Some(_) => return Err(()),
         }
     }
     let mut acc = sets[0].clone();
@@ -1512,7 +1516,100 @@ fn setop_cmd(db: &mut Db, tokens: &[Vec<u8>], op: SetOp) -> Vec<u8> {
             SetOp::Diff => acc.retain(|m| !s.contains(m)),
         }
     }
-    bulk_array(&acc.into_iter().collect::<Vec<_>>())
+    Ok(acc)
+}
+
+fn setop_cmd(db: &mut Db, tokens: &[Vec<u8>], op: SetOp) -> Vec<u8> {
+    if tokens.len() < 2 {
+        return wrong_args("setop");
+    }
+    match setop_compute(db, &tokens[1..], op) {
+        Ok(acc) => bulk_array(&acc.into_iter().collect::<Vec<_>>()),
+        Err(()) => wrongtype(),
+    }
+}
+
+/// SINTERSTORE / SUNIONSTORE / SDIFFSTORE: `<cmd> dest key [key ...]`.
+fn setop_store_cmd(db: &mut Db, tokens: &[Vec<u8>], op: SetOp) -> Vec<u8> {
+    if tokens.len() < 3 {
+        return wrong_args(&cmd_name(tokens));
+    }
+    let acc = match setop_compute(db, &tokens[2..], op) {
+        Ok(a) => a,
+        Err(()) => return wrongtype(),
+    };
+    let n = acc.len();
+    let dest = &tokens[1];
+    if acc.is_empty() {
+        db.remove(dest); // an empty result deletes the destination
+    } else {
+        db.insert(dest.clone(), Value::Set(acc));
+        db.clear_expire(dest); // a fresh store overwrites any prior TTL
+    }
+    integer(n as i64)
+}
+
+fn smove_cmd(db: &mut Db, tokens: &[Vec<u8>]) -> Vec<u8> {
+    if tokens.len() != 4 {
+        return wrong_args("smove");
+    }
+    let (src, dst, member) = (&tokens[1], &tokens[2], &tokens[3]);
+    // Type-check dst up front so we never remove from src and then fail.
+    match db.get(dst) {
+        None | Some(Value::Set(_)) => {}
+        Some(_) => return wrongtype(),
+    }
+    let removed = match db.get_mut(src) {
+        None => false,
+        Some(Value::Set(s)) => s.remove(member),
+        Some(_) => return wrongtype(),
+    };
+    if !removed {
+        return integer(0);
+    }
+    db.remove_if_empty(src);
+    match db.get_or_insert_with(dst, || Value::Set(HashSet::new())) {
+        Value::Set(s) => {
+            s.insert(member.clone());
+        }
+        _ => return wrongtype(), // unreachable: dst was type-checked
+    }
+    integer(1)
+}
+
+fn sintercard_cmd(db: &mut Db, tokens: &[Vec<u8>]) -> Vec<u8> {
+    // SINTERCARD numkeys key [key ...] [LIMIT n]
+    if tokens.len() < 3 {
+        return wrong_args("sintercard");
+    }
+    let numkeys = match parse_int(&tokens[1]) {
+        Some(n) if n > 0 => n as usize,
+        Some(_) => return error("ERR numkeys should be greater than 0"),
+        None => return error("ERR numkeys should be greater than 0"),
+    };
+    if tokens.len() < 2 + numkeys {
+        return error("ERR Number of keys can't be greater than number of args");
+    }
+    let keys = &tokens[2..2 + numkeys];
+    let rest = &tokens[2 + numkeys..];
+    let mut limit: Option<usize> = None;
+    if !rest.is_empty() {
+        if rest.len() == 2 && rest[0].eq_ignore_ascii_case(b"LIMIT") {
+            limit = match parse_int(&rest[1]) {
+                Some(l) if l >= 0 => Some(l as usize),
+                _ => return error("ERR LIMIT can't be negative"),
+            };
+        } else {
+            return error("ERR syntax error");
+        }
+    }
+    match setop_compute(db, keys, SetOp::Inter) {
+        Ok(acc) => match limit {
+            Some(l) if l > 0 => integer(acc.len().min(l) as i64),
+            _ => integer(acc.len() as i64), // LIMIT 0 or absent = no cap
+        },
+        Err(()) => wrongtype(),
+    }
 }
 
 // === sorted sets ============================================================
@@ -2291,6 +2388,84 @@ mod tests {
     }
 
     #[test]
+    fn set_store_move_commands() {
+        let mut db = Db::new();
+        cmd(&mut db, &[b"SADD", b"a", b"1", b"2", b"3"]);
+        cmd(&mut db, &[b"SADD", b"b", b"2", b"3", b"4"]);
+        // SINTERSTORE -> {2,3}
+        assert_eq!(
+            cmd(&mut db, &[b"SINTERSTORE", b"d", b"a", b"b"]),
+            b":2\r\n".to_vec()
+        );
+        assert_eq!(cmd(&mut db, &[b"SCARD", b"d"]), b":2\r\n".to_vec());
+        assert_eq!(
+            cmd(&mut db, &[b"SISMEMBER", b"d", b"2"]),
+            b":1\r\n".to_vec()
+        );
+        assert_eq!(
+            cmd(&mut db, &[b"SISMEMBER", b"d", b"1"]),
+            b":0\r\n".to_vec()
+        );
+        // SUNIONSTORE -> {1,2,3,4}
+        assert_eq!(
+            cmd(&mut db, &[b"SUNIONSTORE", b"u", b"a", b"b"]),
+            b":4\r\n".to_vec()
+        );
+        // SDIFFSTORE a-b -> {1}
+        assert_eq!(
+            cmd(&mut db, &[b"SDIFFSTORE", b"x", b"a", b"b"]),
+            b":1\r\n".to_vec()
+        );
+        assert_eq!(
+            cmd(&mut db, &[b"SISMEMBER", b"x", b"1"]),
+            b":1\r\n".to_vec()
+        );
+        // empty result deletes the destination
+        cmd(&mut db, &[b"SADD", b"e1", b"p"]);
+        cmd(&mut db, &[b"SADD", b"e2", b"q"]);
+        cmd(&mut db, &[b"SET", b"victim", b"old"]);
+        assert_eq!(
+            cmd(&mut db, &[b"SINTERSTORE", b"victim", b"e1", b"e2"]),
+            b":0\r\n".to_vec()
+        );
+        assert_eq!(cmd(&mut db, &[b"EXISTS", b"victim"]), b":0\r\n".to_vec());
+        // SINTERCARD with and without LIMIT
+        assert_eq!(
+            cmd(&mut db, &[b"SINTERCARD", b"2", b"a", b"b"]),
+            b":2\r\n".to_vec()
+        );
+        assert_eq!(
+            cmd(&mut db, &[b"SINTERCARD", b"2", b"a", b"b", b"LIMIT", b"1"]),
+            b":1\r\n".to_vec()
+        );
+        assert_eq!(
+            cmd(&mut db, &[b"SINTERCARD", b"2", b"a", b"b", b"LIMIT", b"0"]),
+            b":2\r\n".to_vec()
+        );
+        // SMOVE
+        assert_eq!(
+            cmd(&mut db, &[b"SMOVE", b"a", b"b", b"1"]),
+            b":1\r\n".to_vec()
+        );
+        assert_eq!(
+            cmd(&mut db, &[b"SISMEMBER", b"a", b"1"]),
+            b":0\r\n".to_vec()
+        );
+        assert_eq!(
+            cmd(&mut db, &[b"SISMEMBER", b"b", b"1"]),
+            b":1\r\n".to_vec()
+        );
+        assert_eq!(
+            cmd(&mut db, &[b"SMOVE", b"a", b"b", b"999"]),
+            b":0\r\n".to_vec()
+        ); // not a member
+        // WRONGTYPE
+        cmd(&mut db, &[b"SET", b"str", b"x"]);
+        assert!(cmd(&mut db, &[b"SMOVE", b"str", b"b", b"1"]).starts_with(b"-WRONGTYPE"));
+        assert!(cmd(&mut db, &[b"SINTERSTORE", b"d", b"str"]).starts_with(b"-WRONGTYPE"));
+    }
+
+    #[test]
     fn list_mutation_commands() {
         let mut db = Db::new();
         cmd(&mut db, &[b"RPUSH", b"l", b"a", b"b", b"c", b"b", b"d"]);
@@ -2414,6 +2589,10 @@ mod tests {
             b"SADD",
             b"SREM",
             b"SPOP",
+            b"SMOVE",
+            b"SINTERSTORE",
+            b"SUNIONSTORE",
+            b"SDIFFSTORE",
             b"ZADD",
             b"ZREM",
             b"ZINCRBY",
@@ -2435,6 +2614,7 @@ mod tests {
             b"GETRANGE".as_slice(),
             b"LRANGE".as_slice(),
             b"LPOS".as_slice(),
+            b"SINTERCARD".as_slice(),
             b"SMEMBERS".as_slice(),
             b"ZRANGE".as_slice(),
             b"XRANGE".as_slice(),
