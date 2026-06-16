@@ -58,9 +58,9 @@ fn main() -> io::Result<()> {
     thread::spawn(move || run_hub(rx, hub_tx));
 
     let port = std::env::var("LOCUS_PORT").unwrap_or_else(|_| "6379".to_string());
-    let addr = format!("127.0.0.1:{port}");
-    let listener = TcpListener::bind(&addr)?;
-    println!("Locus listening on {addr}");
+    let listener = TcpListener::bind(format!("127.0.0.1:{port}"))?;
+    // Print the ACTUAL bound address (port may be OS-assigned when LOCUS_PORT=0).
+    println!("Locus listening on {}", listener.local_addr()?);
 
     let mut next_id: u64 = 1; // 0 is reserved for the master
     for stream in listener.incoming() {

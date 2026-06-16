@@ -9,6 +9,7 @@
 use std::io::{BufRead, BufReader, Read, Write};
 use std::net::{TcpListener, TcpStream};
 use std::process::{Child, Command, Stdio};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::thread::sleep;
 use std::time::{Duration, Instant};
 
@@ -25,38 +26,50 @@ impl Server {
     }
 
     fn start_inner(extra_env: &[(&str, &str)]) -> Server {
-        let port = free_port();
+        // Unique RDB path per spawned server (avoids cross-test interference).
+        static SEQ: AtomicU64 = AtomicU64::new(0);
         let rdb = format!(
             "{}/locus-test-{}-{}.rdb",
             std::env::temp_dir().display(),
             std::process::id(),
-            port
+            SEQ.fetch_add(1, Ordering::Relaxed),
         );
         let _ = std::fs::remove_file(&rdb);
+        // LOCUS_PORT=0 -> the OS picks a free port; we read the real one back
+        // from the server's stdout. No bind-then-drop race between tests.
         let mut cmd = Command::new(env!("CARGO_BIN_EXE_locus"));
-        cmd.env("LOCUS_PORT", port.to_string())
+        cmd.env("LOCUS_PORT", "0")
             .env("LOCUS_RDB", &rdb)
             .env_remove("LOCUS_AOF")
-            .stdout(Stdio::null())
+            .stdout(Stdio::piped())
             .stderr(Stdio::null());
         for (k, v) in extra_env {
             cmd.env(k, v);
         }
-        let child = cmd.spawn().expect("spawn locus");
-        let server = Server { child, port, rdb };
-        server.wait_ready();
-        server
-    }
-
-    fn wait_ready(&self) {
-        let deadline = Instant::now() + Duration::from_secs(10);
-        while Instant::now() < deadline {
-            if TcpStream::connect(("127.0.0.1", self.port)).is_ok() {
-                return;
+        let mut child = cmd.spawn().expect("spawn locus");
+        let stdout = child.stdout.take().expect("child stdout");
+        let mut reader = BufReader::new(stdout);
+        // First line: "Locus listening on 127.0.0.1:<port>".
+        let port = loop {
+            let mut line = String::new();
+            if reader.read_line(&mut line).expect("read stdout") == 0 {
+                panic!("server exited before it started listening");
             }
-            sleep(Duration::from_millis(25));
-        }
-        panic!("server on port {} never came up", self.port);
+            if line.contains("listening")
+                && let Some(p) = line
+                    .rsplit(':')
+                    .next()
+                    .and_then(|s| s.trim().parse::<u16>().ok())
+            {
+                break p;
+            }
+        };
+        // Drain the rest of stdout so the child never blocks on a full pipe.
+        std::thread::spawn(move || {
+            let mut sink = Vec::new();
+            let _ = reader.read_to_end(&mut sink);
+        });
+        Server { child, port, rdb }
     }
 
     fn connect(&self) -> Conn {
@@ -77,12 +90,6 @@ impl Drop for Server {
         let _ = self.child.wait();
         let _ = std::fs::remove_file(&self.rdb);
     }
-}
-
-/// Bind to port 0 to let the OS pick a free port, then release it for the child.
-fn free_port() -> u16 {
-    let l = TcpListener::bind("127.0.0.1:0").unwrap();
-    l.local_addr().unwrap().port()
 }
 
 /// A minimal RESP client connection.
