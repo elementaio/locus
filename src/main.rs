@@ -84,6 +84,18 @@ struct Hub {
     master: Option<(String, String)>,  // (host, port) if we are a replica
     replica_stop: Option<Arc<AtomicBool>>,
     tx: mpsc::Sender<Msg>,              // so we can spawn a replica sync thread
+    // transactions
+    txs: HashMap<u64, TxState>,
+    watched_keys: HashMap<Vec<u8>, HashSet<u64>>,
+}
+
+/// Per-client transaction state (MULTI/EXEC/WATCH).
+#[derive(Default)]
+struct TxState {
+    in_multi: bool,
+    queued: Vec<Vec<Vec<u8>>>,
+    watched: Vec<Vec<u8>>,
+    dirty: bool, // a watched key changed -> EXEC aborts
 }
 
 impl Hub {
@@ -117,6 +129,8 @@ impl Hub {
             master: None,
             replica_stop: None,
             tx,
+            txs: HashMap::new(),
+            watched_keys: HashMap::new(),
         }
     }
 
@@ -142,7 +156,76 @@ impl Hub {
             );
         }
 
+        // In MULTI, queue everything except transaction-control commands.
+        if self.txs.get(&id).map_or(false, |t| t.in_multi) && !is_tx_control(&cmd) {
+            self.txs.get_mut(&id).unwrap().queued.push(tokens);
+            return self.send(id, resp::simple_string("QUEUED"));
+        }
+
         match cmd.as_slice() {
+            // --- transactions ---
+            b"MULTI" => {
+                let tx = self.txs.entry(id).or_default();
+                if tx.in_multi {
+                    return self.send(id, resp::error("ERR MULTI calls can not be nested"));
+                }
+                tx.in_multi = true;
+                self.send(id, resp::simple_string("OK"));
+            }
+            b"DISCARD" => {
+                if !self.txs.get(&id).map_or(false, |t| t.in_multi) {
+                    return self.send(id, resp::error("ERR DISCARD without MULTI"));
+                }
+                let t = self.txs.remove(&id).unwrap();
+                self.unwatch_keys(&t.watched, id);
+                self.send(id, resp::simple_string("OK"));
+            }
+            b"EXEC" => {
+                if !self.txs.get(&id).map_or(false, |t| t.in_multi) {
+                    return self.send(id, resp::error("ERR EXEC without MULTI"));
+                }
+                let t = self.txs.remove(&id).unwrap();
+                self.unwatch_keys(&t.watched, id);
+                if t.dirty {
+                    self.send(id, resp::null_array()); // a watched key changed -> abort
+                } else {
+                    let mut replies = Vec::with_capacity(t.queued.len());
+                    for q in t.queued {
+                        replies.push(self.exec_one(id, q));
+                    }
+                    self.send(id, resp::array(&replies));
+                }
+            }
+            b"WATCH" => {
+                if tokens.len() < 2 {
+                    return self.send(id, resp::error("ERR wrong number of arguments for 'watch' command"));
+                }
+                if self.txs.get(&id).map_or(false, |t| t.in_multi) {
+                    return self.send(id, resp::error("ERR WATCH inside MULTI is not allowed"));
+                }
+                {
+                    let tx = self.txs.entry(id).or_default();
+                    for key in &tokens[1..] {
+                        tx.watched.push(key.clone());
+                    }
+                }
+                for key in &tokens[1..] {
+                    self.watched_keys.entry(key.clone()).or_default().insert(id);
+                }
+                self.send(id, resp::simple_string("OK"));
+            }
+            b"UNWATCH" => {
+                let watched: Vec<Vec<u8>> = self
+                    .txs
+                    .get_mut(&id)
+                    .map(|t| {
+                        t.dirty = false;
+                        std::mem::take(&mut t.watched)
+                    })
+                    .unwrap_or_default();
+                self.unwatch_keys(&watched, id);
+                self.send(id, resp::simple_string("OK"));
+            }
             // --- pub/sub ---
             b"SUBSCRIBE" => {
                 if tokens.len() < 2 {
@@ -231,33 +314,62 @@ impl Hub {
 
             // --- everything else (data commands) ---
             _ => {
-                // A replica is read-only for normal clients.
-                if self.master.is_some() && id != MASTER_ID && aof::is_write(&cmd) {
-                    return self.send(id, resp::error("READONLY You can't write against a read only replica."));
-                }
-                let reply = execute(&tokens, &mut self.db);
-                let errored = reply.first() == Some(&b'-');
-                if !errored && aof::is_write(&tokens[0]) {
-                    let entries = aof::entries_for(&tokens, &reply, &mut self.db);
-                    if let Some(a) = self.aof.as_mut() {
-                        let _ = a.append(&entries);
-                    }
-                    // Propagate the deterministic form to every replica.
-                    if !self.replicas.is_empty() {
-                        for e in &entries {
-                            let bytes = resp::command(e);
-                            for rid in self.replicas.iter() {
-                                if let Some(out) = self.clients.get(rid) {
-                                    let _ = out.send(bytes.clone());
-                                }
-                            }
+                let reply = self.exec_one(id, tokens);
+                self.send(id, reply);
+            }
+        }
+    }
+
+    /// Execute one data command: read-only check, run it, log to AOF, propagate
+    /// to replicas, and mark any watching transactions dirty. Returns the reply.
+    fn exec_one(&mut self, id: u64, tokens: Vec<Vec<u8>>) -> Vec<u8> {
+        let cmd = tokens[0].to_ascii_uppercase();
+        if self.master.is_some() && id != MASTER_ID && aof::is_write(&cmd) {
+            return resp::error("READONLY You can't write against a read only replica.");
+        }
+        let reply = execute(&tokens, &mut self.db);
+        let errored = reply.first() == Some(&b'-');
+        if !errored && aof::is_write(&cmd) {
+            // WATCH: any modification of a watched key dirties its transaction.
+            for key in write_keys(&tokens) {
+                if let Some(watchers) = self.watched_keys.get(key) {
+                    let ids: Vec<u64> = watchers.iter().copied().collect();
+                    for wid in ids {
+                        if let Some(tx) = self.txs.get_mut(&wid) {
+                            tx.dirty = true;
                         }
                     }
                 }
-                if let Some(a) = self.aof.as_mut() {
-                    a.maybe_fsync();
+            }
+            let entries = aof::entries_for(&tokens, &reply, &mut self.db);
+            if let Some(a) = self.aof.as_mut() {
+                let _ = a.append(&entries);
+            }
+            // Propagate the deterministic form to every replica.
+            if !self.replicas.is_empty() {
+                for e in &entries {
+                    let bytes = resp::command(e);
+                    for rid in self.replicas.iter() {
+                        if let Some(out) = self.clients.get(rid) {
+                            let _ = out.send(bytes.clone());
+                        }
+                    }
                 }
-                self.send(id, reply);
+            }
+        }
+        if let Some(a) = self.aof.as_mut() {
+            a.maybe_fsync();
+        }
+        reply
+    }
+
+    fn unwatch_keys(&mut self, watched: &[Vec<u8>], id: u64) {
+        for key in watched {
+            if let Some(set) = self.watched_keys.get_mut(key) {
+                set.remove(&id);
+                if set.is_empty() {
+                    self.watched_keys.remove(key);
+                }
             }
         }
     }
@@ -322,6 +434,19 @@ fn allowed_in_subscribe_mode(cmd: &[u8]) -> bool {
     )
 }
 
+fn is_tx_control(cmd: &[u8]) -> bool {
+    matches!(cmd, b"MULTI" | b"EXEC" | b"DISCARD" | b"WATCH" | b"UNWATCH" | b"RESET")
+}
+
+/// Keys a write command modifies (for WATCH dirtying): all args for DEL,
+/// otherwise the single key at position 1.
+fn write_keys(tokens: &[Vec<u8>]) -> Vec<&[u8]> {
+    match tokens[0].to_ascii_uppercase().as_slice() {
+        b"DEL" => tokens[1..].iter().map(|k| k.as_slice()).collect(),
+        _ => tokens.get(1).map(|k| vec![k.as_slice()]).unwrap_or_default(),
+    }
+}
+
 fn run_hub(rx: mpsc::Receiver<Msg>, tx: mpsc::Sender<Msg>) {
     let mut hub = Hub::new(tx);
     loop {
@@ -333,6 +458,9 @@ fn run_hub(rx: mpsc::Receiver<Msg>, tx: mpsc::Sender<Msg>) {
                 hub.clients.remove(&id);
                 hub.pubsub.remove_client(id);
                 hub.replicas.remove(&id);
+                if let Some(t) = hub.txs.remove(&id) {
+                    hub.unwatch_keys(&t.watched, id);
+                }
             }
             Ok(Msg::Command { id, tokens }) => hub.handle_command(id, tokens),
             Ok(Msg::ReplaceDb(db)) => {
