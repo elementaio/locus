@@ -41,6 +41,7 @@ pub fn execute(tokens: &[Vec<u8>], db: &mut Db) -> Vec<u8> {
         },
         b"ECHO" if tokens.len() == 2 => bulk_string(&tokens[1]),
         b"ECHO" => wrong_args("echo"),
+        b"QUIT" => simple_string("OK"),
         b"DEL" => del_cmd(db, tokens),
         b"EXISTS" => exists_cmd(db, tokens),
         b"TYPE" => match tokens.len() {
