@@ -90,6 +90,8 @@ struct Hub {
     watched_keys: HashMap<Vec<u8>, HashSet<u64>>,
     // blocking XREAD
     blocked: Vec<BlockedReader>,
+    // negotiated RESP version per client (2 or 3)
+    protos: HashMap<u64, u8>,
 }
 
 /// A client parked on a blocking XREAD.
@@ -143,6 +145,7 @@ impl Hub {
             txs: HashMap::new(),
             watched_keys: HashMap::new(),
             blocked: Vec::new(),
+            protos: HashMap::new(),
         }
     }
 
@@ -288,6 +291,7 @@ impl Hub {
             }
             b"PUBSUB" => self.handle_pubsub_introspect(id, &tokens),
             b"XREAD" => self.handle_xread(id, &tokens),
+            b"HELLO" => self.handle_hello(id, &tokens),
 
             // --- replication ---
             b"REPLCONF" => self.send(id, resp::simple_string("OK")),
@@ -385,6 +389,47 @@ impl Hub {
                 _ => i += 1,
             }
         }
+    }
+
+    /// RESP3 negotiation. Accepts HELLO [2|3]; replies with server info as a
+    /// RESP3 map (proto 3) or RESP2 flat array (proto 2). Most reply types are
+    /// identical across RESP2/RESP3, so we track the version but keep the
+    /// existing encoders (full RESP3 typing of every reply is a later extension).
+    fn handle_hello(&mut self, id: u64, tokens: &[Vec<u8>]) {
+        let mut proto = 2u8;
+        if let Some(v) = tokens.get(1) {
+            match std::str::from_utf8(v).ok().and_then(|s| s.parse::<u8>().ok()) {
+                Some(2) => proto = 2,
+                Some(3) => proto = 3,
+                _ => return self.send(id, resp::error("NOPROTO unsupported protocol version")),
+            }
+        }
+        self.protos.insert(id, proto);
+        let role = if self.master.is_some() { "replica" } else { "master" };
+        let fields: Vec<(&[u8], Vec<u8>)> = vec![
+            (b"server", b"locus".to_vec()),
+            (b"version", b"0.1.0".to_vec()),
+            (b"proto", proto.to_string().into_bytes()),
+            (b"id", id.to_string().into_bytes()),
+            (b"mode", b"standalone".to_vec()),
+            (b"role", role.as_bytes().to_vec()),
+        ];
+        let reply = if proto == 3 {
+            let mut o = format!("%{}\r\n", fields.len()).into_bytes();
+            for (k, v) in &fields {
+                o.extend_from_slice(&resp::bulk_string(k));
+                o.extend_from_slice(&resp::bulk_string(v));
+            }
+            o
+        } else {
+            let mut flat = Vec::new();
+            for (k, v) in &fields {
+                flat.push(k.to_vec());
+                flat.push(v.clone());
+            }
+            resp::bulk_array(&flat)
+        };
+        self.send(id, reply);
     }
 
     /// Execute one data command: read-only check, run it, log to AOF, propagate
@@ -529,6 +574,7 @@ fn run_hub(rx: mpsc::Receiver<Msg>, tx: mpsc::Sender<Msg>) {
                     hub.unwatch_keys(&t.watched, id);
                 }
                 hub.blocked.retain(|r| r.id != id);
+                hub.protos.remove(&id);
             }
             Ok(Msg::Command { id, tokens }) => hub.handle_command(id, tokens),
             Ok(Msg::ReplaceDb(db)) => {
@@ -679,20 +725,26 @@ fn handle_conn(conn: TcpStream, id: u64, tx: mpsc::Sender<Msg>) -> io::Result<()
             Ok(n) => n,
         };
         inbuf.extend_from_slice(&chunk[..n]);
+        // Parse all complete commands in this batch from a moving offset, then
+        // drain once — O(batch) instead of O(batch^2) under heavy pipelining.
+        let mut pos = 0;
         loop {
-            match parse_command(&inbuf) {
+            match parse_command(&inbuf[pos..]) {
                 Parsed::Incomplete => break,
                 Parsed::Error(msg) => {
                     let _ = out_tx.send(resp::error(&format!("ERR Protocol error: {msg}")));
                     break 'read;
                 }
                 Parsed::Complete(tokens, consumed) => {
-                    inbuf.drain(0..consumed);
+                    pos += consumed;
                     if tx.send(Msg::Command { id, tokens }).is_err() {
                         break 'read;
                     }
                 }
             }
+        }
+        if pos > 0 {
+            inbuf.drain(0..pos);
         }
     }
 
