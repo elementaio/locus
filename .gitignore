@@ -1,5 +1,6 @@
 # Rust build artifacts
 /target
+/plans
 
 # Persistence files written at runtime
 *.rdb

@@ -6,6 +6,11 @@
 
 const MAX_ARRAY: i64 = 1024 * 1024;
 const MAX_BULK_LEN: i64 = 512 * 1024 * 1024;
+/// Cap eager pre-allocation so a small `*N` header can't force a huge `Vec`.
+const ALLOC_CAP: usize = 1024;
+/// An inline command line (non-`*` framing) is bounded like Redis (64 KiB) so a
+/// client that never sends a CRLF can't grow the connection buffer without limit.
+const MAX_INLINE_LEN: usize = 64 * 1024;
 
 #[derive(Debug)]
 pub enum Parsed {
@@ -66,7 +71,7 @@ pub fn parse_command(buf: &[u8]) -> Parsed {
     if count > MAX_ARRAY {
         return Parsed::Error("invalid multibulk length".into());
     }
-    let mut tokens: Vec<Vec<u8>> = Vec::with_capacity(count as usize);
+    let mut tokens: Vec<Vec<u8>> = Vec::with_capacity((count as usize).min(ALLOC_CAP));
     for _ in 0..count {
         if pos >= buf.len() {
             return Parsed::Incomplete;
@@ -99,7 +104,12 @@ pub fn parse_command(buf: &[u8]) -> Parsed {
 
 fn parse_inline(buf: &[u8]) -> Parsed {
     match find_crlf(buf, 0) {
-        None => Parsed::Incomplete,
+        None => {
+            if buf.len() > MAX_INLINE_LEN {
+                return Parsed::Error("too big inline request".into());
+            }
+            Parsed::Incomplete
+        }
         Some(cr) => {
             let tokens = buf[..cr]
                 .split(|b| matches!(b, b' ' | b'\t'))
@@ -218,5 +228,23 @@ mod tests {
         let (tokens, consumed) = complete(b"PING\r\n");
         assert_eq!(tokens, vec![b"PING".to_vec()]);
         assert_eq!(consumed, 6);
+    }
+
+    #[test]
+    fn unterminated_inline_is_bounded() {
+        // No CRLF yet, under the cap -> wait for more bytes.
+        assert!(matches!(parse_command(b"PING"), Parsed::Incomplete));
+        // No CRLF and over the cap -> error (don't buffer unboundedly).
+        let huge = vec![b'x'; MAX_INLINE_LEN + 1];
+        assert!(matches!(parse_command(&huge), Parsed::Error(_)));
+    }
+
+    #[test]
+    fn oversized_array_header_does_not_preallocate() {
+        // A tiny header declaring a huge array must be Incomplete (waiting for
+        // elements), not an eager multi-megabyte allocation, and not an error
+        // until it actually exceeds MAX_ARRAY.
+        assert!(matches!(parse_command(b"*1000000\r\n"), Parsed::Incomplete));
+        assert!(matches!(parse_command(b"*1048577\r\n"), Parsed::Error(_)));
     }
 }

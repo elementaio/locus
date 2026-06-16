@@ -254,6 +254,16 @@ impl Hub {
                 self.unwatch_keys(&watched, id);
                 self.send(id, resp::simple_string("OK"));
             }
+            b"RESET" => {
+                // Abort any transaction and release its watches, exit subscribe
+                // mode, and drop back to RESP2 — a clean per-connection reset.
+                if let Some(t) = self.txs.remove(&id) {
+                    self.unwatch_keys(&t.watched, id);
+                }
+                self.pubsub.remove_client(id);
+                self.protos.insert(id, 2);
+                self.send(id, resp::simple_string("RESET"));
+            }
             // --- pub/sub ---
             b"SUBSCRIBE" => {
                 if tokens.len() < 2 {
@@ -651,6 +661,9 @@ fn run_hub(rx: mpsc::Receiver<Msg>, tx: mpsc::Sender<Msg>) {
             Ok(Msg::Command { id, tokens }) => hub.handle_command(id, tokens),
             Ok(Msg::ReplaceDb(db)) => {
                 hub.db = *db;
+                // A replica that just loaded a full-sync snapshot may now be able
+                // to satisfy readers parked on a blocking XREAD.
+                hub.serve_blocked();
             }
             Err(mpsc::RecvTimeoutError::Timeout) => {
                 if let Some(a) = hub.aof.as_mut() {

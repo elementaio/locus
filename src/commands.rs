@@ -307,12 +307,15 @@ fn parse_set_opts(args: &[Vec<u8>]) -> Option<SetOpts> {
                     return None;
                 }
                 let n = n as u64;
-                o.expire_at = Some(match a.as_slice() {
-                    b"EX" => now + n * 1000,
-                    b"PX" => now + n,
-                    b"EXAT" => n * 1000,
-                    _ => n,
-                });
+                // Checked arithmetic: a huge TTL must not overflow (panic in
+                // debug, silent wrap to a past deadline in release).
+                let at = match a.as_slice() {
+                    b"EX" => n.checked_mul(1000).and_then(|ms| now.checked_add(ms)),
+                    b"PX" => now.checked_add(n),
+                    b"EXAT" => n.checked_mul(1000),
+                    _ => Some(n),
+                };
+                o.expire_at = Some(at?);
             }
             b"KEEPTTL" => o.keepttl = true,
             b"NX" => o.nx = true,
@@ -381,10 +384,17 @@ fn expire_cmd(db: &mut Db, tokens: &[Vec<u8>], unit_ms: i64, absolute: bool) -> 
     if !db.contains(key) {
         return integer(0);
     }
+    // Checked arithmetic: a huge TTL must not overflow i64 (panic in debug,
+    // silent wrap to a garbage/past deadline in release).
     let at = if absolute {
-        n * unit_ms
+        n.checked_mul(unit_ms)
     } else {
-        now_ms() as i64 + n * unit_ms
+        n.checked_mul(unit_ms)
+            .and_then(|ms| (now_ms() as i64).checked_add(ms))
+    };
+    let at = match at {
+        Some(v) => v,
+        None => return error("ERR invalid expire time in 'expire' command"),
     };
     if at <= now_ms() as i64 {
         db.remove(key);
@@ -975,6 +985,7 @@ fn zadd_cmd(db: &mut Db, tokens: &[Vec<u8>]) -> Vec<u8> {
         return wrong_args("zadd");
     }
     let (mut nx, mut xx, mut ch, mut incr) = (false, false, false, false);
+    let (mut gt, mut lt) = (false, false);
     let mut i = 2;
     while i < tokens.len() {
         match tokens[i].to_ascii_uppercase().as_slice() {
@@ -982,7 +993,8 @@ fn zadd_cmd(db: &mut Db, tokens: &[Vec<u8>]) -> Vec<u8> {
             b"XX" => xx = true,
             b"CH" => ch = true,
             b"INCR" => incr = true,
-            b"GT" | b"LT" => {} // accepted, treated as no-op for now
+            b"GT" => gt = true,
+            b"LT" => lt = true,
             _ => break,
         }
         i += 1;
@@ -993,6 +1005,11 @@ fn zadd_cmd(db: &mut Db, tokens: &[Vec<u8>]) -> Vec<u8> {
     }
     if nx && xx {
         return error("ERR XX and NX options at the same time are not compatible");
+    }
+    // GT/LT update only existing members (toward greater/lesser scores) and are
+    // mutually exclusive with each other and with NX.
+    if (gt && lt) || (nx && (gt || lt)) {
+        return error("ERR GT, LT, and/or NX options at the same time are not compatible");
     }
     if incr && pairs.len() != 2 {
         return error("ERR INCR option supports a single increment-element pair");
@@ -1020,6 +1037,14 @@ fn zadd_cmd(db: &mut Db, tokens: &[Vec<u8>]) -> Vec<u8> {
             return null_bulk();
         }
         let newv = existing.unwrap_or(0.0) + score;
+        // GT/LT abort the increment (return nil) when the new score doesn't move
+        // in the requested direction relative to an existing member.
+        if let Some(old) = existing
+            && ((gt && newv <= old) || (lt && newv >= old))
+        {
+            db.remove_if_empty(key);
+            return null_bulk();
+        }
         z.insert(member.clone(), newv);
         return bulk_string(&fmt_score(newv));
     }
@@ -1036,11 +1061,16 @@ fn zadd_cmd(db: &mut Db, tokens: &[Vec<u8>]) -> Vec<u8> {
                 added += 1;
                 changed += 1;
             }
-            Some(old) if old != score => {
-                z.insert(member.clone(), score);
-                changed += 1;
+            Some(old) => {
+                // GT/LT only update toward a greater/lesser score.
+                if (gt && score <= old) || (lt && score >= old) {
+                    continue;
+                }
+                if old != score {
+                    z.insert(member.clone(), score);
+                    changed += 1;
+                }
             }
-            _ => {}
         }
     }
     db.remove_if_empty(key);
@@ -1500,6 +1530,60 @@ mod tests {
         assert_eq!(
             cmd(&mut db, &[b"ZPOPMIN", b"z"]),
             bulk_array(&[b"b".to_vec(), b"2".to_vec()])
+        );
+    }
+
+    #[test]
+    fn zadd_gt_lt_gate_updates() {
+        let mut db = Db::new();
+        assert_eq!(
+            cmd(&mut db, &[b"ZADD", b"z", b"5", b"m"]),
+            b":1\r\n".to_vec()
+        );
+        // GT: a lower score is ignored, a higher one wins.
+        cmd(&mut db, &[b"ZADD", b"z", b"GT", b"3", b"m"]);
+        assert_eq!(
+            cmd(&mut db, &[b"ZSCORE", b"z", b"m"]),
+            b"$1\r\n5\r\n".to_vec()
+        );
+        cmd(&mut db, &[b"ZADD", b"z", b"GT", b"9", b"m"]);
+        assert_eq!(
+            cmd(&mut db, &[b"ZSCORE", b"z", b"m"]),
+            b"$1\r\n9\r\n".to_vec()
+        );
+        // LT: a higher score is ignored, a lower one wins.
+        cmd(&mut db, &[b"ZADD", b"z", b"LT", b"20", b"m"]);
+        assert_eq!(
+            cmd(&mut db, &[b"ZSCORE", b"z", b"m"]),
+            b"$1\r\n9\r\n".to_vec()
+        );
+        cmd(&mut db, &[b"ZADD", b"z", b"LT", b"2", b"m"]);
+        assert_eq!(
+            cmd(&mut db, &[b"ZSCORE", b"z", b"m"]),
+            b"$1\r\n2\r\n".to_vec()
+        );
+        // GT still adds brand-new members.
+        assert_eq!(
+            cmd(&mut db, &[b"ZADD", b"z", b"GT", b"7", b"new"]),
+            b":1\r\n".to_vec()
+        );
+        // Incompatible combinations are rejected.
+        assert!(cmd(&mut db, &[b"ZADD", b"z", b"GT", b"LT", b"1", b"m"]).starts_with(b"-ERR"));
+        assert!(cmd(&mut db, &[b"ZADD", b"z", b"NX", b"GT", b"1", b"m"]).starts_with(b"-ERR"));
+    }
+
+    #[test]
+    fn expire_with_overflowing_ttl_does_not_panic() {
+        let mut db = Db::new();
+        cmd(&mut db, &[b"SET", b"k", b"v"]);
+        // Near-i64::MAX seconds would overflow when scaled to ms — must error,
+        // not panic (debug) or wrap to a past deadline (release).
+        assert!(cmd(&mut db, &[b"EXPIRE", b"k", b"9999999999999999"]).starts_with(b"-ERR"));
+        // The key must survive (no silent immediate deletion).
+        assert_eq!(cmd(&mut db, &[b"EXISTS", b"k"]), b":1\r\n".to_vec());
+        // SET ... EX with an overflowing TTL is a (syntax) error, key unchanged.
+        assert!(
+            cmd(&mut db, &[b"SET", b"k", b"v2", b"EX", b"99999999999999999"]).starts_with(b"-")
         );
     }
 }

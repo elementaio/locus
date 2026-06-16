@@ -12,6 +12,7 @@ works. This is a curated subset of Redis — the common, useful commands per typ
 | `ECHO msg` | |
 | `HELLO [2\|3]` | RESP version negotiation; returns server info |
 | `INFO` | replication section (`role`, `connected_slaves`, master link) |
+| `RESET` | abort MULTI, UNWATCH, exit subscribe mode, drop to RESP2 |
 | `QUIT` | |
 | `COMMAND` / `CONFIG GET` | minimal stubs so clients connect cleanly |
 
@@ -50,7 +51,7 @@ works. This is a curated subset of Redis — the common, useful commands per typ
 
 ## Sorted sets
 
-`ZADD [NX\|XX] [CH] [INCR]` `ZSCORE` `ZMSCORE` `ZCARD` `ZREM` `ZINCRBY` `ZRANK` `ZREVRANK`
+`ZADD [NX\|XX] [GT\|LT] [CH] [INCR]` `ZSCORE` `ZMSCORE` `ZCARD` `ZREM` `ZINCRBY` `ZRANK` `ZREVRANK`
 `ZRANGE [WITHSCORES] [REV]` `ZREVRANGE` `ZRANGEBYSCORE` / `ZREVRANGEBYSCORE` (exclusive `(` bounds,
 `inf`/`-inf`, `LIMIT`) `ZCOUNT` `ZPOPMIN [count]` `ZPOPMAX [count]`
 

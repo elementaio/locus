@@ -6,6 +6,23 @@ All notable changes to Locus are documented here. The format is based on
 
 ## [Unreleased]
 
+### Fixed
+- **TTL integer overflow** in `EXPIRE`/`PEXPIRE`/`EXPIREAT`/`PEXPIREAT` and `SET … EX/PX/EXAT/PXAT`:
+  very large TTLs now error cleanly instead of panicking (debug) or wrapping to a past deadline and
+  silently deleting the key (release).
+- **`ZADD GT`/`LT`** now gate score updates (and `INCR`) correctly instead of being silently ignored;
+  incompatible flag combinations (`GT`+`LT`, `NX`+`GT`/`LT`) are rejected.
+
+### Added
+- **`RESET`** command — aborts `MULTI`, releases `WATCH`es, exits subscribe mode, drops to RESP2.
+
+### Security / hardening
+- RESP parser bounds untrusted input: capped eager pre-allocation for large `*N` array headers, and a
+  64 KiB limit on un-terminated inline requests (prevents per-connection unbounded buffer growth).
+
+### Fixed (replication)
+- A replica that just loaded a full-sync snapshot now re-evaluates clients parked on blocking `XREAD`.
+
 ## [0.1.0] — 2026-06-16
 
 Initial release. Built in twelve incremental milestones (M0–M12); the git history has one commit per
