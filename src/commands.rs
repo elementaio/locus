@@ -111,6 +111,12 @@ pub fn execute(tokens: &[Vec<u8>], db: &mut Db) -> Vec<u8> {
         b"LRANGE" => lrange_cmd(db, tokens),
         b"LINDEX" => lindex_cmd(db, tokens),
         b"LSET" => lset_cmd(db, tokens),
+        b"LINSERT" => linsert_cmd(db, tokens),
+        b"LREM" => lrem_cmd(db, tokens),
+        b"LTRIM" => ltrim_cmd(db, tokens),
+        b"LPOS" => lpos_cmd(db, tokens),
+        b"RPOPLPUSH" => rpoplpush_cmd(db, tokens),
+        b"LMOVE" => lmove_cmd(db, tokens),
         // hashes
         b"HSET" => hset_cmd(db, tokens, false),
         b"HSETNX" => hsetnx_cmd(db, tokens),
@@ -216,22 +222,21 @@ pub fn command_meta(cmd: &[u8]) -> Option<CmdMeta> {
         | b"ZPOPMAX" | b"DEL" | b"UNLINK" => (2, true),
         // arity 3 reads
         b"LINDEX" | b"HGET" | b"HEXISTS" | b"HMGET" | b"SISMEMBER" | b"SMISMEMBER" | b"ZSCORE"
-        | b"ZMSCORE" | b"ZRANK" | b"ZREVRANK" | b"PUBLISH" | b"REPLICAOF" | b"SLAVEOF" => {
-            (3, false)
-        }
+        | b"ZMSCORE" | b"ZRANK" | b"ZREVRANK" | b"PUBLISH" | b"REPLICAOF" | b"SLAVEOF"
+        | b"LPOS" => (3, false),
         // arity 3 writes
         b"INCRBY" | b"DECRBY" | b"APPEND" | b"HDEL" | b"SADD" | b"SREM" | b"ZREM" | b"EXPIRE"
         | b"PEXPIRE" | b"EXPIREAT" | b"PEXPIREAT" | b"LPUSH" | b"RPUSH" | b"LPUSHX" | b"RPUSHX"
         | b"SET" | b"SETNX" | b"GETSET" | b"MSET" | b"MSETNX" | b"INCRBYFLOAT" | b"RENAME"
-        | b"RENAMENX" => (3, true),
+        | b"RENAMENX" | b"RPOPLPUSH" => (3, true),
         // arity 4 reads
         b"LRANGE" | b"ZRANGE" | b"ZREVRANGE" | b"ZRANGEBYSCORE" | b"ZREVRANGEBYSCORE"
         | b"ZCOUNT" | b"XRANGE" | b"XREVRANGE" | b"XREAD" | b"GETRANGE" => (4, false),
         // arity 4 writes
         b"LSET" | b"HSET" | b"HSETNX" | b"HINCRBY" | b"ZADD" | b"ZINCRBY" | b"SETEX"
-        | b"PSETEX" | b"SETRANGE" => (4, true),
+        | b"PSETEX" | b"SETRANGE" | b"LREM" | b"LTRIM" => (4, true),
         // arity 5 writes
-        b"XADD" => (5, true),
+        b"XADD" | b"LINSERT" | b"LMOVE" => (5, true),
         _ => return None,
     };
     Some(CmdMeta { min_arity, write })
@@ -922,6 +927,256 @@ fn lset_cmd(db: &mut Db, tokens: &[Vec<u8>]) -> Vec<u8> {
         }
         Some(_) => wrongtype(),
     }
+}
+
+fn linsert_cmd(db: &mut Db, tokens: &[Vec<u8>]) -> Vec<u8> {
+    if tokens.len() != 5 {
+        return wrong_args("linsert");
+    }
+    let before = match tokens[2].to_ascii_uppercase().as_slice() {
+        b"BEFORE" => true,
+        b"AFTER" => false,
+        _ => return error("ERR syntax error"),
+    };
+    let (pivot, value) = (&tokens[3], &tokens[4]);
+    match db.get_mut(&tokens[1]) {
+        None => integer(0),
+        Some(Value::List(l)) => match l.iter().position(|x| x == pivot) {
+            None => integer(-1),
+            Some(pos) => {
+                l.insert(if before { pos } else { pos + 1 }, value.clone());
+                integer(l.len() as i64)
+            }
+        },
+        Some(_) => wrongtype(),
+    }
+}
+
+fn lrem_cmd(db: &mut Db, tokens: &[Vec<u8>]) -> Vec<u8> {
+    if tokens.len() != 4 {
+        return wrong_args("lrem");
+    }
+    let count = match parse_int(&tokens[2]) {
+        Some(c) => c,
+        None => return not_integer(),
+    };
+    let value = &tokens[3];
+    // limit = None means "remove all matches" (count == 0).
+    let limit: Option<usize> = if count == 0 {
+        None
+    } else {
+        Some(count.unsigned_abs() as usize)
+    };
+    let mut removed = 0usize;
+    match db.get_mut(&tokens[1]) {
+        None => return integer(0),
+        Some(Value::List(l)) => {
+            if count >= 0 {
+                let mut i = 0;
+                while i < l.len() && limit.is_none_or(|lim| removed < lim) {
+                    if l[i] == *value {
+                        l.remove(i);
+                        removed += 1;
+                    } else {
+                        i += 1;
+                    }
+                }
+            } else {
+                let mut i = l.len();
+                while i > 0 && limit.is_none_or(|lim| removed < lim) {
+                    i -= 1;
+                    if l[i] == *value {
+                        l.remove(i);
+                        removed += 1;
+                    }
+                }
+            }
+        }
+        Some(_) => return wrongtype(),
+    }
+    db.remove_if_empty(&tokens[1]);
+    integer(removed as i64)
+}
+
+fn ltrim_cmd(db: &mut Db, tokens: &[Vec<u8>]) -> Vec<u8> {
+    if tokens.len() != 4 {
+        return wrong_args("ltrim");
+    }
+    let (start, stop) = match (parse_int(&tokens[2]), parse_int(&tokens[3])) {
+        (Some(a), Some(b)) => (a, b),
+        _ => return not_integer(),
+    };
+    match db.get_mut(&tokens[1]) {
+        None => return simple_string("OK"),
+        Some(Value::List(l)) => {
+            let len = l.len() as i64;
+            let mut s = if start < 0 { start + len } else { start };
+            let mut e = if stop < 0 { stop + len } else { stop };
+            if s < 0 {
+                s = 0;
+            }
+            if e >= len {
+                e = len - 1;
+            }
+            if len == 0 || s > e {
+                l.clear();
+            } else {
+                for _ in 0..(len - 1 - e) {
+                    l.pop_back();
+                }
+                for _ in 0..s {
+                    l.pop_front();
+                }
+            }
+        }
+        Some(_) => return wrongtype(),
+    }
+    db.remove_if_empty(&tokens[1]);
+    simple_string("OK")
+}
+
+fn lpos_cmd(db: &mut Db, tokens: &[Vec<u8>]) -> Vec<u8> {
+    if tokens.len() < 3 {
+        return wrong_args("lpos");
+    }
+    let value = &tokens[2];
+    let (mut rank, mut count): (i64, Option<i64>) = (1, None);
+    let mut i = 3;
+    while i < tokens.len() {
+        match tokens[i].to_ascii_uppercase().as_slice() {
+            b"RANK" => {
+                i += 1;
+                rank = match tokens.get(i).and_then(|t| parse_int(t)) {
+                    Some(r) => r,
+                    None => return error("ERR syntax error"),
+                };
+            }
+            b"COUNT" => {
+                i += 1;
+                count = match tokens.get(i).and_then(|t| parse_int(t)) {
+                    Some(c) if c >= 0 => Some(c),
+                    Some(_) => return error("ERR COUNT can't be negative"),
+                    None => return error("ERR syntax error"),
+                };
+            }
+            b"MAXLEN" => {
+                i += 1; // accepted for compatibility, not used
+                if tokens.get(i).and_then(|t| parse_int(t)).is_none() {
+                    return error("ERR syntax error");
+                }
+            }
+            _ => return error("ERR syntax error"),
+        }
+        i += 1;
+    }
+    if rank == 0 {
+        return error("ERR RANK can't be zero");
+    }
+    let l = match db.get(&tokens[1]) {
+        None => {
+            return if count.is_some() {
+                bulk_array(&[])
+            } else {
+                null_bulk()
+            };
+        }
+        Some(Value::List(l)) => l,
+        Some(_) => return wrongtype(),
+    };
+    let want = match count {
+        Some(0) => usize::MAX, // COUNT 0 => all matches
+        Some(c) => c as usize,
+        None => 1,
+    };
+    let skip = (rank.unsigned_abs() - 1) as usize; // RANK N skips N-1 matches
+    let mut positions: Vec<usize> = Vec::new();
+    let mut seen = 0usize;
+    let indices: Vec<usize> = if rank > 0 {
+        (0..l.len()).collect()
+    } else {
+        (0..l.len()).rev().collect()
+    };
+    for idx in indices {
+        if l[idx] == *value {
+            if seen >= skip {
+                positions.push(idx);
+                if positions.len() >= want {
+                    break;
+                }
+            }
+            seen += 1;
+        }
+    }
+    match count {
+        None => positions
+            .first()
+            .map(|&p| integer(p as i64))
+            .unwrap_or_else(null_bulk),
+        Some(_) => array(
+            &positions
+                .iter()
+                .map(|&p| integer(p as i64))
+                .collect::<Vec<_>>(),
+        ),
+    }
+}
+
+/// Pop one element from `src` and push it onto `dst` (the engine for RPOPLPUSH
+/// and LMOVE). `src`/`dst` may be the same key (a rotation).
+fn lmove_core(db: &mut Db, src: &[u8], dst: &[u8], from_left: bool, to_left: bool) -> Vec<u8> {
+    // Type-check the destination up front so we never pop from src and then fail.
+    match db.get(dst) {
+        None | Some(Value::List(_)) => {}
+        Some(_) => return wrongtype(),
+    }
+    let elem = match db.get_mut(src) {
+        None => return null_bulk(),
+        Some(Value::List(l)) => match if from_left {
+            l.pop_front()
+        } else {
+            l.pop_back()
+        } {
+            Some(e) => e,
+            None => return null_bulk(),
+        },
+        Some(_) => return wrongtype(),
+    };
+    db.remove_if_empty(src);
+    match db.get_or_insert_with(dst, || Value::List(VecDeque::new())) {
+        Value::List(l) => {
+            if to_left {
+                l.push_front(elem.clone());
+            } else {
+                l.push_back(elem.clone());
+            }
+        }
+        _ => return wrongtype(), // unreachable: dst was type-checked above
+    }
+    bulk_string(&elem)
+}
+
+fn rpoplpush_cmd(db: &mut Db, tokens: &[Vec<u8>]) -> Vec<u8> {
+    if tokens.len() != 3 {
+        return wrong_args("rpoplpush");
+    }
+    lmove_core(db, &tokens[1], &tokens[2], false, true)
+}
+
+fn lmove_cmd(db: &mut Db, tokens: &[Vec<u8>]) -> Vec<u8> {
+    if tokens.len() != 5 {
+        return wrong_args("lmove");
+    }
+    let from_left = match tokens[3].to_ascii_uppercase().as_slice() {
+        b"LEFT" => true,
+        b"RIGHT" => false,
+        _ => return error("ERR syntax error"),
+    };
+    let to_left = match tokens[4].to_ascii_uppercase().as_slice() {
+        b"LEFT" => true,
+        b"RIGHT" => false,
+        _ => return error("ERR syntax error"),
+    };
+    lmove_core(db, &tokens[1], &tokens[2], from_left, to_left)
 }
 
 // === hashes =================================================================
@@ -2036,6 +2291,80 @@ mod tests {
     }
 
     #[test]
+    fn list_mutation_commands() {
+        let mut db = Db::new();
+        cmd(&mut db, &[b"RPUSH", b"l", b"a", b"b", b"c", b"b", b"d"]);
+        // LINSERT before/after, missing pivot, missing key
+        assert_eq!(
+            cmd(&mut db, &[b"LINSERT", b"l", b"BEFORE", b"c", b"X"]),
+            b":6\r\n".to_vec()
+        ); // a b X c b d
+        assert_eq!(cmd(&mut db, &[b"LINDEX", b"l", b"2"]), bulk_string(b"X"));
+        assert_eq!(
+            cmd(&mut db, &[b"LINSERT", b"l", b"AFTER", b"nope", b"Y"]),
+            b":-1\r\n".to_vec()
+        );
+        assert_eq!(
+            cmd(&mut db, &[b"LINSERT", b"missing", b"BEFORE", b"x", b"y"]),
+            b":0\r\n".to_vec()
+        );
+        // LREM (count>0, from head)
+        assert_eq!(
+            cmd(&mut db, &[b"LREM", b"l", b"1", b"b"]),
+            b":1\r\n".to_vec()
+        );
+        assert_eq!(
+            cmd(&mut db, &[b"LRANGE", b"l", b"0", b"-1"]),
+            bulk_array(&[
+                b"a".to_vec(),
+                b"X".to_vec(),
+                b"c".to_vec(),
+                b"b".to_vec(),
+                b"d".to_vec()
+            ])
+        );
+        // LTRIM
+        assert_eq!(
+            cmd(&mut db, &[b"LTRIM", b"l", b"1", b"3"]),
+            b"+OK\r\n".to_vec()
+        );
+        assert_eq!(
+            cmd(&mut db, &[b"LRANGE", b"l", b"0", b"-1"]),
+            bulk_array(&[b"X".to_vec(), b"c".to_vec(), b"b".to_vec()])
+        );
+        // LPOS: first match, RANK -1 (from tail), COUNT 0 (all), and a miss
+        cmd(&mut db, &[b"RPUSH", b"p", b"a", b"b", b"c", b"b", b"b"]);
+        assert_eq!(cmd(&mut db, &[b"LPOS", b"p", b"b"]), b":1\r\n".to_vec());
+        assert_eq!(
+            cmd(&mut db, &[b"LPOS", b"p", b"b", b"RANK", b"-1"]),
+            b":4\r\n".to_vec()
+        );
+        assert_eq!(
+            cmd(&mut db, &[b"LPOS", b"p", b"b", b"COUNT", b"0"]),
+            array(&[integer(1), integer(3), integer(4)])
+        );
+        assert_eq!(cmd(&mut db, &[b"LPOS", b"p", b"zzz"]), null_bulk());
+        // RPOPLPUSH / LMOVE
+        cmd(&mut db, &[b"RPUSH", b"s", b"1", b"2", b"3"]);
+        assert_eq!(cmd(&mut db, &[b"RPOPLPUSH", b"s", b"d"]), bulk_string(b"3"));
+        assert_eq!(
+            cmd(&mut db, &[b"LMOVE", b"s", b"d", b"LEFT", b"RIGHT"]),
+            bulk_string(b"1")
+        );
+        assert_eq!(
+            cmd(&mut db, &[b"LRANGE", b"d", b"0", b"-1"]),
+            bulk_array(&[b"3".to_vec(), b"1".to_vec()])
+        );
+        assert_eq!(cmd(&mut db, &[b"RPOPLPUSH", b"empty", b"d"]), null_bulk());
+        // WRONGTYPE
+        cmd(&mut db, &[b"SET", b"str", b"x"]);
+        assert!(
+            cmd(&mut db, &[b"LINSERT", b"str", b"BEFORE", b"a", b"b"]).starts_with(b"-WRONGTYPE")
+        );
+        assert!(cmd(&mut db, &[b"RPOPLPUSH", b"str", b"d"]).starts_with(b"-WRONGTYPE"));
+    }
+
+    #[test]
     fn command_table_write_set_is_exact() {
         // The exact set of write commands. A change here is a deliberate decision,
         // not an accident — guards the AOF/replication write-detection.
@@ -2073,6 +2402,11 @@ mod tests {
             b"LPOP",
             b"RPOP",
             b"LSET",
+            b"LINSERT",
+            b"LREM",
+            b"LTRIM",
+            b"RPOPLPUSH",
+            b"LMOVE",
             b"HSET",
             b"HSETNX",
             b"HDEL",
@@ -2100,6 +2434,7 @@ mod tests {
             b"MGET".as_slice(),
             b"GETRANGE".as_slice(),
             b"LRANGE".as_slice(),
+            b"LPOS".as_slice(),
             b"SMEMBERS".as_slice(),
             b"ZRANGE".as_slice(),
             b"XRANGE".as_slice(),

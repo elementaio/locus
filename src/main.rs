@@ -753,8 +753,10 @@ fn write_keys(tokens: &[Vec<u8>]) -> Vec<&[u8]> {
             .step_by(2)
             .map(|k| k.as_slice())
             .collect(),
-        // RENAME src dst -> both source and destination change.
-        b"RENAME" | b"RENAMENX" => tokens[1..3].iter().map(|k| k.as_slice()).collect(),
+        // src dst -> both source and destination change.
+        b"RENAME" | b"RENAMENX" | b"RPOPLPUSH" | b"LMOVE" => {
+            tokens[1..3].iter().map(|k| k.as_slice()).collect()
+        }
         _ => tokens
             .get(1)
             .map(|k| vec![k.as_slice()])
@@ -775,11 +777,13 @@ fn write_modified(cmd: &[u8], reply: &[u8]) -> bool {
         // "count of elements changed" commands: 0 means nothing changed.
         b"DEL" | b"UNLINK" | b"SREM" | b"HDEL" | b"ZREM" | b"SADD" | b"HSETNX" | b"LPUSHX"
         | b"RPUSHX" | b"PERSIST" | b"EXPIRE" | b"PEXPIRE" | b"EXPIREAT" | b"PEXPIREAT"
-        | b"SETNX" | b"MSETNX" | b"RENAMENX" => !zero,
+        | b"SETNX" | b"MSETNX" | b"RENAMENX" | b"LREM" => !zero,
         // ZADD: 0 added/changed, or nil from an aborted INCR (NX/XX/GT/LT).
         b"ZADD" => !(zero || nil),
-        // Conditional write / delete: nil means it didn't happen.
-        b"SET" | b"GETDEL" => !nil,
+        // LINSERT: 0 (no key) or -1 (pivot not found) means nothing was inserted.
+        b"LINSERT" => !(zero || reply.starts_with(b":-1\r\n")),
+        // Conditional write / pop-and-move / delete: nil means it didn't happen.
+        b"SET" | b"GETDEL" | b"RPOPLPUSH" | b"LMOVE" => !nil,
         _ => true,
     }
 }

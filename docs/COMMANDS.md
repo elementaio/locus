@@ -48,7 +48,8 @@ works. This is a curated subset of Redis — the common, useful commands per typ
 ## Lists
 
 `LPUSH` `RPUSH` `LPUSHX` `RPUSHX` `LPOP [count]` `RPOP [count]` `LLEN` `LRANGE` (negative indices)
-`LINDEX` `LSET`
+`LINDEX` `LSET` `LINSERT key BEFORE|AFTER pivot value` `LREM key count value` `LTRIM key start stop`
+`LPOS key value [RANK r] [COUNT n]` `RPOPLPUSH src dst` `LMOVE src dst LEFT|RIGHT LEFT|RIGHT`
 
 ## Hashes
 
