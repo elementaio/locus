@@ -757,6 +757,11 @@ fn write_keys(tokens: &[Vec<u8>]) -> Vec<&[u8]> {
         b"RENAME" | b"RENAMENX" | b"RPOPLPUSH" | b"LMOVE" | b"SMOVE" => {
             tokens[1..3].iter().map(|k| k.as_slice()).collect()
         }
+        // BITOP op dest src... -> the destination is at position 2.
+        b"BITOP" => tokens
+            .get(2)
+            .map(|k| vec![k.as_slice()])
+            .unwrap_or_default(),
         _ => tokens
             .get(1)
             .map(|k| vec![k.as_slice()])

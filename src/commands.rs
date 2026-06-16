@@ -100,6 +100,12 @@ pub fn execute(tokens: &[Vec<u8>], db: &mut Db) -> Vec<u8> {
         b"GETRANGE" => getrange_cmd(db, tokens),
         b"SETRANGE" => setrange_cmd(db, tokens),
         b"STRLEN" => strlen_cmd(db, tokens),
+        // bitmaps
+        b"SETBIT" => setbit_cmd(db, tokens),
+        b"GETBIT" => getbit_cmd(db, tokens),
+        b"BITCOUNT" => bitcount_cmd(db, tokens),
+        b"BITPOS" => bitpos_cmd(db, tokens),
+        b"BITOP" => bitop_cmd(db, tokens),
         // lists
         b"LPUSH" => push_cmd(db, tokens, true, true),
         b"RPUSH" => push_cmd(db, tokens, false, true),
@@ -225,14 +231,14 @@ pub fn command_meta(cmd: &[u8]) -> Option<CmdMeta> {
         b"ECHO" | b"TYPE" | b"TTL" | b"PTTL" | b"GET" | b"STRLEN" | b"LLEN" | b"HGETALL"
         | b"HLEN" | b"HKEYS" | b"HVALS" | b"SMEMBERS" | b"SCARD" | b"ZCARD" | b"XLEN"
         | b"EXISTS" | b"TOUCH" | b"KEYS" | b"MGET" | b"SINTER" | b"SUNION" | b"SDIFF"
-        | b"WATCH" | b"SUBSCRIBE" | b"PSUBSCRIBE" | b"PUBSUB" => (2, false),
+        | b"WATCH" | b"SUBSCRIBE" | b"PSUBSCRIBE" | b"PUBSUB" | b"BITCOUNT" => (2, false),
         // arity 2 writes
         b"PERSIST" | b"INCR" | b"DECR" | b"GETDEL" | b"LPOP" | b"RPOP" | b"SPOP" | b"ZPOPMIN"
         | b"ZPOPMAX" | b"DEL" | b"UNLINK" => (2, true),
         // arity 3 reads
         b"LINDEX" | b"HGET" | b"HEXISTS" | b"HMGET" | b"SISMEMBER" | b"SMISMEMBER" | b"ZSCORE"
         | b"ZMSCORE" | b"ZRANK" | b"ZREVRANK" | b"PUBLISH" | b"REPLICAOF" | b"SLAVEOF"
-        | b"LPOS" | b"SINTERCARD" => (3, false),
+        | b"LPOS" | b"SINTERCARD" | b"GETBIT" | b"BITPOS" => (3, false),
         // arity 3 writes
         b"INCRBY" | b"DECRBY" | b"APPEND" | b"HDEL" | b"SADD" | b"SREM" | b"ZREM" | b"EXPIRE"
         | b"PEXPIRE" | b"EXPIREAT" | b"PEXPIREAT" | b"LPUSH" | b"RPUSH" | b"LPUSHX" | b"RPUSHX"
@@ -244,7 +250,7 @@ pub fn command_meta(cmd: &[u8]) -> Option<CmdMeta> {
         // arity 4 writes
         b"LSET" | b"HSET" | b"HSETNX" | b"HINCRBY" | b"ZADD" | b"ZINCRBY" | b"SETEX"
         | b"PSETEX" | b"SETRANGE" | b"LREM" | b"LTRIM" | b"SMOVE" | b"ZREMRANGEBYRANK"
-        | b"ZREMRANGEBYSCORE" | b"ZUNIONSTORE" | b"ZINTERSTORE" => (4, true),
+        | b"ZREMRANGEBYSCORE" | b"ZUNIONSTORE" | b"ZINTERSTORE" | b"SETBIT" | b"BITOP" => (4, true),
         // arity 5 writes
         b"XADD" | b"LINSERT" | b"LMOVE" => (5, true),
         _ => return None,
@@ -1187,6 +1193,229 @@ fn lmove_cmd(db: &mut Db, tokens: &[Vec<u8>]) -> Vec<u8> {
         _ => return error("ERR syntax error"),
     };
     lmove_core(db, &tokens[1], &tokens[2], from_left, to_left)
+}
+
+// === bitmaps ================================================================
+//
+// Bits are numbered Redis-style: the most-significant bit of byte 0 is bit 0.
+
+const MAX_BIT_OFFSET: i64 = 4 * 1024 * 1024 * 1024 - 1; // < 512 MiB of bytes
+
+fn getbit_at(s: &[u8], offset: usize) -> u8 {
+    let byte = offset / 8;
+    if byte >= s.len() {
+        0
+    } else {
+        (s[byte] >> (7 - (offset % 8))) & 1
+    }
+}
+
+/// Normalize an inclusive [start, end] range with negative-from-end indices over
+/// a length, returning concrete bounds, or None if the range is empty.
+fn norm_range(start: i64, end: i64, len: usize) -> Option<(usize, usize)> {
+    if len == 0 {
+        return None;
+    }
+    let len = len as i64;
+    let mut s = if start < 0 { start + len } else { start };
+    let mut e = if end < 0 { end + len } else { end };
+    if s < 0 {
+        s = 0;
+    }
+    if e >= len {
+        e = len - 1;
+    }
+    if s > e || s >= len {
+        return None;
+    }
+    Some((s as usize, e as usize))
+}
+
+fn setbit_cmd(db: &mut Db, tokens: &[Vec<u8>]) -> Vec<u8> {
+    if tokens.len() != 4 {
+        return wrong_args("setbit");
+    }
+    let offset = match parse_int(&tokens[2]) {
+        Some(o) if (0..=MAX_BIT_OFFSET).contains(&o) => o as usize,
+        _ => return error("ERR bit offset is not an integer or out of range"),
+    };
+    let bit = match tokens[3].as_slice() {
+        b"0" => 0u8,
+        b"1" => 1u8,
+        _ => return error("ERR bit is not an integer or out of range"),
+    };
+    let s = match db.get_or_insert_with(&tokens[1], || Value::Str(Vec::new())) {
+        Value::Str(s) => s,
+        _ => return wrongtype(),
+    };
+    let byte = offset / 8;
+    let shift = 7 - (offset % 8);
+    if s.len() <= byte {
+        s.resize(byte + 1, 0);
+    }
+    let old = (s[byte] >> shift) & 1;
+    if bit == 1 {
+        s[byte] |= 1 << shift;
+    } else {
+        s[byte] &= !(1 << shift);
+    }
+    integer(old as i64)
+}
+
+fn getbit_cmd(db: &mut Db, tokens: &[Vec<u8>]) -> Vec<u8> {
+    if tokens.len() != 3 {
+        return wrong_args("getbit");
+    }
+    let offset = match parse_int(&tokens[2]) {
+        Some(o) if o >= 0 => o as usize,
+        _ => return error("ERR bit offset is not an integer or out of range"),
+    };
+    match db.get(&tokens[1]) {
+        None => integer(0),
+        Some(Value::Str(s)) => integer(getbit_at(s, offset) as i64),
+        Some(_) => wrongtype(),
+    }
+}
+
+fn bitcount_cmd(db: &mut Db, tokens: &[Vec<u8>]) -> Vec<u8> {
+    if tokens.len() == 3 || tokens.len() > 5 {
+        return error("ERR syntax error");
+    }
+    let s = match db.get(&tokens[1]) {
+        None => return integer(0),
+        Some(Value::Str(s)) => s,
+        Some(_) => return wrongtype(),
+    };
+    if tokens.len() == 2 {
+        return integer(s.iter().map(|b| b.count_ones() as i64).sum());
+    }
+    let (start, end) = match (parse_int(&tokens[2]), parse_int(&tokens[3])) {
+        (Some(a), Some(b)) => (a, b),
+        _ => return not_integer(),
+    };
+    let bit_mode = if tokens.len() == 5 {
+        match tokens[4].to_ascii_uppercase().as_slice() {
+            b"BYTE" => false,
+            b"BIT" => true,
+            _ => return error("ERR syntax error"),
+        }
+    } else {
+        false
+    };
+    if bit_mode {
+        match norm_range(start, end, s.len() * 8) {
+            Some((lo, hi)) => integer((lo..=hi).map(|o| getbit_at(s, o) as i64).sum()),
+            None => integer(0),
+        }
+    } else {
+        match norm_range(start, end, s.len()) {
+            Some((lo, hi)) => integer(s[lo..=hi].iter().map(|b| b.count_ones() as i64).sum()),
+            None => integer(0),
+        }
+    }
+}
+
+fn bitpos_cmd(db: &mut Db, tokens: &[Vec<u8>]) -> Vec<u8> {
+    if tokens.len() < 3 || tokens.len() > 6 {
+        return error("ERR syntax error");
+    }
+    let target = match tokens[2].as_slice() {
+        b"0" => 0u8,
+        b"1" => 1u8,
+        _ => return error("ERR The bit argument must be 1 or 0."),
+    };
+    let s = match db.get(&tokens[1]) {
+        None => return integer(if target == 0 { 0 } else { -1 }),
+        Some(Value::Str(s)) => s.clone(),
+        Some(_) => return wrongtype(),
+    };
+    let has_end = tokens.len() >= 5;
+    let bit_mode = match tokens.get(5).map(|m| m.to_ascii_uppercase()) {
+        None => false,
+        Some(m) if m == b"BYTE" => false,
+        Some(m) if m == b"BIT" => true,
+        _ => return error("ERR syntax error"),
+    };
+    let unit_len = if bit_mode { s.len() * 8 } else { s.len() };
+    let start = match tokens.get(3) {
+        Some(t) => match parse_int(t) {
+            Some(v) => v,
+            None => return not_integer(),
+        },
+        None => 0,
+    };
+    let end = match tokens.get(4) {
+        Some(t) => match parse_int(t) {
+            Some(v) => v,
+            None => return not_integer(),
+        },
+        None => unit_len as i64 - 1,
+    };
+    let (lo_bit, hi_bit) = if bit_mode {
+        match norm_range(start, end, s.len() * 8) {
+            Some(r) => r,
+            None => return integer(-1),
+        }
+    } else {
+        match norm_range(start, end, s.len()) {
+            Some((bs, be)) => (bs * 8, be * 8 + 7),
+            None => return integer(-1),
+        }
+    };
+    for o in lo_bit..=hi_bit {
+        if getbit_at(&s, o) == target {
+            return integer(o as i64);
+        }
+    }
+    // Looking for a 0 with no explicit end: the string has an implicit zero tail.
+    if target == 0 && !has_end {
+        integer((s.len() * 8) as i64)
+    } else {
+        integer(-1)
+    }
+}
+
+fn bitop_cmd(db: &mut Db, tokens: &[Vec<u8>]) -> Vec<u8> {
+    if tokens.len() < 4 {
+        return wrong_args("bitop");
+    }
+    let op = tokens[1].to_ascii_uppercase();
+    let srcs = &tokens[3..];
+    if op == b"NOT" && srcs.len() != 1 {
+        return error("ERR BITOP NOT must be called with a single source key.");
+    }
+    let mut sources: Vec<Vec<u8>> = Vec::new();
+    for k in srcs {
+        match db.get(k) {
+            None => sources.push(Vec::new()),
+            Some(Value::Str(s)) => sources.push(s.clone()),
+            Some(_) => return wrongtype(),
+        }
+    }
+    let maxlen = sources.iter().map(|s| s.len()).max().unwrap_or(0);
+    let byte_at = |s: &[u8], i: usize| *s.get(i).unwrap_or(&0);
+    let result: Vec<u8> = match op.as_slice() {
+        b"NOT" => sources[0].iter().map(|b| !b).collect(),
+        b"AND" => (0..maxlen)
+            .map(|i| sources.iter().fold(0xFFu8, |acc, s| acc & byte_at(s, i)))
+            .collect(),
+        b"OR" => (0..maxlen)
+            .map(|i| sources.iter().fold(0u8, |acc, s| acc | byte_at(s, i)))
+            .collect(),
+        b"XOR" => (0..maxlen)
+            .map(|i| sources.iter().fold(0u8, |acc, s| acc ^ byte_at(s, i)))
+            .collect(),
+        _ => return error("ERR syntax error"),
+    };
+    let n = result.len();
+    let dest = &tokens[2];
+    if result.is_empty() {
+        db.remove(dest);
+    } else {
+        db.insert(dest.clone(), Value::Str(result));
+        db.clear_expire(dest);
+    }
+    integer(n as i64)
 }
 
 // === hashes =================================================================
@@ -2800,6 +3029,75 @@ mod tests {
     }
 
     #[test]
+    fn bitmap_commands() {
+        let mut db = Db::new();
+        // SETBIT grows the value and returns the previous bit.
+        assert_eq!(
+            cmd(&mut db, &[b"SETBIT", b"k", b"7", b"1"]),
+            b":0\r\n".to_vec()
+        );
+        assert_eq!(cmd(&mut db, &[b"GET", b"k"]), bulk_string(&[0x01]));
+        assert_eq!(
+            cmd(&mut db, &[b"SETBIT", b"k", b"0", b"1"]),
+            b":0\r\n".to_vec()
+        );
+        assert_eq!(cmd(&mut db, &[b"GET", b"k"]), bulk_string(&[0x81]));
+        assert_eq!(
+            cmd(&mut db, &[b"SETBIT", b"k", b"7", b"0"]),
+            b":1\r\n".to_vec()
+        );
+        // GETBIT (incl. beyond end)
+        assert_eq!(cmd(&mut db, &[b"GETBIT", b"k", b"0"]), b":1\r\n".to_vec());
+        assert_eq!(cmd(&mut db, &[b"GETBIT", b"k", b"5"]), b":0\r\n".to_vec());
+        assert_eq!(cmd(&mut db, &[b"GETBIT", b"k", b"999"]), b":0\r\n".to_vec());
+        // BITCOUNT (Redis's canonical "foobar" == 26; byte and bit ranges)
+        cmd(&mut db, &[b"SET", b"c", b"foobar"]);
+        assert_eq!(cmd(&mut db, &[b"BITCOUNT", b"c"]), b":26\r\n".to_vec());
+        assert_eq!(
+            cmd(&mut db, &[b"BITCOUNT", b"c", b"0", b"0"]),
+            b":4\r\n".to_vec()
+        ); // 'f'
+        assert_eq!(
+            cmd(&mut db, &[b"BITCOUNT", b"c", b"1", b"1"]),
+            b":6\r\n".to_vec()
+        ); // 'o'
+        cmd(&mut db, &[b"SET", b"ff", &[0xff]]);
+        assert_eq!(
+            cmd(&mut db, &[b"BITCOUNT", b"ff", b"0", b"3", b"BIT"]),
+            b":4\r\n".to_vec()
+        );
+        // BITPOS
+        cmd(&mut db, &[b"SET", b"p", &[0x00, 0xff, 0xf0]]);
+        assert_eq!(cmd(&mut db, &[b"BITPOS", b"p", b"1"]), b":8\r\n".to_vec());
+        cmd(&mut db, &[b"SET", b"one", &[0xff]]);
+        assert_eq!(cmd(&mut db, &[b"BITPOS", b"one", b"0"]), b":8\r\n".to_vec()); // implicit zero tail
+        assert_eq!(
+            cmd(&mut db, &[b"BITPOS", b"one", b"0", b"0", b"-1"]),
+            b":-1\r\n".to_vec()
+        ); // explicit end
+        // BITOP AND/OR/XOR/NOT
+        cmd(&mut db, &[b"SET", b"x", &[0xCC]]);
+        cmd(&mut db, &[b"SET", b"y", &[0xAA]]);
+        assert_eq!(
+            cmd(&mut db, &[b"BITOP", b"AND", b"d", b"x", b"y"]),
+            b":1\r\n".to_vec()
+        );
+        assert_eq!(cmd(&mut db, &[b"GET", b"d"]), bulk_string(&[0x88]));
+        cmd(&mut db, &[b"BITOP", b"OR", b"d", b"x", b"y"]);
+        assert_eq!(cmd(&mut db, &[b"GET", b"d"]), bulk_string(&[0xEE]));
+        cmd(&mut db, &[b"BITOP", b"XOR", b"d", b"x", b"y"]);
+        assert_eq!(cmd(&mut db, &[b"GET", b"d"]), bulk_string(&[0x66]));
+        cmd(&mut db, &[b"BITOP", b"NOT", b"d", b"x"]);
+        assert_eq!(cmd(&mut db, &[b"GET", b"d"]), bulk_string(&[0x33]));
+        // WRONGTYPE
+        cmd(&mut db, &[b"RPUSH", b"l", b"a"]);
+        assert!(cmd(&mut db, &[b"SETBIT", b"l", b"0", b"1"]).starts_with(b"-WRONGTYPE"));
+        assert!(cmd(&mut db, &[b"BITCOUNT", b"l"]).starts_with(b"-WRONGTYPE"));
+        // bad args
+        assert!(cmd(&mut db, &[b"SETBIT", b"k", b"0", b"2"]).starts_with(b"-ERR"));
+    }
+
+    #[test]
     fn command_table_write_set_is_exact() {
         // The exact set of write commands. A change here is a deliberate decision,
         // not an accident — guards the AOF/replication write-detection.
@@ -2862,6 +3160,8 @@ mod tests {
             b"ZREMRANGEBYSCORE",
             b"ZUNIONSTORE",
             b"ZINTERSTORE",
+            b"SETBIT",
+            b"BITOP",
             b"XADD",
         ];
         for w in writes {
@@ -2879,6 +3179,9 @@ mod tests {
             b"LRANGE".as_slice(),
             b"LPOS".as_slice(),
             b"SINTERCARD".as_slice(),
+            b"GETBIT".as_slice(),
+            b"BITCOUNT".as_slice(),
+            b"BITPOS".as_slice(),
             b"SMEMBERS".as_slice(),
             b"ZRANGE".as_slice(),
             b"XRANGE".as_slice(),

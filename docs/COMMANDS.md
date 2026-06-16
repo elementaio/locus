@@ -51,6 +51,12 @@ works. This is a curated subset of Redis — the common, useful commands per typ
 `LINDEX` `LSET` `LINSERT key BEFORE|AFTER pivot value` `LREM key count value` `LTRIM key start stop`
 `LPOS key value [RANK r] [COUNT n]` `RPOPLPUSH src dst` `LMOVE src dst LEFT|RIGHT LEFT|RIGHT`
 
+## Bitmaps
+
+`SETBIT key offset 0|1` `GETBIT key offset` `BITCOUNT key [start end [BYTE\|BIT]]`
+`BITPOS key 0|1 [start [end [BYTE\|BIT]]]` `BITOP AND\|OR\|XOR\|NOT dest key [key ...]`
+(bit 0 = most-significant bit of byte 0, as in Redis)
+
 ## Hashes
 
 `HSET` `HSETNX` `HGET` `HMGET` `HGETALL` `HDEL` `HEXISTS` `HLEN` `HKEYS` `HVALS` `HINCRBY`
