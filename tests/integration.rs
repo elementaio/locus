@@ -292,6 +292,24 @@ fn keys_and_dbsize_over_the_wire() {
     );
 }
 
+#[test]
+fn conditional_writes_over_the_wire() {
+    let s = Server::start();
+    let mut c = s.connect();
+    c.cmd(&["SET", "lock", "owner-a"]);
+    assert_eq!(c.cmd(&["CAS", "lock", "owner-b", "owner-c"]), "0"); // wrong owner
+    assert_eq!(c.cmd(&["CAS", "lock", "owner-a", "owner-c"]), "1"); // right owner
+    assert_eq!(c.cmd(&["GET", "lock"]), "owner-c");
+    // monotonic cursor
+    assert_eq!(c.cmd(&["SETMAX", "cursor", "10"]), "1");
+    assert_eq!(c.cmd(&["SETMAX", "cursor", "4"]), "0");
+    assert_eq!(c.cmd(&["GET", "cursor"]), "10");
+    // quota
+    assert_eq!(c.cmd(&["INCRCAP", "quota", "1", "2"]), "1");
+    assert_eq!(c.cmd(&["INCRCAP", "quota", "1", "2"]), "2");
+    assert_eq!(c.cmd(&["INCRCAP", "quota", "1", "2"]), "(nil)"); // capped
+}
+
 // === geo ====================================================================
 
 #[test]

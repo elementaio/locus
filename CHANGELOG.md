@@ -6,6 +6,11 @@ All notable changes to Locus are documented here. The format is based on
 
 ## [Unreleased]
 
+### Added (conditional writes — the CAS primitive)
+- **CAS family** `CAS key expected new`, `CADEL key expected`, `SETMAX key n` (monotonic cursor),
+  `INCRCAP key delta cap` (quota). Atomic check-and-write under single-threaded execution — no WATCH/Lua.
+  Logged to the AOF as their concrete effect (`SET`/`DEL`) so replay/replication stay deterministic.
+
 ### Added (geo — the geo-first differentiator)
 - **Live geofencing** — `CDCSUBSCRIBE REGION <lon> <lat> <radius> <unit>`: an atomic snapshot of the geo
   keys inside the circle, then a live stream as keys **enter/move** (`write`) and **leave** (`del` — on

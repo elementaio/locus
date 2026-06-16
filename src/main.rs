@@ -1353,13 +1353,13 @@ fn write_modified(cmd: &[u8], reply: &[u8]) -> bool {
         b"DEL" | b"UNLINK" | b"SREM" | b"HDEL" | b"ZREM" | b"SADD" | b"HSETNX" | b"LPUSHX"
         | b"RPUSHX" | b"PERSIST" | b"EXPIRE" | b"PEXPIRE" | b"EXPIREAT" | b"PEXPIREAT"
         | b"SETNX" | b"MSETNX" | b"RENAMENX" | b"LREM" | b"SMOVE" | b"ZREMRANGEBYRANK"
-        | b"ZREMRANGEBYSCORE" => !zero,
+        | b"ZREMRANGEBYSCORE" | b"CAS" | b"CADEL" | b"SETMAX" => !zero,
         // ZADD: 0 added/changed, or nil from an aborted INCR (NX/XX/GT/LT).
         b"ZADD" => !(zero || nil),
         // LINSERT: 0 (no key) or -1 (pivot not found) means nothing was inserted.
         b"LINSERT" => !(zero || reply.starts_with(b":-1\r\n")),
         // Conditional write / pop-and-move / delete: nil means it didn't happen.
-        b"SET" | b"GETDEL" | b"RPOPLPUSH" | b"LMOVE" => !nil,
+        b"SET" | b"GETDEL" | b"RPOPLPUSH" | b"LMOVE" | b"INCRCAP" => !nil,
         _ => true,
     }
 }

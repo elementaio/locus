@@ -138,6 +138,11 @@ pub fn execute(tokens: &[Vec<u8>], db: &mut Db) -> Vec<u8> {
         b"GETRANGE" => getrange_cmd(db, tokens),
         b"SETRANGE" => setrange_cmd(db, tokens),
         b"STRLEN" => strlen_cmd(db, tokens),
+        // conditional writes (CAS family)
+        b"CAS" => cas_cmd(db, tokens),
+        b"CADEL" => cadel_cmd(db, tokens),
+        b"SETMAX" => setmax_cmd(db, tokens),
+        b"INCRCAP" => incrcap_cmd(db, tokens),
         // bitmaps
         b"SETBIT" => setbit_cmd(db, tokens),
         b"GETBIT" => getbit_cmd(db, tokens),
@@ -288,7 +293,8 @@ pub fn command_meta(cmd: &[u8]) -> Option<CmdMeta> {
         b"INCRBY" | b"DECRBY" | b"APPEND" | b"HDEL" | b"SADD" | b"SREM" | b"ZREM" | b"EXPIRE"
         | b"PEXPIRE" | b"EXPIREAT" | b"PEXPIREAT" | b"LPUSH" | b"RPUSH" | b"LPUSHX" | b"RPUSHX"
         | b"SET" | b"SETNX" | b"GETSET" | b"MSET" | b"MSETNX" | b"INCRBYFLOAT" | b"RENAME"
-        | b"RENAMENX" | b"RPOPLPUSH" | b"SINTERSTORE" | b"SUNIONSTORE" | b"SDIFFSTORE" => (3, true),
+        | b"RENAMENX" | b"RPOPLPUSH" | b"SINTERSTORE" | b"SUNIONSTORE" | b"SDIFFSTORE"
+        | b"CADEL" | b"SETMAX" => (3, true),
         // arity 4 reads
         b"LRANGE" | b"ZRANGE" | b"ZREVRANGE" | b"ZRANGEBYSCORE" | b"ZREVRANGEBYSCORE"
         | b"ZCOUNT" | b"XRANGE" | b"XREVRANGE" | b"XREAD" | b"GETRANGE" => (4, false),
@@ -296,7 +302,7 @@ pub fn command_meta(cmd: &[u8]) -> Option<CmdMeta> {
         b"LSET" | b"HSET" | b"HSETNX" | b"HINCRBY" | b"ZADD" | b"ZINCRBY" | b"SETEX"
         | b"PSETEX" | b"SETRANGE" | b"LREM" | b"LTRIM" | b"SMOVE" | b"ZREMRANGEBYRANK"
         | b"ZREMRANGEBYSCORE" | b"ZUNIONSTORE" | b"ZINTERSTORE" | b"SETBIT" | b"BITOP"
-        | b"GEOSET" => (4, true),
+        | b"GEOSET" | b"CAS" | b"INCRCAP" => (4, true),
         // arity 5 writes
         b"XADD" | b"LINSERT" | b"LMOVE" => (5, true),
         // geosearch: GEOSEARCH FROMKEY k BYRADIUS r unit (6) is the shortest form
@@ -1477,6 +1483,119 @@ fn bitop_cmd(db: &mut Db, tokens: &[Vec<u8>]) -> Vec<u8> {
         db.clear_expire(dest);
     }
     integer(n as i64)
+}
+
+// === conditional writes (CAS family) ========================================
+//
+// Near-free under single-threaded execution: the check and the write happen in
+// one hub turn, so there's no race. These remove most reasons to reach for Lua
+// or WATCH (persist-before-ack, dedup, monotonic cursors, quotas).
+
+/// Read a key as a string for a compare op. `Err(())` = wrong type.
+fn cas_current<'a>(db: &'a mut Db, key: &[u8]) -> Result<Option<&'a Vec<u8>>, ()> {
+    match db.get(key) {
+        None => Ok(None),
+        Some(Value::Str(s)) => Ok(Some(s)),
+        Some(_) => Err(()),
+    }
+}
+
+/// CAS key expected new — set `new` only if the current value equals `expected`
+/// (the key must already hold that string). Returns 1 if set, else 0.
+fn cas_cmd(db: &mut Db, tokens: &[Vec<u8>]) -> Vec<u8> {
+    if tokens.len() != 4 {
+        return wrong_args("cas");
+    }
+    let matches = match cas_current(db, &tokens[1]) {
+        Err(()) => return wrongtype(),
+        Ok(cur) => cur == Some(&tokens[2]),
+    };
+    if matches {
+        db.insert(tokens[1].clone(), Value::Str(tokens[3].clone()));
+        integer(1)
+    } else {
+        integer(0)
+    }
+}
+
+/// CADEL key expected — delete the key only if its value equals `expected`.
+fn cadel_cmd(db: &mut Db, tokens: &[Vec<u8>]) -> Vec<u8> {
+    if tokens.len() != 3 {
+        return wrong_args("cadel");
+    }
+    let matches = match cas_current(db, &tokens[1]) {
+        Err(()) => return wrongtype(),
+        Ok(cur) => cur == Some(&tokens[2]),
+    };
+    if matches {
+        db.remove(&tokens[1]);
+        integer(1)
+    } else {
+        integer(0)
+    }
+}
+
+/// SETMAX key n — monotonic set: store `n` only if it's greater than the current
+/// integer value (or the key is missing). Returns 1 if it advanced, else 0.
+/// The forward-only cursor primitive (chat's CursorStore.advance).
+fn setmax_cmd(db: &mut Db, tokens: &[Vec<u8>]) -> Vec<u8> {
+    if tokens.len() != 3 {
+        return wrong_args("setmax");
+    }
+    let n = match parse_int(&tokens[2]) {
+        Some(n) => n,
+        None => return not_integer(),
+    };
+    let cur = match db.get(&tokens[1]) {
+        None => None,
+        Some(Value::Str(v)) => match std::str::from_utf8(v)
+            .ok()
+            .and_then(|s| s.parse::<i64>().ok())
+        {
+            Some(c) => Some(c),
+            None => return not_integer(),
+        },
+        Some(_) => return wrongtype(),
+    };
+    if cur.is_none_or(|c| n > c) {
+        db.insert(tokens[1].clone(), Value::Str(n.to_string().into_bytes()));
+        integer(1)
+    } else {
+        integer(0)
+    }
+}
+
+/// INCRCAP key delta cap — increment by `delta` only if the result stays ≤ `cap`;
+/// returns the new value, or nil if it would exceed the cap (a quota/rate limiter).
+fn incrcap_cmd(db: &mut Db, tokens: &[Vec<u8>]) -> Vec<u8> {
+    if tokens.len() != 4 {
+        return wrong_args("incrcap");
+    }
+    let (delta, cap) = match (parse_int(&tokens[2]), parse_int(&tokens[3])) {
+        (Some(d), Some(c)) => (d, c),
+        _ => return not_integer(),
+    };
+    let cur = match db.get(&tokens[1]) {
+        None => 0,
+        Some(Value::Str(v)) => match std::str::from_utf8(v)
+            .ok()
+            .and_then(|s| s.parse::<i64>().ok())
+        {
+            Some(c) => c,
+            None => return not_integer(),
+        },
+        Some(_) => return wrongtype(),
+    };
+    let next = match cur.checked_add(delta) {
+        Some(n) => n,
+        None => return error("ERR increment or decrement would overflow"),
+    };
+    if next <= cap {
+        db.insert(tokens[1].clone(), Value::Str(next.to_string().into_bytes()));
+        integer(next)
+    } else {
+        null_bulk() // capped — rejected, value unchanged
+    }
 }
 
 // === hashes =================================================================
@@ -3553,6 +3672,54 @@ mod tests {
     }
 
     #[test]
+    fn conditional_writes() {
+        let mut db = Db::new();
+        // CAS only sets when the current value matches expected.
+        cmd(&mut db, &[b"SET", b"k", b"v1"]);
+        assert_eq!(
+            cmd(&mut db, &[b"CAS", b"k", b"wrong", b"v2"]),
+            b":0\r\n".to_vec()
+        );
+        assert_eq!(cmd(&mut db, &[b"GET", b"k"]), bulk_string(b"v1"));
+        assert_eq!(
+            cmd(&mut db, &[b"CAS", b"k", b"v1", b"v2"]),
+            b":1\r\n".to_vec()
+        );
+        assert_eq!(cmd(&mut db, &[b"GET", b"k"]), bulk_string(b"v2"));
+        assert_eq!(
+            cmd(&mut db, &[b"CAS", b"missing", b"x", b"y"]),
+            b":0\r\n".to_vec()
+        );
+        // CADEL only deletes on match.
+        assert_eq!(cmd(&mut db, &[b"CADEL", b"k", b"nope"]), b":0\r\n".to_vec());
+        assert_eq!(cmd(&mut db, &[b"CADEL", b"k", b"v2"]), b":1\r\n".to_vec());
+        assert_eq!(cmd(&mut db, &[b"EXISTS", b"k"]), b":0\r\n".to_vec());
+        // SETMAX advances only forward.
+        assert_eq!(cmd(&mut db, &[b"SETMAX", b"cur", b"5"]), b":1\r\n".to_vec()); // created
+        assert_eq!(cmd(&mut db, &[b"SETMAX", b"cur", b"3"]), b":0\r\n".to_vec()); // 3 < 5
+        assert_eq!(cmd(&mut db, &[b"SETMAX", b"cur", b"9"]), b":1\r\n".to_vec());
+        assert_eq!(cmd(&mut db, &[b"GET", b"cur"]), bulk_string(b"9"));
+        // INCRCAP increments until the cap, then rejects.
+        assert_eq!(
+            cmd(&mut db, &[b"INCRCAP", b"q", b"3", b"5"]),
+            b":3\r\n".to_vec()
+        );
+        assert_eq!(
+            cmd(&mut db, &[b"INCRCAP", b"q", b"2", b"5"]),
+            b":5\r\n".to_vec()
+        );
+        assert_eq!(
+            cmd(&mut db, &[b"INCRCAP", b"q", b"1", b"5"]),
+            b"$-1\r\n".to_vec()
+        ); // would exceed
+        assert_eq!(cmd(&mut db, &[b"GET", b"q"]), bulk_string(b"5")); // unchanged
+        // WRONGTYPE
+        cmd(&mut db, &[b"RPUSH", b"l", b"x"]);
+        assert!(cmd(&mut db, &[b"CAS", b"l", b"a", b"b"]).starts_with(b"-WRONGTYPE"));
+        assert!(cmd(&mut db, &[b"SETMAX", b"l", b"1"]).starts_with(b"-WRONGTYPE"));
+    }
+
+    #[test]
     fn command_table_write_set_is_exact() {
         // The exact set of write commands. A change here is a deliberate decision,
         // not an accident — guards the AOF/replication write-detection.
@@ -3566,6 +3733,10 @@ mod tests {
             b"MSETNX",
             b"SETRANGE",
             b"INCRBYFLOAT",
+            b"CAS",
+            b"CADEL",
+            b"SETMAX",
+            b"INCRCAP",
             b"GETDEL",
             b"DEL",
             b"UNLINK",

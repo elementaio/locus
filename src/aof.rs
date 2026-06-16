@@ -132,6 +132,13 @@ pub fn entries_for(tokens: &[Vec<u8>], reply: &[u8], db: &mut Db) -> Vec<Vec<Vec
                 _ => vec![],
             }
         }
+        // CAS-family: only reaches here on success — log the concrete effect.
+        b"CAS" => vec![vec![b"SET".to_vec(), tokens[1].clone(), tokens[3].clone()]],
+        b"CADEL" => vec![vec![b"DEL".to_vec(), tokens[1].clone()]],
+        b"SETMAX" | b"INCRCAP" => match db.get(&tokens[1]) {
+            Some(Value::Str(v)) => vec![vec![b"SET".to_vec(), tokens[1].clone(), v.clone()]],
+            _ => vec![],
+        },
         _ => vec![tokens.to_vec()],
     }
 }

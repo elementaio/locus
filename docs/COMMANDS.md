@@ -53,6 +53,18 @@ works. This is a curated subset of Redis — the common, useful commands per typ
 `LINDEX` `LSET` `LINSERT key BEFORE|AFTER pivot value` `LREM key count value` `LTRIM key start stop`
 `LPOS key value [RANK r] [COUNT n]` `RPOPLPUSH src dst` `LMOVE src dst LEFT|RIGHT LEFT|RIGHT`
 
+## Conditional writes (CAS family)
+
+Check-and-write in a single atomic step (no WATCH/Lua needed) — for persist-before-ack, dedup,
+monotonic cursors, and quotas.
+
+| Command | Notes |
+|---|---|
+| `CAS key expected new` | set `new` iff the current value == `expected` (key must exist) → `1`/`0` |
+| `CADEL key expected` | delete iff the current value == `expected` → `1`/`0` |
+| `SETMAX key n` | monotonic: store `n` iff `n` > current integer (or missing) → `1` if advanced else `0` |
+| `INCRCAP key delta cap` | increment iff result ≤ `cap`; returns the new value, or nil if it would exceed |
+
 ## Geo (geo-first)
 
 Each geo object is its **own key** holding a point (the geo-first model, not Redis's members-in-a-zset).
