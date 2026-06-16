@@ -150,6 +150,11 @@ pub fn execute(tokens: &[Vec<u8>], db: &mut Db) -> Vec<u8> {
         b"CMSINCRBY" => cmsincrby_cmd(db, tokens),
         b"CMSQUERY" => cmsquery_cmd(db, tokens),
         b"CMSLOAD" => cmsload_cmd(db, tokens),
+        b"TOPKRESERVE" => topkreserve_cmd(db, tokens),
+        b"TOPKADD" => topkadd_cmd(db, tokens),
+        b"TOPKLIST" => topklist_cmd(db, tokens),
+        b"TOPKCOUNT" => topkcount_cmd(db, tokens),
+        b"TOPKLOAD" => topkload_cmd(db, tokens),
         // bitmaps
         b"SETBIT" => setbit_cmd(db, tokens),
         b"GETBIT" => getbit_cmd(db, tokens),
@@ -287,7 +292,7 @@ pub fn command_meta(cmd: &[u8]) -> Option<CmdMeta> {
         | b"HLEN" | b"HKEYS" | b"HVALS" | b"SMEMBERS" | b"SCARD" | b"ZCARD" | b"XLEN"
         | b"EXISTS" | b"TOUCH" | b"KEYS" | b"MGET" | b"SINTER" | b"SUNION" | b"SDIFF"
         | b"WATCH" | b"SUBSCRIBE" | b"PSUBSCRIBE" | b"PUBSUB" | b"BITCOUNT" | b"SRANDMEMBER"
-        | b"SELECT" | b"CDCREAD" | b"CDCPENDING" | b"GEOPOS" => (2, false),
+        | b"SELECT" | b"CDCREAD" | b"CDCPENDING" | b"GEOPOS" | b"TOPKLIST" => (2, false),
         // arity 2 writes
         b"PERSIST" | b"INCR" | b"DECR" | b"GETDEL" | b"LPOP" | b"RPOP" | b"SPOP" | b"ZPOPMIN"
         | b"ZPOPMAX" | b"DEL" | b"UNLINK" => (2, true),
@@ -295,13 +300,13 @@ pub fn command_meta(cmd: &[u8]) -> Option<CmdMeta> {
         b"LINDEX" | b"HGET" | b"HEXISTS" | b"HMGET" | b"SISMEMBER" | b"SMISMEMBER" | b"ZSCORE"
         | b"ZMSCORE" | b"ZRANK" | b"ZREVRANK" | b"PUBLISH" | b"REPLICAOF" | b"SLAVEOF"
         | b"LPOS" | b"SINTERCARD" | b"GETBIT" | b"BITPOS" | b"CDCGROUP" | b"CDCREADGROUP"
-        | b"CDCACK" | b"GEODIST" | b"BFEXISTS" | b"CMSQUERY" => (3, false),
+        | b"CDCACK" | b"GEODIST" | b"BFEXISTS" | b"CMSQUERY" | b"TOPKCOUNT" => (3, false),
         // arity 3 writes
         b"INCRBY" | b"DECRBY" | b"APPEND" | b"HDEL" | b"SADD" | b"SREM" | b"ZREM" | b"EXPIRE"
         | b"PEXPIRE" | b"EXPIREAT" | b"PEXPIREAT" | b"LPUSH" | b"RPUSH" | b"LPUSHX" | b"RPUSHX"
         | b"SET" | b"SETNX" | b"GETSET" | b"MSET" | b"MSETNX" | b"INCRBYFLOAT" | b"RENAME"
         | b"RENAMENX" | b"RPOPLPUSH" | b"SINTERSTORE" | b"SUNIONSTORE" | b"SDIFFSTORE"
-        | b"CADEL" | b"SETMAX" | b"BFADD" => (3, true),
+        | b"CADEL" | b"SETMAX" | b"BFADD" | b"TOPKRESERVE" | b"TOPKADD" | b"TOPKLOAD" => (3, true),
         // arity 4 reads
         b"LRANGE" | b"ZRANGE" | b"ZREVRANGE" | b"ZRANGEBYSCORE" | b"ZREVRANGEBYSCORE"
         | b"ZCOUNT" | b"XRANGE" | b"XREVRANGE" | b"XREAD" | b"GETRANGE" => (4, false),
@@ -1726,6 +1731,85 @@ fn cmsload_cmd(db: &mut Db, tokens: &[Vec<u8>]) -> Vec<u8> {
             simple_string("OK")
         }
         None => error("ERR CMS counters length mismatch"),
+    }
+}
+
+// === sketches: Top-K ========================================================
+
+fn topkreserve_cmd(db: &mut Db, tokens: &[Vec<u8>]) -> Vec<u8> {
+    if tokens.len() != 3 {
+        return wrong_args("topkreserve");
+    }
+    let k = match parse_int(&tokens[2]) {
+        Some(k) if k > 0 => k as usize,
+        _ => return error("ERR TOPKRESERVE: k must be a positive integer"),
+    };
+    db.insert(
+        tokens[1].clone(),
+        Value::TopK(crate::sketch::TopK::default_topk(k)),
+    );
+    simple_string("OK")
+}
+
+fn topkadd_cmd(db: &mut Db, tokens: &[Vec<u8>]) -> Vec<u8> {
+    if tokens.len() < 3 {
+        return wrong_args("topkadd");
+    }
+    let tk = match db.get_or_insert_with(&tokens[1], || {
+        Value::TopK(crate::sketch::TopK::default_topk(10))
+    }) {
+        Value::TopK(t) => t,
+        _ => return wrongtype(),
+    };
+    // Per added item, return the item it evicted from the leaderboard (or nil).
+    let out: Vec<Vec<u8>> = tokens[2..]
+        .iter()
+        .map(|item| match tk.add(item) {
+            Some(evicted) => bulk_string(&evicted),
+            None => null_bulk(),
+        })
+        .collect();
+    array(&out)
+}
+
+fn topklist_cmd(db: &mut Db, tokens: &[Vec<u8>]) -> Vec<u8> {
+    if tokens.len() != 2 {
+        return wrong_args("topklist");
+    }
+    match db.get(&tokens[1]) {
+        None => bulk_array(&[]),
+        Some(Value::TopK(t)) => bulk_array(&t.list()),
+        Some(_) => wrongtype(),
+    }
+}
+
+fn topkcount_cmd(db: &mut Db, tokens: &[Vec<u8>]) -> Vec<u8> {
+    if tokens.len() < 3 {
+        return wrong_args("topkcount");
+    }
+    match db.get(&tokens[1]) {
+        None => array(&tokens[2..].iter().map(|_| integer(0)).collect::<Vec<_>>()),
+        Some(Value::TopK(t)) => array(
+            &tokens[2..]
+                .iter()
+                .map(|it| integer(t.count(it) as i64))
+                .collect::<Vec<_>>(),
+        ),
+        Some(_) => wrongtype(),
+    }
+}
+
+/// TOPKLOAD key blob — restore from the opaque blob (AOF rewrite / replication).
+fn topkload_cmd(db: &mut Db, tokens: &[Vec<u8>]) -> Vec<u8> {
+    if tokens.len() != 3 {
+        return wrong_args("topkload");
+    }
+    match crate::sketch::TopK::from_bytes(&tokens[2]) {
+        Some(tk) => {
+            db.insert(tokens[1].clone(), Value::TopK(tk));
+            simple_string("OK")
+        }
+        None => error("ERR invalid TopK blob"),
     }
 }
 
@@ -3902,6 +3986,30 @@ mod tests {
     }
 
     #[test]
+    fn topk_commands() {
+        let mut db = Db::new();
+        cmd(&mut db, &[b"TOPKRESERVE", b"hh", b"2"]);
+        for _ in 0..5 {
+            cmd(&mut db, &[b"TOPKADD", b"hh", b"a"]);
+        }
+        for _ in 0..3 {
+            cmd(&mut db, &[b"TOPKADD", b"hh", b"b"]);
+        }
+        cmd(&mut db, &[b"TOPKADD", b"hh", b"c"]); // count 1, shouldn't make the k=2 board
+        assert_eq!(
+            cmd(&mut db, &[b"TOPKLIST", b"hh"]),
+            bulk_array(&[b"a".to_vec(), b"b".to_vec()])
+        );
+        assert_eq!(cmd(&mut db, &[b"TYPE", b"hh"]), b"+topk\r\n".to_vec());
+        // counts (over-estimate, never under)
+        let counts = cmd(&mut db, &[b"TOPKCOUNT", b"hh", b"a", b"missing"]);
+        assert!(counts.starts_with(b"*2\r\n") && counts.windows(4).any(|w| w == b":5\r\n"));
+        // WRONGTYPE
+        cmd(&mut db, &[b"SET", b"s", b"x"]);
+        assert!(cmd(&mut db, &[b"TOPKADD", b"s", b"a"]).starts_with(b"-WRONGTYPE"));
+    }
+
+    #[test]
     fn command_table_write_set_is_exact() {
         // The exact set of write commands. A change here is a deliberate decision,
         // not an accident — guards the AOF/replication write-detection.
@@ -3975,6 +4083,9 @@ mod tests {
             b"BFLOAD",
             b"CMSINCRBY",
             b"CMSLOAD",
+            b"TOPKRESERVE",
+            b"TOPKADD",
+            b"TOPKLOAD",
             b"XADD",
         ];
         for w in writes {
@@ -4000,6 +4111,8 @@ mod tests {
             b"GEOSEARCH".as_slice(),
             b"BFEXISTS".as_slice(),
             b"CMSQUERY".as_slice(),
+            b"TOPKLIST".as_slice(),
+            b"TOPKCOUNT".as_slice(),
             b"SRANDMEMBER".as_slice(),
             b"RANDOMKEY".as_slice(),
             b"SMEMBERS".as_slice(),

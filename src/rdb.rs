@@ -64,6 +64,7 @@ fn write_value<W: Write>(w: &mut W, key: &[u8], v: &Value) -> io::Result<()> {
         Value::Geo(..) => 6,
         Value::Bloom(_) => 7,
         Value::Cms(_) => 8,
+        Value::TopK(_) => 9,
     };
     w.write_all(&[tag])?;
     write_bytes(w, key)?;
@@ -123,6 +124,7 @@ fn write_value<W: Write>(w: &mut W, key: &[u8], v: &Value) -> io::Result<()> {
             w.write_all(&c.depth.to_le_bytes())?;
             write_bytes(w, &c.to_bytes())?;
         }
+        Value::TopK(t) => write_bytes(w, &t.to_bytes())?, // self-describing blob
     }
     Ok(())
 }
@@ -271,6 +273,12 @@ fn read_value<R: Read>(r: &mut R, tag: u8) -> io::Result<Value> {
                 .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "bad CMS"))?;
             Value::Cms(cms)
         }
+        9 => {
+            let bytes = read_bytes(r)?;
+            let tk = crate::sketch::TopK::from_bytes(&bytes)
+                .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "bad TopK"))?;
+            Value::TopK(tk)
+        }
         _ => {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidData,
@@ -330,6 +338,8 @@ mod tests {
         run(&mut db, &[b"GEOSET", b"g", b"13.361389", b"38.115556"]);
         run(&mut db, &[b"BFADD", b"bf", b"alice"]);
         run(&mut db, &[b"CMSINCRBY", b"cm", b"x", b"7"]);
+        run(&mut db, &[b"TOPKRESERVE", b"tk", b"3"]);
+        run(&mut db, &[b"TOPKADD", b"tk", b"a", b"a", b"b"]);
 
         save(&db, path).unwrap();
         let mut loaded = load(path).unwrap();
@@ -369,6 +379,15 @@ mod tests {
         assert_eq!(
             execute(&to(&[b"CMSQUERY", b"cm", b"x"]), &mut loaded),
             b"*1\r\n:7\r\n".to_vec()
+        );
+        assert_eq!(
+            execute(&to(&[b"TYPE", b"tk"]), &mut loaded),
+            b"+topk\r\n".to_vec()
+        );
+        // a (count 2) ranks above b (count 1)
+        assert_eq!(
+            execute(&to(&[b"TOPKLIST", b"tk"]), &mut loaded),
+            b"*2\r\n$1\r\na\r\n$1\r\nb\r\n".to_vec()
         );
         let _ = fs::remove_file(path);
     }

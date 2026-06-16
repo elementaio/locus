@@ -65,9 +65,14 @@ Compact, mergeable summaries. First up: a Bloom filter for dedup / set membershi
 | `CMSINCRBY key item count [item count ...]` | Count-Min: add to frequencies → new estimate per item |
 | `CMSQUERY key item [item ...]` | estimated frequency per item (over-estimate, never under) |
 | `CMSLOAD key width depth bytes` | restore raw counters (AOF rewrite / replication) |
+| `TOPKRESERVE key k` | create a Top-K (heavy hitters) tracking the `k` most frequent items |
+| `TOPKADD key item [item ...]` | count items → per item, the leaderboard item it evicted (or nil) |
+| `TOPKLIST key` | current leaders, highest count first |
+| `TOPKCOUNT key item [item ...]` | estimated count per item |
+| `TOPKLOAD key bytes` | restore (AOF rewrite / replication) |
 
-Auto-sized on first add (Bloom ≈10k @ 1% FPR; CMS 2000×5); persist via RDB/AOF.
-(Top-K and t-digest are the next sketches.)
+Auto-sized on first add (Bloom ≈10k @ 1% FPR; CMS 2000×5; TopK k=10 default); persist via RDB/AOF.
+(t-digest — live percentiles — is the next sketch.)
 
 ## Conditional writes (CAS family)
 

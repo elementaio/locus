@@ -329,6 +329,22 @@ fn bloom_filter_dedup() {
 }
 
 #[test]
+fn topk_heavy_hitters() {
+    let s = Server::start();
+    let mut c = s.connect();
+    assert_eq!(c.cmd(&["TOPKRESERVE", "hh", "2"]), "OK");
+    for _ in 0..5 {
+        c.cmd(&["TOPKADD", "hh", "rust"]);
+    }
+    for _ in 0..3 {
+        c.cmd(&["TOPKADD", "hh", "go"]);
+    }
+    c.cmd(&["TOPKADD", "hh", "zig"]); // 1 occurrence — off the k=2 board
+    assert_eq!(c.cmd(&["TOPKLIST", "hh"]), "[rust, go]");
+    assert_eq!(c.cmd(&["TYPE", "hh"]), "topk");
+}
+
+#[test]
 fn count_min_trending() {
     let s = Server::start();
     let mut c = s.connect();

@@ -34,6 +34,8 @@ pub enum Value {
     Bloom(crate::sketch::Bloom),
     /// A Count-Min sketch (probabilistic frequency / "trending").
     Cms(crate::sketch::Cms),
+    /// A Top-K heavy-hitters sketch.
+    TopK(crate::sketch::TopK),
 }
 
 /// A stream entry id: (milliseconds, sequence).
@@ -69,6 +71,7 @@ impl Value {
             Value::Geo(..) => "geo",
             Value::Bloom(_) => "bloom",
             Value::Cms(_) => "cms",
+            Value::TopK(_) => "topk",
         }
     }
 
@@ -79,7 +82,9 @@ impl Value {
             Value::Set(s) => s.is_empty(),
             Value::ZSet(z) => z.is_empty(),
             Value::Stream(s) => s.entries.is_empty(),
-            Value::Str(_) | Value::Geo(..) | Value::Bloom(_) | Value::Cms(_) => false,
+            Value::Str(_) | Value::Geo(..) | Value::Bloom(_) | Value::Cms(_) | Value::TopK(_) => {
+                false
+            }
         }
     }
 }
@@ -358,6 +363,9 @@ fn estimate_size(key_len: usize, v: &Value) -> usize {
         Value::Geo(..) => 16, // two f64
         Value::Bloom(b) => b.bits.len(),
         Value::Cms(c) => c.counters.len() * 4,
+        Value::TopK(t) => {
+            t.cms.counters.len() * 4 + t.top.iter().map(|(it, _)| it.len() + 16).sum::<usize>()
+        }
     };
     KEY_OVH + key_len + val
 }

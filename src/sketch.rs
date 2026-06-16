@@ -155,6 +155,108 @@ impl Cms {
     }
 }
 
+/// Top-K heavy hitters: a Count-Min for frequencies plus a `k`-slot table of the
+/// current leaders. Approximate (rides on the CMS estimates) but compact.
+pub struct TopK {
+    pub k: usize,
+    pub cms: Cms,
+    pub top: Vec<(Vec<u8>, u64)>, // current heavy hitters (item -> estimate), unordered
+}
+
+impl TopK {
+    pub fn new(k: usize, width: u32, depth: u32) -> TopK {
+        TopK {
+            k: k.max(1),
+            cms: Cms::with_dims(width, depth),
+            top: Vec::new(),
+        }
+    }
+
+    pub fn default_topk(k: usize) -> TopK {
+        Self::new(k, 2000, 5)
+    }
+
+    /// Count an occurrence of `item`; returns the item it evicted from the
+    /// leaderboard, if any.
+    pub fn add(&mut self, item: &[u8]) -> Option<Vec<u8>> {
+        let est = self.cms.incr(item, 1);
+        if let Some(slot) = self.top.iter_mut().find(|(it, _)| it == item) {
+            slot.1 = est;
+            return None;
+        }
+        if self.top.len() < self.k {
+            self.top.push((item.to_vec(), est));
+            return None;
+        }
+        let (min_i, min_c) = self
+            .top
+            .iter()
+            .enumerate()
+            .map(|(i, (_, c))| (i, *c))
+            .min_by_key(|(_, c)| *c)
+            .unwrap();
+        if est > min_c {
+            Some(std::mem::replace(&mut self.top[min_i], (item.to_vec(), est)).0)
+        } else {
+            None
+        }
+    }
+
+    /// Current leaders, highest count first.
+    pub fn list(&self) -> Vec<Vec<u8>> {
+        let mut v = self.top.clone();
+        v.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
+        v.into_iter().map(|(it, _)| it).collect()
+    }
+
+    pub fn count(&self, item: &[u8]) -> u64 {
+        self.cms.query(item)
+    }
+
+    /// Serialize the whole structure to an opaque blob (RDB / AOF restore).
+    pub fn to_bytes(&self) -> Vec<u8> {
+        let mut out = Vec::new();
+        out.extend_from_slice(&(self.k as u32).to_le_bytes());
+        out.extend_from_slice(&self.cms.width.to_le_bytes());
+        out.extend_from_slice(&self.cms.depth.to_le_bytes());
+        out.extend_from_slice(&self.cms.to_bytes());
+        out.extend_from_slice(&(self.top.len() as u32).to_le_bytes());
+        for (item, count) in &self.top {
+            out.extend_from_slice(&(item.len() as u32).to_le_bytes());
+            out.extend_from_slice(item);
+            out.extend_from_slice(&count.to_le_bytes());
+        }
+        out
+    }
+
+    pub fn from_bytes(b: &[u8]) -> Option<TopK> {
+        let mut p = 0;
+        let u32_at = |b: &[u8], p: &mut usize| -> Option<u32> {
+            let v = b.get(*p..*p + 4)?;
+            *p += 4;
+            Some(u32::from_le_bytes([v[0], v[1], v[2], v[3]]))
+        };
+        let k = u32_at(b, &mut p)? as usize;
+        let width = u32_at(b, &mut p)?;
+        let depth = u32_at(b, &mut p)?;
+        let cms_len = width as usize * depth as usize * 4;
+        let cms = Cms::from_bytes(width, depth, b.get(p..p + cms_len)?)?;
+        p += cms_len;
+        let n = u32_at(b, &mut p)? as usize;
+        let mut top = Vec::with_capacity(n);
+        for _ in 0..n {
+            let l = u32_at(b, &mut p)? as usize;
+            let item = b.get(p..p + l)?.to_vec();
+            p += l;
+            let cb = b.get(p..p + 8)?;
+            p += 8;
+            let count = u64::from_le_bytes(cb.try_into().ok()?);
+            top.push((item, count));
+        }
+        Some(TopK { k, cms, top })
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -197,5 +299,24 @@ mod tests {
         c.incr(b"x", 7);
         let r = Cms::from_bytes(c.width, c.depth, &c.to_bytes()).unwrap();
         assert_eq!(r.query(b"x"), 7);
+    }
+
+    #[test]
+    fn topk_tracks_heavy_hitters() {
+        let mut t = TopK::default_topk(2);
+        for _ in 0..5 {
+            t.add(b"a");
+        }
+        for _ in 0..3 {
+            t.add(b"b");
+        }
+        t.add(b"c"); // count 1 — shouldn't displace a(5)/b(3) in a k=2 board
+        let list = t.list();
+        assert_eq!(list, vec![b"a".to_vec(), b"b".to_vec()]);
+        assert!(t.count(b"a") >= 5);
+        // round-trip through the opaque blob
+        let r = TopK::from_bytes(&t.to_bytes()).unwrap();
+        assert_eq!(r.list(), list);
+        assert_eq!(r.k, 2);
     }
 }
