@@ -6,6 +6,13 @@ All notable changes to Locus are documented here. The format is based on
 
 ## [Unreleased]
 
+### Added (changefeed — the reactive differentiator)
+- **`CDCSUBSCRIBE [prefix]` / `CDCUNSUBSCRIBE`** — a reliable, ordered keyspace changefeed: an atomic
+  snapshot of matching keys followed by a live stream of every change (`write`/`del`/`expire`), with
+  no gap or duplication (guaranteed by single-threaded execution). Values are inlined for string keys.
+  Fed from the same modification choke points as WATCH/AOF/replication, so it never misses a write and
+  never reports a no-op. The foundation for live-query and geofencing.
+
 ### Added (commands)
 - String commands: `MGET`, `MSET`, `MSETNX`, `SETNX`, `SETEX`, `PSETEX`, `GETSET`, `GETRANGE`,
   `SETRANGE`, `INCRBYFLOAT`.

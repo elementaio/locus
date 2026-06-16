@@ -262,7 +262,7 @@ pub fn command_meta(cmd: &[u8]) -> Option<CmdMeta> {
         b"PING" | b"QUIT" | b"COMMAND" | b"CONFIG" | b"SAVE" | b"BGSAVE" | b"BGREWRITEAOF"
         | b"MULTI" | b"EXEC" | b"DISCARD" | b"UNWATCH" | b"RESET" | b"INFO" | b"HELLO"
         | b"REPLCONF" | b"PSYNC" | b"SYNC" | b"UNSUBSCRIBE" | b"PUNSUBSCRIBE" | b"DBSIZE"
-        | b"RANDOMKEY" => (1, false),
+        | b"RANDOMKEY" | b"CDCSUBSCRIBE" | b"CDCUNSUBSCRIBE" => (1, false),
         // arity 1 writes
         b"FLUSHDB" | b"FLUSHALL" => (1, true),
         // arity 2 reads

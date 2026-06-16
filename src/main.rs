@@ -28,7 +28,7 @@ use std::thread;
 use std::time::Duration;
 
 use commands::execute;
-use db::{Db, now_ms};
+use db::{Db, Value, now_ms};
 use pubsub::PubSub;
 use resp::{Parsed, parse_command};
 
@@ -102,6 +102,8 @@ struct Hub {
     protos: HashMap<u64, u8>,
     // soft memory cap (bytes); None = unlimited
     maxmemory: Option<usize>,
+    // changefeed subscribers: client id -> key prefix (empty = all keys)
+    changefeeds: HashMap<u64, Vec<u8>>,
 }
 
 /// A client parked on a blocking XREAD.
@@ -163,6 +165,7 @@ impl Hub {
                 .ok()
                 .and_then(|s| parse_mem(&s))
                 .filter(|&m| m > 0),
+            changefeeds: HashMap::new(),
         }
     }
 
@@ -178,11 +181,15 @@ impl Hub {
         }
         let cmd = tokens[0].to_ascii_uppercase();
 
-        if self.pubsub.total(id) > 0 && !allowed_in_subscribe_mode(&cmd) {
+        // A connection in pub/sub or changefeed "push mode" may only run the
+        // push-control commands (plus PING/QUIT/RESET) — replies must not
+        // interleave with pushed messages.
+        let in_push_mode = self.pubsub.total(id) > 0 || self.changefeeds.contains_key(&id);
+        if in_push_mode && !allowed_in_push_mode(&cmd) {
             return self.send(
                 id,
                 resp::error(&format!(
-                    "ERR Can't execute '{}': only (P)SUBSCRIBE / (P)UNSUBSCRIBE / PING / QUIT / RESET are allowed in this context",
+                    "ERR Can't execute '{}': only (P)SUBSCRIBE / (P)UNSUBSCRIBE / CDC(UN)SUBSCRIBE / PING / QUIT / RESET are allowed in this context",
                     String::from_utf8_lossy(&cmd).to_ascii_lowercase()
                 )),
             );
@@ -299,6 +306,7 @@ impl Hub {
                     self.unwatch_keys(&t.watched, id);
                 }
                 self.pubsub.remove_client(id);
+                self.changefeeds.remove(&id);
                 self.protos.insert(id, 2);
                 self.send(id, resp::simple_string("RESET"));
             }
@@ -368,6 +376,8 @@ impl Hub {
                 self.send(id, resp::integer(n));
             }
             b"PUBSUB" => self.handle_pubsub_introspect(id, &tokens),
+            b"CDCSUBSCRIBE" => self.handle_cdc_subscribe(id, &tokens),
+            b"CDCUNSUBSCRIBE" => self.handle_cdc_unsubscribe(id),
             b"XREAD" => self.handle_xread(id, &tokens),
             b"HELLO" => self.handle_hello(id, &tokens),
 
@@ -474,6 +484,89 @@ impl Hub {
             } else {
                 i += 1;
             }
+        }
+    }
+
+    /// CDCSUBSCRIBE [prefix] — enter changefeed push mode: send an atomic
+    /// snapshot of the matching keyspace, then live-stream every matching change.
+    /// Snapshot + registration happen in this single hub turn, so no change can
+    /// slip between them (no gap, no dup) — that's the single-thread guarantee.
+    fn handle_cdc_subscribe(&mut self, id: u64, tokens: &[Vec<u8>]) {
+        let prefix = tokens.get(1).cloned().unwrap_or_default();
+        self.changefeeds.insert(id, prefix.clone());
+        let keys: Vec<Vec<u8>> = self
+            .db
+            .live_keys()
+            .into_iter()
+            .filter(|k| k.starts_with(&prefix))
+            .collect();
+        let n = keys.len();
+        for k in keys {
+            let val = match self.db.get(&k) {
+                Some(Value::Str(s)) => resp::bulk_string(s),
+                _ => resp::null_bulk(), // non-string: change-only, client re-fetches
+            };
+            self.send(
+                id,
+                resp::array(&[
+                    resp::bulk_string(b"cdc-snapshot"),
+                    resp::bulk_string(&k),
+                    val,
+                ]),
+            );
+        }
+        self.send(
+            id,
+            resp::array(&[
+                resp::bulk_string(b"cdc-snapshot-done"),
+                resp::integer(n as i64),
+            ]),
+        );
+    }
+
+    fn handle_cdc_unsubscribe(&mut self, id: u64) {
+        self.changefeeds.remove(&id);
+        self.send(id, resp::array(&[resp::bulk_string(b"cdc-unsubscribe")]));
+    }
+
+    /// Push a change to every changefeed subscriber whose prefix matches `key`.
+    fn push_change(&self, event: &[u8], key: &[u8], value: Option<&[u8]>) {
+        if self.changefeeds.is_empty() {
+            return;
+        }
+        let val = match value {
+            Some(v) => resp::bulk_string(v),
+            None => resp::null_bulk(),
+        };
+        let msg = resp::array(&[
+            resp::bulk_string(b"cdc-change"),
+            resp::bulk_string(event),
+            resp::bulk_string(key),
+            val,
+        ]);
+        for (cid, prefix) in &self.changefeeds {
+            if key.starts_with(prefix) {
+                self.send(*cid, msg.clone());
+            }
+        }
+    }
+
+    /// Emit changefeed events for the keys a write touched (called from exec_one
+    /// after a confirmed modification). `Del` if the key is now gone, else
+    /// `Write` (with the new value for strings).
+    fn emit_write_changes(&mut self, tokens: &[Vec<u8>]) {
+        if self.changefeeds.is_empty() {
+            return;
+        }
+        let keys: Vec<Vec<u8>> = write_keys(tokens).iter().map(|k| k.to_vec()).collect();
+        for key in keys {
+            // Read the post-command state, then push (no db borrow held across send).
+            let (event, value): (&[u8], Option<Vec<u8>>) = match self.db.get(&key) {
+                Some(Value::Str(s)) => (b"write", Some(s.clone())),
+                Some(_) => (b"write", None), // non-string: change-only, client re-fetches
+                None => (b"del", None),
+            };
+            self.push_change(event, &key, value.as_deref());
         }
     }
 
@@ -585,6 +678,8 @@ impl Hub {
                         }
                     }
                 }
+                // Feed the changefeed (same modified-key set as WATCH/AOF).
+                self.emit_write_changes(&tokens);
             }
         }
         if let Some(a) = self.aof.as_mut() {
@@ -608,10 +703,12 @@ impl Hub {
         }
     }
 
-    /// Dirty the WATCHers of any key the keyspace expired since the last drain.
+    /// Dirty the WATCHers of any key the keyspace expired since the last drain,
+    /// and emit an `expire` change to changefeed subscribers.
     fn dirty_expired_watchers(&mut self) {
         for key in self.db.take_expired() {
             self.dirty_watchers(&key);
+            self.push_change(b"expire", &key, None);
         }
     }
 
@@ -629,6 +726,7 @@ impl Hub {
             match self.db.evict_one() {
                 Some(key) => {
                     self.dirty_watchers(&key);
+                    self.push_change(b"del", &key, None);
                     self.propagate(&[b"DEL".to_vec(), key]);
                 }
                 None => break, // keyspace empty — nothing left to evict
@@ -720,13 +818,15 @@ impl Hub {
     }
 }
 
-fn allowed_in_subscribe_mode(cmd: &[u8]) -> bool {
+fn allowed_in_push_mode(cmd: &[u8]) -> bool {
     matches!(
         cmd,
         b"SUBSCRIBE"
             | b"UNSUBSCRIBE"
             | b"PSUBSCRIBE"
             | b"PUNSUBSCRIBE"
+            | b"CDCSUBSCRIBE"
+            | b"CDCUNSUBSCRIBE"
             | b"PING"
             | b"QUIT"
             | b"RESET"
@@ -831,6 +931,7 @@ fn run_hub(rx: mpsc::Receiver<Msg>, tx: mpsc::Sender<Msg>) {
                 }
                 hub.blocked.retain(|r| r.id != id);
                 hub.protos.remove(&id);
+                hub.changefeeds.remove(&id);
             }
             Ok(Msg::Command { id, tokens }) => hub.handle_command(id, tokens),
             Ok(Msg::ReplaceDb(db)) => {

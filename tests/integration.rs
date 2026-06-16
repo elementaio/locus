@@ -292,6 +292,52 @@ fn keys_and_dbsize_over_the_wire() {
     );
 }
 
+// === changefeed =============================================================
+
+#[test]
+fn changefeed_snapshot_then_live_changes() {
+    let s = Server::start();
+    let mut w = s.connect();
+    w.cmd(&["SET", "user:1", "alice"]);
+    w.cmd(&["SET", "other", "x"]); // outside the subscribed prefix
+
+    let mut feed = s.connect();
+    feed.send(&["CDCSUBSCRIBE", "user:"]);
+    // Atomic snapshot: only user:1, then a done marker with the count.
+    let snap = feed.read_reply();
+    assert!(
+        snap.contains("cdc-snapshot") && snap.contains("user:1") && snap.contains("alice"),
+        "snapshot entry: {snap}"
+    );
+    assert_eq!(feed.read_reply(), "[cdc-snapshot-done, 1]");
+
+    // Live change on a matching key is pushed with its new value.
+    w.cmd(&["SET", "user:2", "bob"]);
+    let chg = feed.read_reply();
+    assert!(
+        chg.contains("cdc-change")
+            && chg.contains("write")
+            && chg.contains("user:2")
+            && chg.contains("bob"),
+        "change: {chg}"
+    );
+
+    // A non-matching write is filtered out; the next delivered event is the del.
+    w.cmd(&["SET", "other", "y"]);
+    w.cmd(&["DEL", "user:1"]);
+    let del = feed.read_reply();
+    assert!(
+        del.contains("cdc-change") && del.contains("del") && del.contains("user:1"),
+        "del: {del}"
+    );
+
+    // Push mode: a normal data command on the feed connection is rejected.
+    assert!(feed.cmd(&["GET", "user:2"]).starts_with("-ERR"));
+    // ...but CDCUNSUBSCRIBE leaves push mode and restores normal commands.
+    assert_eq!(feed.cmd(&["CDCUNSUBSCRIBE"]), "[cdc-unsubscribe]");
+    assert_eq!(feed.cmd(&["GET", "user:2"]), "bob");
+}
+
 // === pub/sub ================================================================
 
 #[test]

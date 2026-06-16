@@ -96,6 +96,20 @@ _Consumer groups (`XGROUP`/`XREADGROUP`/`XACK`) are not yet implemented._
 `SUBSCRIBE` `UNSUBSCRIBE` `PSUBSCRIBE` `PUNSUBSCRIBE` `PUBLISH` `PUBSUB CHANNELS|NUMSUB|NUMPAT`
 (glob `*`/`?` patterns)
 
+## Changefeed (Locus-native, reactive)
+
+A reliable, ordered alternative to keyspace notifications: subscribe to a key prefix and receive an
+**atomic snapshot** of matching keys, then a live stream of every change — no gap, no dup (the
+single-threaded hub guarantees it). The connection enters push mode (like pub/sub).
+
+| Command | Notes |
+|---|---|
+| `CDCSUBSCRIBE [prefix]` | snapshot (`["cdc-snapshot", key, value]` …, then `["cdc-snapshot-done", count]`), then live `["cdc-change", write\|del\|expire, key, value]` |
+| `CDCUNSUBSCRIBE` | leave push mode |
+
+Values are inlined for string keys; for other types the event signals the change and the client
+re-fetches. (Offsets / reconnect catch-up / consumer groups / geo-region filters are the next phases.)
+
 ## Transactions
 
 `MULTI` `EXEC` `DISCARD` `WATCH` `UNWATCH` — optimistic locking; no rollback on runtime error (as in
