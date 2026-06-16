@@ -6,6 +6,12 @@ All notable changes to Locus are documented here. The format is based on
 
 ## [Unreleased]
 
+### Changed (internal)
+- Consolidated command metadata (existence, minimum arity, write-or-read) into a single
+  `commands::command_meta` table — the one source of truth. `aof::is_write` now delegates to it,
+  removing the separate hand-maintained write allowlist that could silently drift (a forgotten entry
+  meant a write that wasn't persisted or replicated). A regression-lock test pins the write set.
+
 ### Added
 - **`maxmemory` + eviction** (`LOCUS_MAXMEMORY`, accepts `kb`/`mb`/`gb` suffixes). Approximate memory
   accounting bounds dataset growth; when over the cap a master evicts arbitrary keys (streamed to

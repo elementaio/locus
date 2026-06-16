@@ -160,37 +160,68 @@ pub fn execute(tokens: &[Vec<u8>], db: &mut Db) -> Vec<u8> {
     }
 }
 
-/// Minimum argument count (including the command name) for each known command,
-/// or `None` if the command is unknown. Used for MULTI queue-time validation:
-/// an unknown command or one with too few arguments aborts the transaction
-/// (EXECABORT). Only the *minimum* is enforced — an over-long command still
-/// errors at execution time — so a valid command is never rejected at queue time.
-pub fn min_arity(cmd: &[u8]) -> Option<usize> {
-    Some(match cmd {
-        // arity 1: bare commands and those with all-optional args
+/// Static metadata for a command: its minimum arity (args including the command
+/// name) and whether it mutates the keyspace.
+pub struct CmdMeta {
+    pub min_arity: usize,
+    pub write: bool,
+}
+
+/// The command table — the SINGLE source of truth for which commands exist,
+/// their minimum arity, and whether they are writes. Returns `None` for an
+/// unknown command. Adding a command means one dispatch arm in `execute()` (or
+/// the hub) plus one entry here; `min_arity` (MULTI queue-time validation) and
+/// `is_write` (AOF logging + replication + eviction gating) both read this, so
+/// there is no second list to forget to update.
+///
+/// `write` must be exact: a write mistagged as a read would silently fail to
+/// persist or replicate. Only the *minimum* arity is enforced for validation —
+/// an over-long command still errors at execution time — so a valid command is
+/// never wrongly rejected.
+pub fn command_meta(cmd: &[u8]) -> Option<CmdMeta> {
+    // (min_arity, is_write)
+    let (min_arity, write) = match cmd {
+        // arity 1 — bare commands / all-optional args (none are writes)
         b"PING" | b"QUIT" | b"COMMAND" | b"CONFIG" | b"SAVE" | b"BGSAVE" | b"BGREWRITEAOF"
         | b"MULTI" | b"EXEC" | b"DISCARD" | b"UNWATCH" | b"RESET" | b"INFO" | b"HELLO"
-        | b"REPLCONF" | b"PSYNC" | b"SYNC" | b"UNSUBSCRIBE" | b"PUNSUBSCRIBE" => 1,
-        // arity 2: command + key (or one required arg)
-        b"ECHO" | b"TYPE" | b"TTL" | b"PTTL" | b"PERSIST" | b"GET" | b"GETDEL" | b"INCR"
-        | b"DECR" | b"STRLEN" | b"LLEN" | b"HGETALL" | b"HLEN" | b"HKEYS" | b"HVALS"
-        | b"SMEMBERS" | b"SCARD" | b"ZCARD" | b"XLEN" | b"LPOP" | b"RPOP" | b"SPOP"
-        | b"ZPOPMIN" | b"ZPOPMAX" | b"DEL" | b"EXISTS" | b"SINTER" | b"SUNION" | b"SDIFF"
-        | b"WATCH" | b"SUBSCRIBE" | b"PSUBSCRIBE" | b"PUBSUB" => 2,
-        // arity 3: command + key + one arg
-        b"INCRBY" | b"DECRBY" | b"APPEND" | b"LINDEX" | b"HGET" | b"HEXISTS" | b"HMGET"
-        | b"HDEL" | b"SADD" | b"SREM" | b"SISMEMBER" | b"SMISMEMBER" | b"ZSCORE" | b"ZMSCORE"
-        | b"ZREM" | b"ZRANK" | b"ZREVRANK" | b"PUBLISH" | b"EXPIRE" | b"PEXPIRE" | b"EXPIREAT"
-        | b"PEXPIREAT" | b"LPUSH" | b"RPUSH" | b"LPUSHX" | b"RPUSHX" | b"SET" | b"REPLICAOF"
-        | b"SLAVEOF" => 3,
-        // arity 4: command + key + two args
-        b"LRANGE" | b"LSET" | b"HSET" | b"HSETNX" | b"HINCRBY" | b"ZADD" | b"ZINCRBY"
-        | b"ZRANGE" | b"ZREVRANGE" | b"ZRANGEBYSCORE" | b"ZREVRANGEBYSCORE" | b"ZCOUNT"
-        | b"XRANGE" | b"XREVRANGE" | b"XREAD" => 4,
-        // arity 5: XADD key id field value
-        b"XADD" => 5,
+        | b"REPLCONF" | b"PSYNC" | b"SYNC" | b"UNSUBSCRIBE" | b"PUNSUBSCRIBE" => (1, false),
+        // arity 2 reads
+        b"ECHO" | b"TYPE" | b"TTL" | b"PTTL" | b"GET" | b"STRLEN" | b"LLEN" | b"HGETALL"
+        | b"HLEN" | b"HKEYS" | b"HVALS" | b"SMEMBERS" | b"SCARD" | b"ZCARD" | b"XLEN"
+        | b"EXISTS" | b"SINTER" | b"SUNION" | b"SDIFF" | b"WATCH" | b"SUBSCRIBE"
+        | b"PSUBSCRIBE" | b"PUBSUB" => (2, false),
+        // arity 2 writes
+        b"PERSIST" | b"INCR" | b"DECR" | b"GETDEL" | b"LPOP" | b"RPOP" | b"SPOP" | b"ZPOPMIN"
+        | b"ZPOPMAX" | b"DEL" => (2, true),
+        // arity 3 reads
+        b"LINDEX" | b"HGET" | b"HEXISTS" | b"HMGET" | b"SISMEMBER" | b"SMISMEMBER" | b"ZSCORE"
+        | b"ZMSCORE" | b"ZRANK" | b"ZREVRANK" | b"PUBLISH" | b"REPLICAOF" | b"SLAVEOF" => {
+            (3, false)
+        }
+        // arity 3 writes
+        b"INCRBY" | b"DECRBY" | b"APPEND" | b"HDEL" | b"SADD" | b"SREM" | b"ZREM" | b"EXPIRE"
+        | b"PEXPIRE" | b"EXPIREAT" | b"PEXPIREAT" | b"LPUSH" | b"RPUSH" | b"LPUSHX" | b"RPUSHX"
+        | b"SET" => (3, true),
+        // arity 4 reads
+        b"LRANGE" | b"ZRANGE" | b"ZREVRANGE" | b"ZRANGEBYSCORE" | b"ZREVRANGEBYSCORE"
+        | b"ZCOUNT" | b"XRANGE" | b"XREVRANGE" | b"XREAD" => (4, false),
+        // arity 4 writes
+        b"LSET" | b"HSET" | b"HSETNX" | b"HINCRBY" | b"ZADD" | b"ZINCRBY" => (4, true),
+        // arity 5 writes
+        b"XADD" => (5, true),
         _ => return None,
-    })
+    };
+    Some(CmdMeta { min_arity, write })
+}
+
+/// Minimum argument count for `cmd`, or `None` if unknown. See [`command_meta`].
+pub fn min_arity(cmd: &[u8]) -> Option<usize> {
+    command_meta(cmd).map(|m| m.min_arity)
+}
+
+/// Whether `cmd` (case-insensitive) mutates the keyspace. See [`command_meta`].
+pub fn is_write(cmd: &[u8]) -> bool {
+    command_meta(&cmd.to_ascii_uppercase()).is_some_and(|m| m.write)
 }
 
 // === generic ================================================================
@@ -1603,6 +1634,76 @@ mod tests {
         // Incompatible combinations are rejected.
         assert!(cmd(&mut db, &[b"ZADD", b"z", b"GT", b"LT", b"1", b"m"]).starts_with(b"-ERR"));
         assert!(cmd(&mut db, &[b"ZADD", b"z", b"NX", b"GT", b"1", b"m"]).starts_with(b"-ERR"));
+    }
+
+    #[test]
+    fn command_table_write_set_is_exact() {
+        // The exact set of write commands. A change here is a deliberate decision,
+        // not an accident — guards the AOF/replication write-detection.
+        let writes: &[&[u8]] = &[
+            b"SET",
+            b"GETDEL",
+            b"DEL",
+            b"EXPIRE",
+            b"PEXPIRE",
+            b"EXPIREAT",
+            b"PEXPIREAT",
+            b"PERSIST",
+            b"INCR",
+            b"DECR",
+            b"INCRBY",
+            b"DECRBY",
+            b"APPEND",
+            b"LPUSH",
+            b"RPUSH",
+            b"LPUSHX",
+            b"RPUSHX",
+            b"LPOP",
+            b"RPOP",
+            b"LSET",
+            b"HSET",
+            b"HSETNX",
+            b"HDEL",
+            b"HINCRBY",
+            b"SADD",
+            b"SREM",
+            b"SPOP",
+            b"ZADD",
+            b"ZREM",
+            b"ZINCRBY",
+            b"ZPOPMIN",
+            b"ZPOPMAX",
+            b"XADD",
+        ];
+        for w in writes {
+            assert!(
+                is_write(w),
+                "{} should be a write",
+                String::from_utf8_lossy(w)
+            );
+        }
+        // Reads and admin commands must not be writes.
+        for r in [
+            b"GET".as_slice(),
+            b"MGET".as_slice(), // not yet implemented -> unknown -> not a write
+            b"LRANGE".as_slice(),
+            b"SMEMBERS".as_slice(),
+            b"ZRANGE".as_slice(),
+            b"XRANGE".as_slice(),
+            b"EXISTS".as_slice(),
+            b"PING".as_slice(),
+            b"INFO".as_slice(),
+            b"SUBSCRIBE".as_slice(),
+        ] {
+            assert!(
+                !is_write(r),
+                "{} should not be a write",
+                String::from_utf8_lossy(r)
+            );
+        }
+        // is_write is case-insensitive.
+        assert!(is_write(b"set"));
+        assert!(!is_write(b"get"));
     }
 
     #[test]

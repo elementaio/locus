@@ -34,43 +34,11 @@ pub fn configured_path() -> Option<String> {
 }
 
 /// Commands that modify the dataset (and so must be logged).
+/// Whether a command mutates the keyspace (and so must be logged/replicated).
+/// Delegates to the single command table in `commands` so there is no separate
+/// write-list to keep in sync.
 pub fn is_write(cmd: &[u8]) -> bool {
-    matches!(
-        cmd.to_ascii_uppercase().as_slice(),
-        b"SET"
-            | b"GETDEL"
-            | b"DEL"
-            | b"EXPIRE"
-            | b"PEXPIRE"
-            | b"EXPIREAT"
-            | b"PEXPIREAT"
-            | b"PERSIST"
-            | b"INCR"
-            | b"DECR"
-            | b"INCRBY"
-            | b"DECRBY"
-            | b"APPEND"
-            | b"LPUSH"
-            | b"RPUSH"
-            | b"LPUSHX"
-            | b"RPUSHX"
-            | b"LPOP"
-            | b"RPOP"
-            | b"LSET"
-            | b"HSET"
-            | b"HSETNX"
-            | b"HDEL"
-            | b"HINCRBY"
-            | b"SADD"
-            | b"SREM"
-            | b"SPOP"
-            | b"ZADD"
-            | b"ZREM"
-            | b"ZINCRBY"
-            | b"ZPOPMIN"
-            | b"ZPOPMAX"
-            | b"XADD"
-    )
+    crate::commands::is_write(cmd)
 }
 
 pub struct Aof {
