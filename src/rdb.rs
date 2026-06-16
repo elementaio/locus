@@ -239,7 +239,12 @@ fn read_value<R: Read>(r: &mut R, tag: u8) -> io::Result<Value> {
             }
             Value::Stream(Stream { entries, last_id })
         }
-        _ => return Err(io::Error::new(io::ErrorKind::InvalidData, "unknown type tag")),
+        _ => {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "unknown type tag",
+            ));
+        }
     })
 }
 
@@ -294,11 +299,26 @@ mod tests {
         save(&db, path).unwrap();
         let mut loaded = load(path).unwrap();
 
-        assert_eq!(execute(&to(&[b"GET", b"s"]), &mut loaded), b"$5\r\nhello\r\n".to_vec());
-        assert_eq!(execute(&to(&[b"LLEN", b"l"]), &mut loaded), b":3\r\n".to_vec());
-        assert_eq!(execute(&to(&[b"HGET", b"h", b"f"]), &mut loaded), b"$1\r\nv\r\n".to_vec());
-        assert_eq!(execute(&to(&[b"SCARD", b"st"]), &mut loaded), b":2\r\n".to_vec());
-        assert_eq!(execute(&to(&[b"ZSCORE", b"z", b"m"]), &mut loaded), b"$3\r\n1.5\r\n".to_vec());
+        assert_eq!(
+            execute(&to(&[b"GET", b"s"]), &mut loaded),
+            b"$5\r\nhello\r\n".to_vec()
+        );
+        assert_eq!(
+            execute(&to(&[b"LLEN", b"l"]), &mut loaded),
+            b":3\r\n".to_vec()
+        );
+        assert_eq!(
+            execute(&to(&[b"HGET", b"h", b"f"]), &mut loaded),
+            b"$1\r\nv\r\n".to_vec()
+        );
+        assert_eq!(
+            execute(&to(&[b"SCARD", b"st"]), &mut loaded),
+            b":2\r\n".to_vec()
+        );
+        assert_eq!(
+            execute(&to(&[b"ZSCORE", b"z", b"m"]), &mut loaded),
+            b"$3\r\n1.5\r\n".to_vec()
+        );
         // TTL survived (roughly)
         let ttl = execute(&to(&[b"TTL", b"e"]), &mut loaded);
         assert!(ttl.starts_with(b":") && ttl != b":-1\r\n".to_vec() && ttl != b":-2\r\n".to_vec());

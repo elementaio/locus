@@ -23,22 +23,30 @@ use std::collections::{HashMap, HashSet};
 use std::io::{self, Read, Write};
 use std::net::{TcpListener, TcpStream};
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{mpsc, Arc};
+use std::sync::{Arc, mpsc};
 use std::thread;
 use std::time::Duration;
 
 use commands::execute;
-use db::{now_ms, Db};
+use db::{Db, now_ms};
 use pubsub::PubSub;
-use resp::{parse_command, Parsed};
+use resp::{Parsed, parse_command};
 
 /// Reserved client id for commands replicated from a master.
 const MASTER_ID: u64 = 0;
 
 enum Msg {
-    Connect { id: u64, out: mpsc::Sender<Vec<u8>> },
-    Command { id: u64, tokens: Vec<Vec<u8>> },
-    Disconnect { id: u64 },
+    Connect {
+        id: u64,
+        out: mpsc::Sender<Vec<u8>>,
+    },
+    Command {
+        id: u64,
+        tokens: Vec<Vec<u8>>,
+    },
+    Disconnect {
+        id: u64,
+    },
     /// Replica received a full-sync snapshot; replace the whole dataset.
     ReplaceDb(Box<Db>),
 }
@@ -81,10 +89,10 @@ struct Hub {
     clients: HashMap<u64, mpsc::Sender<Vec<u8>>>,
     pubsub: PubSub,
     // replication
-    replicas: HashSet<u64>,             // client ids receiving our write stream
-    master: Option<(String, String)>,  // (host, port) if we are a replica
+    replicas: HashSet<u64>,           // client ids receiving our write stream
+    master: Option<(String, String)>, // (host, port) if we are a replica
     replica_stop: Option<Arc<AtomicBool>>,
-    tx: mpsc::Sender<Msg>,              // so we can spawn a replica sync thread
+    tx: mpsc::Sender<Msg>, // so we can spawn a replica sync thread
     // transactions
     txs: HashMap<u64, TxState>,
     watched_keys: HashMap<Vec<u8>, HashSet<u64>>,
@@ -120,7 +128,9 @@ impl Hub {
                     eprintln!("AOF load failed: {e} — starting empty");
                     Db::new()
                 });
-                let aof = aof::Aof::open(path).map_err(|e| eprintln!("AOF open failed: {e}")).ok();
+                let aof = aof::Aof::open(path)
+                    .map_err(|e| eprintln!("AOF open failed: {e}"))
+                    .ok();
                 (db, aof)
             }
             None => {
@@ -213,7 +223,10 @@ impl Hub {
             }
             b"WATCH" => {
                 if tokens.len() < 2 {
-                    return self.send(id, resp::error("ERR wrong number of arguments for 'watch' command"));
+                    return self.send(
+                        id,
+                        resp::error("ERR wrong number of arguments for 'watch' command"),
+                    );
                 }
                 if self.txs.get(&id).is_some_and(|t| t.in_multi) {
                     return self.send(id, resp::error("ERR WATCH inside MULTI is not allowed"));
@@ -244,7 +257,10 @@ impl Hub {
             // --- pub/sub ---
             b"SUBSCRIBE" => {
                 if tokens.len() < 2 {
-                    return self.send(id, resp::error("ERR wrong number of arguments for 'subscribe' command"));
+                    return self.send(
+                        id,
+                        resp::error("ERR wrong number of arguments for 'subscribe' command"),
+                    );
                 }
                 for ch in &tokens[1..] {
                     let c = self.pubsub.subscribe(id, ch);
@@ -253,7 +269,10 @@ impl Hub {
             }
             b"PSUBSCRIBE" => {
                 if tokens.len() < 2 {
-                    return self.send(id, resp::error("ERR wrong number of arguments for 'psubscribe' command"));
+                    return self.send(
+                        id,
+                        resp::error("ERR wrong number of arguments for 'psubscribe' command"),
+                    );
                 }
                 for pat in &tokens[1..] {
                     let c = self.pubsub.psubscribe(id, pat);
@@ -261,7 +280,11 @@ impl Hub {
                 }
             }
             b"UNSUBSCRIBE" => {
-                let chans = if tokens.len() > 1 { tokens[1..].to_vec() } else { self.pubsub.channels_of(id) };
+                let chans = if tokens.len() > 1 {
+                    tokens[1..].to_vec()
+                } else {
+                    self.pubsub.channels_of(id)
+                };
                 if chans.is_empty() {
                     self.send(id, pubsub::unsubscribe_reply(None, 0));
                 } else {
@@ -272,7 +295,11 @@ impl Hub {
                 }
             }
             b"PUNSUBSCRIBE" => {
-                let pats = if tokens.len() > 1 { tokens[1..].to_vec() } else { self.pubsub.patterns_of(id) };
+                let pats = if tokens.len() > 1 {
+                    tokens[1..].to_vec()
+                } else {
+                    self.pubsub.patterns_of(id)
+                };
                 if pats.is_empty() {
                     self.send(id, pubsub::punsubscribe_reply(None, 0));
                 } else {
@@ -284,7 +311,10 @@ impl Hub {
             }
             b"PUBLISH" => {
                 if tokens.len() != 3 {
-                    return self.send(id, resp::error("ERR wrong number of arguments for 'publish' command"));
+                    return self.send(
+                        id,
+                        resp::error("ERR wrong number of arguments for 'publish' command"),
+                    );
                 }
                 let n = self.pubsub.publish(&tokens[1], &tokens[2], &self.clients);
                 self.send(id, resp::integer(n));
@@ -296,20 +326,35 @@ impl Hub {
             // --- replication ---
             b"REPLCONF" => self.send(id, resp::simple_string("OK")),
             b"PSYNC" | b"SYNC" => {
-                self.send(id, b"+FULLRESYNC 0000000000000000000000000000000000000000 0\r\n".to_vec());
+                self.send(
+                    id,
+                    b"+FULLRESYNC 0000000000000000000000000000000000000000 0\r\n".to_vec(),
+                );
                 let snap = rdb::serialize(&self.db);
                 let mut bulk = format!("${}\r\n", snap.len()).into_bytes();
                 bulk.extend_from_slice(&snap);
                 self.send(id, bulk);
                 self.replicas.insert(id);
-                println!("replication: replica {id} attached ({} byte snapshot)", snap.len());
+                println!(
+                    "replication: replica {id} attached ({} byte snapshot)",
+                    snap.len()
+                );
             }
             b"REPLICAOF" | b"SLAVEOF" => self.handle_replicaof(id, &tokens),
             b"INFO" => {
-                let role = if self.master.is_some() { "slave" } else { "master" };
-                let mut s = format!("# Replication\r\nrole:{role}\r\nconnected_slaves:{}\r\n", self.replicas.len());
+                let role = if self.master.is_some() {
+                    "slave"
+                } else {
+                    "master"
+                };
+                let mut s = format!(
+                    "# Replication\r\nrole:{role}\r\nconnected_slaves:{}\r\n",
+                    self.replicas.len()
+                );
                 if let Some((h, p)) = &self.master {
-                    s.push_str(&format!("master_host:{h}\r\nmaster_port:{p}\r\nmaster_link_status:up\r\n"));
+                    s.push_str(&format!(
+                        "master_host:{h}\r\nmaster_port:{p}\r\nmaster_link_status:up\r\n"
+                    ));
                 }
                 self.send(id, resp::bulk_string(s.as_bytes()));
             }
@@ -353,7 +398,12 @@ impl Hub {
         match req.block {
             Some(ms) => {
                 let deadline = if ms == 0 { None } else { Some(now_ms() + ms) };
-                self.blocked.push(BlockedReader { id, specs, count: req.count, deadline });
+                self.blocked.push(BlockedReader {
+                    id,
+                    specs,
+                    count: req.count,
+                    deadline,
+                });
             }
             None => self.send(id, streams::nil()),
         }
@@ -398,14 +448,21 @@ impl Hub {
     fn handle_hello(&mut self, id: u64, tokens: &[Vec<u8>]) {
         let mut proto = 2u8;
         if let Some(v) = tokens.get(1) {
-            match std::str::from_utf8(v).ok().and_then(|s| s.parse::<u8>().ok()) {
+            match std::str::from_utf8(v)
+                .ok()
+                .and_then(|s| s.parse::<u8>().ok())
+            {
                 Some(2) => proto = 2,
                 Some(3) => proto = 3,
                 _ => return self.send(id, resp::error("NOPROTO unsupported protocol version")),
             }
         }
         self.protos.insert(id, proto);
-        let role = if self.master.is_some() { "replica" } else { "master" };
+        let role = if self.master.is_some() {
+            "replica"
+        } else {
+            "master"
+        };
         let fields: Vec<(&[u8], Vec<u8>)> = vec![
             (b"server", b"locus".to_vec()),
             (b"version", b"0.1.0".to_vec()),
@@ -488,7 +545,10 @@ impl Hub {
 
     fn handle_replicaof(&mut self, id: u64, tokens: &[Vec<u8>]) {
         if tokens.len() != 3 {
-            return self.send(id, resp::error("ERR wrong number of arguments for 'replicaof' command"));
+            return self.send(
+                id,
+                resp::error("ERR wrong number of arguments for 'replicaof' command"),
+            );
         }
         // Stop any existing replication link first.
         if let Some(flag) = self.replica_stop.take() {
@@ -542,12 +602,21 @@ impl Hub {
 fn allowed_in_subscribe_mode(cmd: &[u8]) -> bool {
     matches!(
         cmd,
-        b"SUBSCRIBE" | b"UNSUBSCRIBE" | b"PSUBSCRIBE" | b"PUNSUBSCRIBE" | b"PING" | b"QUIT" | b"RESET"
+        b"SUBSCRIBE"
+            | b"UNSUBSCRIBE"
+            | b"PSUBSCRIBE"
+            | b"PUNSUBSCRIBE"
+            | b"PING"
+            | b"QUIT"
+            | b"RESET"
     )
 }
 
 fn is_tx_control(cmd: &[u8]) -> bool {
-    matches!(cmd, b"MULTI" | b"EXEC" | b"DISCARD" | b"WATCH" | b"UNWATCH" | b"RESET")
+    matches!(
+        cmd,
+        b"MULTI" | b"EXEC" | b"DISCARD" | b"WATCH" | b"UNWATCH" | b"RESET"
+    )
 }
 
 /// Keys a write command modifies (for WATCH dirtying): all args for DEL,
@@ -555,7 +624,10 @@ fn is_tx_control(cmd: &[u8]) -> bool {
 fn write_keys(tokens: &[Vec<u8>]) -> Vec<&[u8]> {
     match tokens[0].to_ascii_uppercase().as_slice() {
         b"DEL" => tokens[1..].iter().map(|k| k.as_slice()).collect(),
-        _ => tokens.get(1).map(|k| vec![k.as_slice()]).unwrap_or_default(),
+        _ => tokens
+            .get(1)
+            .map(|k| vec![k.as_slice()])
+            .unwrap_or_default(),
     }
 }
 
@@ -615,7 +687,10 @@ fn try_sync(addr: &str, hub_tx: &mpsc::Sender<Msg>, stop: &Arc<AtomicBool>) -> i
     send_cmd(&mut stream, &[b"PING"])?;
     read_line(&mut stream)?;
     let myport = std::env::var("LOCUS_PORT").unwrap_or_else(|_| "6379".into());
-    send_cmd(&mut stream, &[b"REPLCONF", b"listening-port", myport.as_bytes()])?;
+    send_cmd(
+        &mut stream,
+        &[b"REPLCONF", b"listening-port", myport.as_bytes()],
+    )?;
     read_line(&mut stream)?;
     send_cmd(&mut stream, &[b"PSYNC", b"?", b"-1"])?;
     read_line(&mut stream)?; // +FULLRESYNC <id> <offset>
@@ -648,7 +723,12 @@ fn try_sync(addr: &str, hub_tx: &mpsc::Sender<Msg>, stop: &Arc<AtomicBool>) -> i
                         Parsed::Complete(tokens, consumed) => {
                             inbuf.drain(0..consumed);
                             if !tokens.is_empty()
-                                && hub_tx.send(Msg::Command { id: MASTER_ID, tokens }).is_err()
+                                && hub_tx
+                                    .send(Msg::Command {
+                                        id: MASTER_ID,
+                                        tokens,
+                                    })
+                                    .is_err()
                             {
                                 return Ok(());
                             }
@@ -658,7 +738,11 @@ fn try_sync(addr: &str, hub_tx: &mpsc::Sender<Msg>, stop: &Arc<AtomicBool>) -> i
                     }
                 }
             }
-            Err(e) if matches!(e.kind(), io::ErrorKind::WouldBlock | io::ErrorKind::TimedOut) => {}
+            Err(e)
+                if matches!(
+                    e.kind(),
+                    io::ErrorKind::WouldBlock | io::ErrorKind::TimedOut
+                ) => {}
             Err(e) => return Err(e),
         }
     }
@@ -688,7 +772,10 @@ fn read_line(s: &mut TcpStream) -> io::Result<Vec<u8>> {
 fn read_bulk_header(s: &mut TcpStream) -> io::Result<usize> {
     let line = read_line(s)?;
     if line.first() != Some(&b'$') {
-        return Err(io::Error::new(io::ErrorKind::InvalidData, "expected bulk header"));
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "expected bulk header",
+        ));
     }
     std::str::from_utf8(&line[1..])
         .ok()
@@ -712,7 +799,13 @@ fn handle_conn(conn: TcpStream, id: u64, tx: mpsc::Sender<Msg>) -> io::Result<()
         }
     });
 
-    if tx.send(Msg::Connect { id, out: out_tx.clone() }).is_err() {
+    if tx
+        .send(Msg::Connect {
+            id,
+            out: out_tx.clone(),
+        })
+        .is_err()
+    {
         return Ok(());
     }
 

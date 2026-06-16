@@ -29,7 +29,12 @@ impl PubSub {
     }
 
     pub fn subscribe(&mut self, id: u64, channel: &[u8]) -> usize {
-        if self.channels.entry(channel.to_vec()).or_default().insert(id) {
+        if self
+            .channels
+            .entry(channel.to_vec())
+            .or_default()
+            .insert(id)
+        {
             *self.counts.entry(id).or_insert(0) += 1;
         }
         self.total(id)
@@ -45,9 +50,10 @@ impl PubSub {
     pub fn unsubscribe(&mut self, id: u64, channel: &[u8]) -> usize {
         if let Some(subs) = self.channels.get_mut(channel) {
             if subs.remove(&id)
-                && let Some(c) = self.counts.get_mut(&id) {
-                    *c = c.saturating_sub(1);
-                }
+                && let Some(c) = self.counts.get_mut(&id)
+            {
+                *c = c.saturating_sub(1);
+            }
             if subs.is_empty() {
                 self.channels.remove(channel);
             }
@@ -58,9 +64,10 @@ impl PubSub {
     pub fn punsubscribe(&mut self, id: u64, pat: &[u8]) -> usize {
         if let Some(subs) = self.patterns.get_mut(pat) {
             if subs.remove(&id)
-                && let Some(c) = self.counts.get_mut(&id) {
-                    *c = c.saturating_sub(1);
-                }
+                && let Some(c) = self.counts.get_mut(&id)
+            {
+                *c = c.saturating_sub(1);
+            }
             if subs.is_empty() {
                 self.patterns.remove(pat);
             }
@@ -110,9 +117,10 @@ impl PubSub {
             let msg = message(channel, payload);
             for id in subs {
                 if let Some(out) = clients.get(id)
-                    && out.send(msg.clone()).is_ok() {
-                        n += 1;
-                    }
+                    && out.send(msg.clone()).is_ok()
+                {
+                    n += 1;
+                }
             }
         }
         for (pat, subs) in &self.patterns {
@@ -120,9 +128,10 @@ impl PubSub {
                 let msg = pmessage(pat, channel, payload);
                 for id in subs {
                     if let Some(out) = clients.get(id)
-                        && out.send(msg.clone()).is_ok() {
-                            n += 1;
-                        }
+                        && out.send(msg.clone()).is_ok()
+                    {
+                        n += 1;
+                    }
                 }
             }
         }
@@ -133,7 +142,10 @@ impl PubSub {
         self.channels.keys().cloned().collect()
     }
     pub fn numsub(&self, channel: &[u8]) -> i64 {
-        self.channels.get(channel).map(|s| s.len() as i64).unwrap_or(0)
+        self.channels
+            .get(channel)
+            .map(|s| s.len() as i64)
+            .unwrap_or(0)
     }
     pub fn numpat(&self) -> i64 {
         self.patterns.len() as i64

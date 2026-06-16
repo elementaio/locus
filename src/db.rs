@@ -88,10 +88,11 @@ impl Db {
 
     fn check_expiry(&mut self, key: &[u8]) {
         if let Some(&deadline) = self.expires.get(key)
-            && deadline <= now_ms() {
-                self.data.remove(key);
-                self.expires.remove(key);
-            }
+            && deadline <= now_ms()
+        {
+            self.data.remove(key);
+            self.expires.remove(key);
+        }
     }
 
     pub fn get(&mut self, key: &[u8]) -> Option<&Value> {

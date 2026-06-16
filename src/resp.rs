@@ -183,7 +183,10 @@ mod tests {
     fn parses_a_set_command() {
         let buf = b"*3\r\n$3\r\nSET\r\n$3\r\nfoo\r\n$3\r\nbar\r\n";
         let (tokens, consumed) = complete(buf);
-        assert_eq!(tokens, vec![b"SET".to_vec(), b"foo".to_vec(), b"bar".to_vec()]);
+        assert_eq!(
+            tokens,
+            vec![b"SET".to_vec(), b"foo".to_vec(), b"bar".to_vec()]
+        );
         assert_eq!(consumed, buf.len());
     }
 

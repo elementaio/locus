@@ -1,4 +1,16 @@
+# Rust build artifacts
 /target
+
+# Persistence files written at runtime
 *.rdb
 *.rdb.tmp
 *.aof
+
+# Backups / editor / OS cruft
+**/*.rs.bk
+*.swp
+.DS_Store
+.idea/
+.vscode/
+
+# Note: Cargo.lock IS committed (this is a binary application).

@@ -6,7 +6,7 @@
 
 use std::collections::{HashMap, HashSet, VecDeque};
 
-use crate::db::{now_ms, Db, Value};
+use crate::db::{Db, Value, now_ms};
 use crate::rdb;
 use crate::resp::{
     array, bulk_array, bulk_string, error, integer, null_array, null_bulk, simple_string,
@@ -19,7 +19,9 @@ type HashVal = HashMap<Vec<u8>, Vec<u8>>;
 // --- shared helpers ---------------------------------------------------------
 
 fn wrong_args(cmd: &str) -> Vec<u8> {
-    error(&format!("ERR wrong number of arguments for '{cmd}' command"))
+    error(&format!(
+        "ERR wrong number of arguments for '{cmd}' command"
+    ))
 }
 fn not_integer() -> Vec<u8> {
     error("ERR value is not an integer or out of range")
@@ -28,7 +30,9 @@ fn wrongtype() -> Vec<u8> {
     error("WRONGTYPE Operation against a key holding the wrong kind of value")
 }
 fn parse_int(arg: &[u8]) -> Option<i64> {
-    std::str::from_utf8(arg).ok().and_then(|s| s.parse::<i64>().ok())
+    std::str::from_utf8(arg)
+        .ok()
+        .and_then(|s| s.parse::<i64>().ok())
 }
 
 pub fn execute(tokens: &[Vec<u8>], db: &mut Db) -> Vec<u8> {
@@ -162,7 +166,10 @@ fn del_cmd(db: &mut Db, tokens: &[Vec<u8>]) -> Vec<u8> {
     if tokens.len() < 2 {
         return wrong_args("del");
     }
-    let n = tokens[1..].iter().filter(|k| db.remove(k).is_some()).count();
+    let n = tokens[1..]
+        .iter()
+        .filter(|k| db.remove(k).is_some())
+        .count();
     integer(n as i64)
 }
 
@@ -253,7 +260,9 @@ fn incr_cmd(db: &mut Db, tokens: &[Vec<u8>], fixed_delta: i64, has_arg: bool) ->
 
     let current = match db.get(&tokens[1]) {
         None => 0,
-        Some(Value::Str(v)) => match std::str::from_utf8(v).ok().and_then(|s| s.parse::<i64>().ok())
+        Some(Value::Str(v)) => match std::str::from_utf8(v)
+            .ok()
+            .and_then(|s| s.parse::<i64>().ok())
         {
             Some(n) => n,
             None => return not_integer(),
@@ -456,13 +465,23 @@ fn pop_cmd(db: &mut Db, tokens: &[Vec<u8>], front: bool) -> Vec<u8> {
             }
         }
         Some(_) => return wrongtype(),
-        None => return if count.is_some() { null_array() } else { null_bulk() },
+        None => {
+            return if count.is_some() {
+                null_array()
+            } else {
+                null_bulk()
+            };
+        }
     }
     db.remove_if_empty(key);
     if count.is_some() {
         bulk_array(&popped)
     } else {
-        popped.into_iter().next().map(|v| bulk_string(&v)).unwrap_or_else(null_bulk)
+        popped
+            .into_iter()
+            .next()
+            .map(|v| bulk_string(&v))
+            .unwrap_or_else(null_bulk)
     }
 }
 
@@ -479,11 +498,7 @@ fn llen_cmd(db: &mut Db, tokens: &[Vec<u8>]) -> Vec<u8> {
 
 /// Clamp a possibly-negative index into a valid range position.
 fn norm(i: i64, len: usize) -> i64 {
-    if i < 0 {
-        i + len as i64
-    } else {
-        i
-    }
+    if i < 0 { i + len as i64 } else { i }
 }
 
 fn lrange_cmd(db: &mut Db, tokens: &[Vec<u8>]) -> Vec<u8> {
@@ -616,7 +631,10 @@ fn hget_cmd(db: &mut Db, tokens: &[Vec<u8>]) -> Vec<u8> {
     match with_hash(db, &tokens[1]) {
         Err(()) => wrongtype(),
         Ok(None) => null_bulk(),
-        Ok(Some(h)) => h.get(&tokens[2]).map(|v| bulk_string(v)).unwrap_or_else(null_bulk),
+        Ok(Some(h)) => h
+            .get(&tokens[2])
+            .map(|v| bulk_string(v))
+            .unwrap_or_else(null_bulk),
     }
 }
 
@@ -663,7 +681,10 @@ fn hdel_cmd(db: &mut Db, tokens: &[Vec<u8>]) -> Vec<u8> {
     }
     let removed = match db.get_mut(&tokens[1]) {
         None => 0,
-        Some(Value::Hash(h)) => tokens[2..].iter().filter(|f| h.remove(*f).is_some()).count() as i64,
+        Some(Value::Hash(h)) => tokens[2..]
+            .iter()
+            .filter(|f| h.remove(*f).is_some())
+            .count() as i64,
         Some(_) => return wrongtype(),
     };
     db.remove_if_empty(&tokens[1]);
@@ -724,7 +745,10 @@ fn hincrby_cmd(db: &mut Db, tokens: &[Vec<u8>]) -> Vec<u8> {
     };
     let cur = match h.get(&tokens[2]) {
         None => 0,
-        Some(v) => match std::str::from_utf8(v).ok().and_then(|s| s.parse::<i64>().ok()) {
+        Some(v) => match std::str::from_utf8(v)
+            .ok()
+            .and_then(|s| s.parse::<i64>().ok())
+        {
             Some(n) => n,
             None => return error("ERR hash value is not an integer"),
         },
@@ -748,7 +772,10 @@ fn sadd_cmd(db: &mut Db, tokens: &[Vec<u8>]) -> Vec<u8> {
         Value::Set(s) => s,
         _ => return wrongtype(),
     };
-    let added = tokens[2..].iter().filter(|m| s.insert((*m).clone())).count();
+    let added = tokens[2..]
+        .iter()
+        .filter(|m| s.insert((*m).clone()))
+        .count();
     integer(added as i64)
 }
 
@@ -828,7 +855,13 @@ fn spop_cmd(db: &mut Db, tokens: &[Vec<u8>]) -> Vec<u8> {
     };
     let mut popped: Vec<Vec<u8>> = Vec::new();
     match db.get_mut(&tokens[1]) {
-        None => return if count.is_some() { bulk_array(&[]) } else { null_bulk() },
+        None => {
+            return if count.is_some() {
+                bulk_array(&[])
+            } else {
+                null_bulk()
+            };
+        }
         Some(Value::Set(s)) => {
             // Not cryptographically random — we take arbitrary members. (A true
             // random pick is a later refinement.)
@@ -844,7 +877,11 @@ fn spop_cmd(db: &mut Db, tokens: &[Vec<u8>]) -> Vec<u8> {
     if count.is_some() {
         bulk_array(&popped)
     } else {
-        popped.into_iter().next().map(|v| bulk_string(&v)).unwrap_or_else(null_bulk)
+        popped
+            .into_iter()
+            .next()
+            .map(|v| bulk_string(&v))
+            .unwrap_or_else(null_bulk)
     }
 }
 
@@ -1060,7 +1097,10 @@ fn zrem_cmd(db: &mut Db, tokens: &[Vec<u8>]) -> Vec<u8> {
     }
     let removed = match db.get_mut(&tokens[1]) {
         None => 0,
-        Some(Value::ZSet(z)) => tokens[2..].iter().filter(|m| z.remove(*m).is_some()).count() as i64,
+        Some(Value::ZSet(z)) => tokens[2..]
+            .iter()
+            .filter(|m| z.remove(*m).is_some())
+            .count() as i64,
         Some(_) => return wrongtype(),
     };
     db.remove_if_empty(&tokens[1]);
@@ -1104,7 +1144,13 @@ fn zrank_cmd(db: &mut Db, tokens: &[Vec<u8>], rev: bool) -> Vec<u8> {
     }
 }
 
-fn zrange_index(z: &HashMap<Vec<u8>, f64>, start: i64, stop: i64, withscores: bool, rev: bool) -> Vec<u8> {
+fn zrange_index(
+    z: &HashMap<Vec<u8>, f64>,
+    start: i64,
+    stop: i64,
+    withscores: bool,
+    rev: bool,
+) -> Vec<u8> {
     let mut sorted = sorted_members(z);
     if rev {
         sorted.reverse();
@@ -1267,7 +1313,10 @@ fn zcount_cmd(db: &mut Db, tokens: &[Vec<u8>]) -> Vec<u8> {
         Err(()) => wrongtype(),
         Ok(None) => integer(0),
         Ok(Some(z)) => {
-            let n = z.values().filter(|s| in_range(**s, lo, lo_ex, hi, hi_ex)).count();
+            let n = z
+                .values()
+                .filter(|s| in_range(**s, lo, lo_ex, hi, hi_ex))
+                .count();
             integer(n as i64)
         }
     }
@@ -1331,11 +1380,20 @@ mod tests {
     #[test]
     fn lists() {
         let mut db = Db::new();
-        assert_eq!(cmd(&mut db, &[b"RPUSH", b"l", b"a", b"b", b"c"]), b":3\r\n".to_vec());
+        assert_eq!(
+            cmd(&mut db, &[b"RPUSH", b"l", b"a", b"b", b"c"]),
+            b":3\r\n".to_vec()
+        );
         assert_eq!(cmd(&mut db, &[b"LPUSH", b"l", b"z"]), b":4\r\n".to_vec());
         assert_eq!(cmd(&mut db, &[b"LLEN", b"l"]), b":4\r\n".to_vec());
-        assert_eq!(cmd(&mut db, &[b"LINDEX", b"l", b"0"]), b"$1\r\nz\r\n".to_vec());
-        assert_eq!(cmd(&mut db, &[b"LINDEX", b"l", b"-1"]), b"$1\r\nc\r\n".to_vec());
+        assert_eq!(
+            cmd(&mut db, &[b"LINDEX", b"l", b"0"]),
+            b"$1\r\nz\r\n".to_vec()
+        );
+        assert_eq!(
+            cmd(&mut db, &[b"LINDEX", b"l", b"-1"]),
+            b"$1\r\nc\r\n".to_vec()
+        );
         assert_eq!(
             cmd(&mut db, &[b"LRANGE", b"l", b"0", b"-1"]),
             bulk_array(&[b"z".to_vec(), b"a".to_vec(), b"b".to_vec(), b"c".to_vec()])
@@ -1347,23 +1405,44 @@ mod tests {
     #[test]
     fn hashes() {
         let mut db = Db::new();
-        assert_eq!(cmd(&mut db, &[b"HSET", b"h", b"f1", b"v1", b"f2", b"v2"]), b":2\r\n".to_vec());
-        assert_eq!(cmd(&mut db, &[b"HGET", b"h", b"f1"]), b"$2\r\nv1\r\n".to_vec());
+        assert_eq!(
+            cmd(&mut db, &[b"HSET", b"h", b"f1", b"v1", b"f2", b"v2"]),
+            b":2\r\n".to_vec()
+        );
+        assert_eq!(
+            cmd(&mut db, &[b"HGET", b"h", b"f1"]),
+            b"$2\r\nv1\r\n".to_vec()
+        );
         assert_eq!(cmd(&mut db, &[b"HLEN", b"h"]), b":2\r\n".to_vec());
         assert_eq!(cmd(&mut db, &[b"HEXISTS", b"h", b"f2"]), b":1\r\n".to_vec());
-        assert_eq!(cmd(&mut db, &[b"HINCRBY", b"h", b"n", b"5"]), b":5\r\n".to_vec());
-        assert_eq!(cmd(&mut db, &[b"HDEL", b"h", b"f1", b"f2", b"n"]), b":3\r\n".to_vec());
+        assert_eq!(
+            cmd(&mut db, &[b"HINCRBY", b"h", b"n", b"5"]),
+            b":5\r\n".to_vec()
+        );
+        assert_eq!(
+            cmd(&mut db, &[b"HDEL", b"h", b"f1", b"f2", b"n"]),
+            b":3\r\n".to_vec()
+        );
         assert_eq!(cmd(&mut db, &[b"EXISTS", b"h"]), b":0\r\n".to_vec()); // emptied -> gone
     }
 
     #[test]
     fn sets() {
         let mut db = Db::new();
-        assert_eq!(cmd(&mut db, &[b"SADD", b"s", b"a", b"b", b"c"]), b":3\r\n".to_vec());
+        assert_eq!(
+            cmd(&mut db, &[b"SADD", b"s", b"a", b"b", b"c"]),
+            b":3\r\n".to_vec()
+        );
         assert_eq!(cmd(&mut db, &[b"SADD", b"s", b"a"]), b":0\r\n".to_vec());
         assert_eq!(cmd(&mut db, &[b"SCARD", b"s"]), b":3\r\n".to_vec());
-        assert_eq!(cmd(&mut db, &[b"SISMEMBER", b"s", b"b"]), b":1\r\n".to_vec());
-        assert_eq!(cmd(&mut db, &[b"SISMEMBER", b"s", b"z"]), b":0\r\n".to_vec());
+        assert_eq!(
+            cmd(&mut db, &[b"SISMEMBER", b"s", b"b"]),
+            b":1\r\n".to_vec()
+        );
+        assert_eq!(
+            cmd(&mut db, &[b"SISMEMBER", b"s", b"z"]),
+            b":0\r\n".to_vec()
+        );
         cmd(&mut db, &[b"SADD", b"t", b"b", b"c", b"d"]);
         // SINTER s t = {b, c}
         let inter = cmd(&mut db, &[b"SINTER", b"s", b"t"]);
@@ -1384,11 +1463,17 @@ mod tests {
     fn zsets() {
         let mut db = Db::new();
         assert_eq!(
-            cmd(&mut db, &[b"ZADD", b"z", b"1", b"a", b"3", b"c", b"2", b"b"]),
+            cmd(
+                &mut db,
+                &[b"ZADD", b"z", b"1", b"a", b"3", b"c", b"2", b"b"]
+            ),
             b":3\r\n".to_vec()
         );
         assert_eq!(cmd(&mut db, &[b"ZCARD", b"z"]), b":3\r\n".to_vec());
-        assert_eq!(cmd(&mut db, &[b"ZSCORE", b"z", b"b"]), b"$1\r\n2\r\n".to_vec());
+        assert_eq!(
+            cmd(&mut db, &[b"ZSCORE", b"z", b"b"]),
+            b"$1\r\n2\r\n".to_vec()
+        );
         assert_eq!(cmd(&mut db, &[b"ZRANK", b"z", b"a"]), b":0\r\n".to_vec());
         assert_eq!(cmd(&mut db, &[b"ZRANK", b"z", b"c"]), b":2\r\n".to_vec());
         assert_eq!(cmd(&mut db, &[b"ZREVRANK", b"z", b"c"]), b":0\r\n".to_vec());
@@ -1402,9 +1487,15 @@ mod tests {
             cmd(&mut db, &[b"ZRANGEBYSCORE", b"z", b"(1", b"3"]),
             bulk_array(&[b"b".to_vec(), b"c".to_vec()])
         );
-        assert_eq!(cmd(&mut db, &[b"ZINCRBY", b"z", b"5", b"a"]), b"$1\r\n6\r\n".to_vec());
+        assert_eq!(
+            cmd(&mut db, &[b"ZINCRBY", b"z", b"5", b"a"]),
+            b"$1\r\n6\r\n".to_vec()
+        );
         assert_eq!(cmd(&mut db, &[b"ZRANK", b"z", b"a"]), b":2\r\n".to_vec()); // now highest
-        assert_eq!(cmd(&mut db, &[b"ZCOUNT", b"z", b"2", b"6"]), b":3\r\n".to_vec());
+        assert_eq!(
+            cmd(&mut db, &[b"ZCOUNT", b"z", b"2", b"6"]),
+            b":3\r\n".to_vec()
+        );
         // ZPOPMIN removes the lowest
         assert_eq!(
             cmd(&mut db, &[b"ZPOPMIN", b"z"]),

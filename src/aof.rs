@@ -17,8 +17,8 @@ use std::fs::{self, File, OpenOptions};
 use std::io::{self, Read, Write};
 
 use crate::commands::execute;
-use crate::db::{now_ms, Db, Value};
-use crate::resp::{parse_command, Parsed};
+use crate::db::{Db, Value, now_ms};
+use crate::resp::{Parsed, parse_command};
 
 pub const DEFAULT_PATH: &str = "locus.aof";
 
@@ -37,12 +37,38 @@ pub fn configured_path() -> Option<String> {
 pub fn is_write(cmd: &[u8]) -> bool {
     matches!(
         cmd.to_ascii_uppercase().as_slice(),
-        b"SET" | b"GETDEL" | b"DEL" | b"EXPIRE" | b"PEXPIRE" | b"EXPIREAT" | b"PEXPIREAT"
-            | b"PERSIST" | b"INCR" | b"DECR" | b"INCRBY" | b"DECRBY" | b"APPEND"
-            | b"LPUSH" | b"RPUSH" | b"LPUSHX" | b"RPUSHX" | b"LPOP" | b"RPOP" | b"LSET"
-            | b"HSET" | b"HSETNX" | b"HDEL" | b"HINCRBY"
-            | b"SADD" | b"SREM" | b"SPOP"
-            | b"ZADD" | b"ZREM" | b"ZINCRBY" | b"ZPOPMIN" | b"ZPOPMAX"
+        b"SET"
+            | b"GETDEL"
+            | b"DEL"
+            | b"EXPIRE"
+            | b"PEXPIRE"
+            | b"EXPIREAT"
+            | b"PEXPIREAT"
+            | b"PERSIST"
+            | b"INCR"
+            | b"DECR"
+            | b"INCRBY"
+            | b"DECRBY"
+            | b"APPEND"
+            | b"LPUSH"
+            | b"RPUSH"
+            | b"LPUSHX"
+            | b"RPUSHX"
+            | b"LPOP"
+            | b"RPOP"
+            | b"LSET"
+            | b"HSET"
+            | b"HSETNX"
+            | b"HDEL"
+            | b"HINCRBY"
+            | b"SADD"
+            | b"SREM"
+            | b"SPOP"
+            | b"ZADD"
+            | b"ZREM"
+            | b"ZINCRBY"
+            | b"ZPOPMIN"
+            | b"ZPOPMAX"
             | b"XADD"
     )
 }
@@ -143,7 +169,11 @@ pub fn entries_for(tokens: &[Vec<u8>], reply: &[u8], db: &mut Db) -> Vec<Vec<Vec
 }
 
 fn pexpireat(key: &[u8], at_ms: u64) -> Vec<Vec<u8>> {
-    vec![b"PEXPIREAT".to_vec(), key.to_vec(), at_ms.to_string().into_bytes()]
+    vec![
+        b"PEXPIREAT".to_vec(),
+        key.to_vec(),
+        at_ms.to_string().into_bytes(),
+    ]
 }
 
 fn local_crlf(buf: &[u8], from: usize) -> Option<usize> {
@@ -290,7 +320,11 @@ fn reconstruct(key: &[u8], value: &Value) -> Vec<Vec<Vec<u8>>> {
 
 fn fmt_score(s: f64) -> Vec<u8> {
     if s.is_infinite() {
-        if s > 0.0 { b"inf".to_vec() } else { b"-inf".to_vec() }
+        if s > 0.0 {
+            b"inf".to_vec()
+        } else {
+            b"-inf".to_vec()
+        }
     } else {
         format!("{s}").into_bytes()
     }
@@ -311,8 +345,15 @@ mod tests {
         let _ = fs::remove_file(path);
         let mut a = Aof::open(path).unwrap();
         // Log a few commands by hand (as the owner would).
-        a.append(&[vec![b"SET".to_vec(), b"k".to_vec(), b"v".to_vec()]]).unwrap();
-        a.append(&[vec![b"RPUSH".to_vec(), b"l".to_vec(), b"a".to_vec(), b"b".to_vec()]]).unwrap();
+        a.append(&[vec![b"SET".to_vec(), b"k".to_vec(), b"v".to_vec()]])
+            .unwrap();
+        a.append(&[vec![
+            b"RPUSH".to_vec(),
+            b"l".to_vec(),
+            b"a".to_vec(),
+            b"b".to_vec(),
+        ]])
+        .unwrap();
         a.append(&[vec![b"INCR".to_vec(), b"c".to_vec()]]).unwrap();
         a.append(&[vec![b"INCR".to_vec(), b"c".to_vec()]]).unwrap();
         drop(a);
@@ -329,7 +370,8 @@ mod tests {
         let path = "/tmp/locus_aof_torn.aof";
         let _ = fs::remove_file(path);
         let mut a = Aof::open(path).unwrap();
-        a.append(&[vec![b"SET".to_vec(), b"ok".to_vec(), b"1".to_vec()]]).unwrap();
+        a.append(&[vec![b"SET".to_vec(), b"ok".to_vec(), b"1".to_vec()]])
+            .unwrap();
         drop(a);
         // Simulate a crash mid-write: append a truncated command.
         let mut f = OpenOptions::new().append(true).open(path).unwrap();

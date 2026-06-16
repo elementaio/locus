@@ -4,7 +4,7 @@
 //! Blocking XREAD is handled in the hub (it must park the client); the rest is
 //! pure data operations here. (Consumer groups are deferred.)
 
-use crate::db::{now_ms, Db, Stream, StreamId, Value};
+use crate::db::{Db, Stream, StreamId, Value, now_ms};
 use crate::resp::{array, bulk_array, bulk_string, error, integer, null_array};
 
 pub fn fmt_id(id: StreamId) -> Vec<u8> {
@@ -39,7 +39,9 @@ fn gen_id(arg: &[u8], last: StreamId) -> Result<StreamId, String> {
         Some((m, s)) => (m, Some(s)),
         None => (txt, None),
     };
-    let ms: u64 = ms_part.parse().map_err(|_| "Invalid stream ID specified as stream command argument".to_string())?;
+    let ms: u64 = ms_part
+        .parse()
+        .map_err(|_| "Invalid stream ID specified as stream command argument".to_string())?;
     let id = match seq_part {
         None | Some("*") => {
             if ms == last.0 {
@@ -47,11 +49,16 @@ fn gen_id(arg: &[u8], last: StreamId) -> Result<StreamId, String> {
             } else if ms > last.0 {
                 (ms, 0)
             } else {
-                return Err("The ID specified in XADD is equal or smaller than the target stream top item".into());
+                return Err(
+                    "The ID specified in XADD is equal or smaller than the target stream top item"
+                        .into(),
+                );
             }
         }
         Some(s) => {
-            let seq: u64 = s.parse().map_err(|_| "Invalid stream ID specified as stream command argument".to_string())?;
+            let seq: u64 = s.parse().map_err(|_| {
+                "Invalid stream ID specified as stream command argument".to_string()
+            })?;
             (ms, seq)
         }
     };
@@ -59,7 +66,9 @@ fn gen_id(arg: &[u8], last: StreamId) -> Result<StreamId, String> {
         return Err("The ID specified in XADD must be greater than 0-0".into());
     }
     if id <= last && last != (0, 0) {
-        return Err("The ID specified in XADD is equal or smaller than the target stream top item".into());
+        return Err(
+            "The ID specified in XADD is equal or smaller than the target stream top item".into(),
+        );
     }
     Ok(id)
 }
@@ -80,8 +89,10 @@ pub fn xadd(db: &mut Db, tokens: &[Vec<u8>]) -> Vec<u8> {
         Ok(id) => id,
         Err(e) => return error(&format!("ERR {e}")),
     };
-    let fields: Vec<(Vec<u8>, Vec<u8>)> =
-        tokens[3..].chunks(2).map(|c| (c[0].clone(), c[1].clone())).collect();
+    let fields: Vec<(Vec<u8>, Vec<u8>)> = tokens[3..]
+        .chunks(2)
+        .map(|c| (c[0].clone(), c[1].clone()))
+        .collect();
     match db.get_or_insert_with(key, || Value::Stream(Stream::new())) {
         Value::Stream(s) => {
             s.entries.push((id, fields));
@@ -139,7 +150,11 @@ pub fn xrange(db: &mut Db, tokens: &[Vec<u8>], rev: bool) -> Vec<u8> {
     } else {
         None
     };
-    let (start_arg, end_arg) = if rev { (&tokens[3], &tokens[2]) } else { (&tokens[2], &tokens[3]) };
+    let (start_arg, end_arg) = if rev {
+        (&tokens[3], &tokens[2])
+    } else {
+        (&tokens[2], &tokens[3])
+    };
     let (start, end) = match (bound(start_arg, false), bound(end_arg, true)) {
         (Some(a), Some(b)) => (a, b),
         _ => return error("ERR Invalid stream ID specified as stream command argument"),
@@ -205,7 +220,10 @@ pub fn parse_xread(tokens: &[Vec<u8>]) -> Result<XReadReq, String> {
     }
     let rest = &tokens[i..];
     if rest.is_empty() || !rest.len().is_multiple_of(2) {
-        return Err("Unbalanced XREAD list of streams: for each stream key an ID or '$' must be specified.".into());
+        return Err(
+            "Unbalanced XREAD list of streams: for each stream key an ID or '$' must be specified."
+                .into(),
+        );
     }
     let n = rest.len() / 2;
     let mut streams = Vec::with_capacity(n);
@@ -219,7 +237,11 @@ pub fn parse_xread(tokens: &[Vec<u8>]) -> Result<XReadReq, String> {
         };
         streams.push((key, spec));
     }
-    Ok(XReadReq { count, block, streams })
+    Ok(XReadReq {
+        count,
+        block,
+        streams,
+    })
 }
 
 /// Resolve "$" specs to each stream's current last id (snapshot for blocking).
@@ -240,7 +262,11 @@ pub fn resolve_specs(db: &mut Db, req: &XReadReq) -> Vec<(Vec<u8>, StreamId)> {
 }
 
 /// Collect entries strictly after each spec's id. Returns None if all empty.
-pub fn xread_collect(db: &mut Db, specs: &[(Vec<u8>, StreamId)], count: Option<usize>) -> Option<Vec<u8>> {
+pub fn xread_collect(
+    db: &mut Db,
+    specs: &[(Vec<u8>, StreamId)],
+    count: Option<usize>,
+) -> Option<Vec<u8>> {
     let mut out: Vec<Vec<u8>> = Vec::new();
     for (key, after) in specs {
         if let Some(Value::Stream(s)) = db.get(key) {
