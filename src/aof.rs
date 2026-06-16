@@ -43,6 +43,7 @@ pub fn is_write(cmd: &[u8]) -> bool {
             | b"HSET" | b"HSETNX" | b"HDEL" | b"HINCRBY"
             | b"SADD" | b"SREM" | b"SPOP"
             | b"ZADD" | b"ZREM" | b"ZINCRBY" | b"ZPOPMIN" | b"ZPOPMAX"
+            | b"XADD"
     )
 }
 
@@ -124,6 +125,17 @@ pub fn entries_for(tokens: &[Vec<u8>], reply: &[u8], db: &mut Db) -> Vec<Vec<Vec
                 let mut c = vec![b"SREM".to_vec(), tokens[1].clone()];
                 c.extend(popped);
                 vec![c]
+            }
+        }
+        b"XADD" => {
+            // Log the concrete generated id (from the reply), never "*".
+            match extract_bulks(reply).into_iter().next() {
+                Some(realid) if tokens.len() > 2 => {
+                    let mut c = tokens.to_vec();
+                    c[2] = realid;
+                    vec![c]
+                }
+                _ => vec![],
             }
         }
         _ => vec![tokens.to_vec()],
@@ -261,6 +273,18 @@ fn reconstruct(key: &[u8], value: &Value) -> Vec<Vec<Vec<u8>>> {
             }
             vec![c]
         }
+        Value::Stream(s) => s
+            .entries
+            .iter()
+            .map(|(id, fields)| {
+                let mut c = vec![b"XADD".to_vec(), key.to_vec(), crate::streams::fmt_id(*id)];
+                for (f, v) in fields {
+                    c.push(f.clone());
+                    c.push(v.clone());
+                }
+                c
+            })
+            .collect(),
     }
 }
 

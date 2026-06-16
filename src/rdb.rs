@@ -12,7 +12,7 @@ use std::collections::{HashMap, HashSet, VecDeque};
 use std::fs::{self, File};
 use std::io::{self, BufReader, BufWriter, Read, Write};
 
-use crate::db::{Db, Value};
+use crate::db::{Db, Stream, Value};
 
 pub const DEFAULT_PATH: &str = "locus.rdb";
 const MAGIC: &[u8; 9] = b"LOCUSRDB1";
@@ -60,6 +60,7 @@ fn write_value<W: Write>(w: &mut W, key: &[u8], v: &Value) -> io::Result<()> {
         Value::Hash(_) => 2,
         Value::Set(_) => 3,
         Value::ZSet(_) => 4,
+        Value::Stream(_) => 5,
     };
     w.write_all(&[tag])?;
     write_bytes(w, key)?;
@@ -89,6 +90,20 @@ fn write_value<W: Write>(w: &mut W, key: &[u8], v: &Value) -> io::Result<()> {
             for (m, score) in z {
                 write_bytes(w, m)?;
                 w.write_all(&score.to_le_bytes())?;
+            }
+        }
+        Value::Stream(s) => {
+            w.write_all(&(s.entries.len() as u32).to_le_bytes())?;
+            w.write_all(&s.last_id.0.to_le_bytes())?;
+            w.write_all(&s.last_id.1.to_le_bytes())?;
+            for (id, fields) in &s.entries {
+                w.write_all(&id.0.to_le_bytes())?;
+                w.write_all(&id.1.to_le_bytes())?;
+                w.write_all(&(fields.len() as u32).to_le_bytes())?;
+                for (f, v) in fields {
+                    write_bytes(w, f)?;
+                    write_bytes(w, v)?;
+                }
             }
         }
     }
@@ -206,6 +221,23 @@ fn read_value<R: Read>(r: &mut R, tag: u8) -> io::Result<Value> {
                 z.insert(m, score);
             }
             Value::ZSet(z)
+        }
+        5 => {
+            let n = read_u32(r)?;
+            let last_id = (read_u64(r)?, read_u64(r)?);
+            let mut entries = Vec::with_capacity(n);
+            for _ in 0..n {
+                let id = (read_u64(r)?, read_u64(r)?);
+                let fc = read_u32(r)?;
+                let mut fields = Vec::with_capacity(fc);
+                for _ in 0..fc {
+                    let f = read_bytes(r)?;
+                    let v = read_bytes(r)?;
+                    fields.push((f, v));
+                }
+                entries.push((id, fields));
+            }
+            Value::Stream(Stream { entries, last_id })
         }
         _ => return Err(io::Error::new(io::ErrorKind::InvalidData, "unknown type tag")),
     })

@@ -17,6 +17,7 @@ mod db;
 mod pubsub;
 mod rdb;
 mod resp;
+mod streams;
 
 use std::collections::{HashMap, HashSet};
 use std::io::{self, Read, Write};
@@ -27,7 +28,7 @@ use std::thread;
 use std::time::Duration;
 
 use commands::execute;
-use db::Db;
+use db::{now_ms, Db};
 use pubsub::PubSub;
 use resp::{parse_command, Parsed};
 
@@ -87,6 +88,16 @@ struct Hub {
     // transactions
     txs: HashMap<u64, TxState>,
     watched_keys: HashMap<Vec<u8>, HashSet<u64>>,
+    // blocking XREAD
+    blocked: Vec<BlockedReader>,
+}
+
+/// A client parked on a blocking XREAD.
+struct BlockedReader {
+    id: u64,
+    specs: Vec<(Vec<u8>, db::StreamId)>,
+    count: Option<usize>,
+    deadline: Option<u64>, // None = block forever
 }
 
 /// Per-client transaction state (MULTI/EXEC/WATCH).
@@ -131,6 +142,7 @@ impl Hub {
             tx,
             txs: HashMap::new(),
             watched_keys: HashMap::new(),
+            blocked: Vec::new(),
         }
     }
 
@@ -275,6 +287,7 @@ impl Hub {
                 self.send(id, resp::integer(n));
             }
             b"PUBSUB" => self.handle_pubsub_introspect(id, &tokens),
+            b"XREAD" => self.handle_xread(id, &tokens),
 
             // --- replication ---
             b"REPLCONF" => self.send(id, resp::simple_string("OK")),
@@ -314,8 +327,62 @@ impl Hub {
 
             // --- everything else (data commands) ---
             _ => {
+                let is_xadd = cmd.as_slice() == b"XADD";
                 let reply = self.exec_one(id, tokens);
                 self.send(id, reply);
+                if is_xadd {
+                    self.serve_blocked();
+                }
+            }
+        }
+    }
+
+    fn handle_xread(&mut self, id: u64, tokens: &[Vec<u8>]) {
+        let req = match streams::parse_xread(tokens) {
+            Ok(r) => r,
+            Err(e) => return self.send(id, resp::error(&format!("ERR {e}"))),
+        };
+        let specs = streams::resolve_specs(&mut self.db, &req);
+        if let Some(reply) = streams::xread_collect(&mut self.db, &specs, req.count) {
+            return self.send(id, reply);
+        }
+        match req.block {
+            Some(ms) => {
+                let deadline = if ms == 0 { None } else { Some(now_ms() + ms) };
+                self.blocked.push(BlockedReader { id, specs, count: req.count, deadline });
+            }
+            None => self.send(id, streams::nil()),
+        }
+    }
+
+    /// After a stream gains entries, satisfy any parked readers that can now read.
+    fn serve_blocked(&mut self) {
+        let mut i = 0;
+        while i < self.blocked.len() {
+            let specs = self.blocked[i].specs.clone();
+            let count = self.blocked[i].count;
+            let rid = self.blocked[i].id;
+            if let Some(reply) = streams::xread_collect(&mut self.db, &specs, count) {
+                self.blocked.remove(i);
+                self.send(rid, reply);
+            } else {
+                i += 1;
+            }
+        }
+    }
+
+    /// Time out parked readers whose BLOCK deadline has passed (reply nil).
+    fn expire_blocked(&mut self) {
+        let now = now_ms();
+        let mut i = 0;
+        while i < self.blocked.len() {
+            match self.blocked[i].deadline {
+                Some(d) if d <= now => {
+                    let rid = self.blocked[i].id;
+                    self.blocked.remove(i);
+                    self.send(rid, streams::nil());
+                }
+                _ => i += 1,
             }
         }
     }
@@ -461,6 +528,7 @@ fn run_hub(rx: mpsc::Receiver<Msg>, tx: mpsc::Sender<Msg>) {
                 if let Some(t) = hub.txs.remove(&id) {
                     hub.unwatch_keys(&t.watched, id);
                 }
+                hub.blocked.retain(|r| r.id != id);
             }
             Ok(Msg::Command { id, tokens }) => hub.handle_command(id, tokens),
             Ok(Msg::ReplaceDb(db)) => {
@@ -471,6 +539,7 @@ fn run_hub(rx: mpsc::Receiver<Msg>, tx: mpsc::Sender<Msg>) {
                     a.maybe_fsync();
                 }
                 hub.db.active_expire();
+                hub.expire_blocked();
             }
             Err(mpsc::RecvTimeoutError::Disconnected) => break,
         }

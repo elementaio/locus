@@ -25,6 +25,25 @@ pub enum Value {
     /// Sorted set: member -> score. Kept correct-but-simple (sorted on demand);
     /// a skiplist for O(log n) rank/range is the documented later optimization.
     ZSet(HashMap<Vec<u8>, f64>),
+    Stream(Stream),
+}
+
+/// A stream entry id: (milliseconds, sequence).
+pub type StreamId = (u64, u64);
+
+/// An append-only stream of (id, field-value pairs), ordered by id.
+pub struct Stream {
+    pub entries: Vec<(StreamId, Vec<(Vec<u8>, Vec<u8>)>)>,
+    pub last_id: StreamId,
+}
+
+impl Stream {
+    pub fn new() -> Self {
+        Stream {
+            entries: Vec::new(),
+            last_id: (0, 0),
+        }
+    }
 }
 
 impl Value {
@@ -35,6 +54,7 @@ impl Value {
             Value::Hash(_) => "hash",
             Value::Set(_) => "set",
             Value::ZSet(_) => "zset",
+            Value::Stream(_) => "stream",
         }
     }
 
@@ -44,6 +64,7 @@ impl Value {
             Value::Hash(h) => h.is_empty(),
             Value::Set(s) => s.is_empty(),
             Value::ZSet(z) => z.is_empty(),
+            Value::Stream(s) => s.entries.is_empty(),
             Value::Str(_) => false,
         }
     }

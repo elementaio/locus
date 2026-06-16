@@ -11,6 +11,7 @@ use crate::rdb;
 use crate::resp::{
     array, bulk_array, bulk_string, error, integer, null_array, null_bulk, simple_string,
 };
+use crate::streams;
 
 // --- shared helpers ---------------------------------------------------------
 
@@ -125,6 +126,11 @@ pub fn execute(tokens: &[Vec<u8>], db: &mut Db) -> Vec<u8> {
         b"ZCOUNT" => zcount_cmd(db, tokens),
         b"ZPOPMIN" => zpop_cmd(db, tokens, false),
         b"ZPOPMAX" => zpop_cmd(db, tokens, true),
+        // streams (XREAD is handled in the hub for blocking support)
+        b"XADD" => streams::xadd(db, tokens),
+        b"XLEN" => streams::xlen(db, tokens),
+        b"XRANGE" => streams::xrange(db, tokens, false),
+        b"XREVRANGE" => streams::xrange(db, tokens, true),
         // persistence
         b"SAVE" => match rdb::save(db, &rdb::configured_path()) {
             Ok(()) => simple_string("OK"),
