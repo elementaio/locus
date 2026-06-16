@@ -77,11 +77,21 @@ pub fn execute(tokens: &[Vec<u8>], db: &mut Db) -> Vec<u8> {
         b"SET" => set_cmd(db, tokens),
         b"GET" => get_cmd(db, tokens),
         b"GETDEL" => getdel_cmd(db, tokens),
+        b"GETSET" => getset_cmd(db, tokens),
+        b"SETNX" => setnx_cmd(db, tokens),
+        b"SETEX" => setex_cmd(db, tokens, 1000, "setex"),
+        b"PSETEX" => setex_cmd(db, tokens, 1, "psetex"),
+        b"MGET" => mget_cmd(db, tokens),
+        b"MSET" => mset_cmd(db, tokens),
+        b"MSETNX" => msetnx_cmd(db, tokens),
         b"INCR" => incr_cmd(db, tokens, 1, false),
         b"DECR" => incr_cmd(db, tokens, -1, false),
         b"INCRBY" => incr_cmd(db, tokens, 0, true),
         b"DECRBY" => incr_cmd(db, tokens, 0, true),
+        b"INCRBYFLOAT" => incrbyfloat_cmd(db, tokens),
         b"APPEND" => append_cmd(db, tokens),
+        b"GETRANGE" => getrange_cmd(db, tokens),
+        b"SETRANGE" => setrange_cmd(db, tokens),
         b"STRLEN" => strlen_cmd(db, tokens),
         // lists
         b"LPUSH" => push_cmd(db, tokens, true, true),
@@ -188,7 +198,7 @@ pub fn command_meta(cmd: &[u8]) -> Option<CmdMeta> {
         // arity 2 reads
         b"ECHO" | b"TYPE" | b"TTL" | b"PTTL" | b"GET" | b"STRLEN" | b"LLEN" | b"HGETALL"
         | b"HLEN" | b"HKEYS" | b"HVALS" | b"SMEMBERS" | b"SCARD" | b"ZCARD" | b"XLEN"
-        | b"EXISTS" | b"SINTER" | b"SUNION" | b"SDIFF" | b"WATCH" | b"SUBSCRIBE"
+        | b"EXISTS" | b"MGET" | b"SINTER" | b"SUNION" | b"SDIFF" | b"WATCH" | b"SUBSCRIBE"
         | b"PSUBSCRIBE" | b"PUBSUB" => (2, false),
         // arity 2 writes
         b"PERSIST" | b"INCR" | b"DECR" | b"GETDEL" | b"LPOP" | b"RPOP" | b"SPOP" | b"ZPOPMIN"
@@ -201,12 +211,13 @@ pub fn command_meta(cmd: &[u8]) -> Option<CmdMeta> {
         // arity 3 writes
         b"INCRBY" | b"DECRBY" | b"APPEND" | b"HDEL" | b"SADD" | b"SREM" | b"ZREM" | b"EXPIRE"
         | b"PEXPIRE" | b"EXPIREAT" | b"PEXPIREAT" | b"LPUSH" | b"RPUSH" | b"LPUSHX" | b"RPUSHX"
-        | b"SET" => (3, true),
+        | b"SET" | b"SETNX" | b"GETSET" | b"MSET" | b"MSETNX" | b"INCRBYFLOAT" => (3, true),
         // arity 4 reads
         b"LRANGE" | b"ZRANGE" | b"ZREVRANGE" | b"ZRANGEBYSCORE" | b"ZREVRANGEBYSCORE"
-        | b"ZCOUNT" | b"XRANGE" | b"XREVRANGE" | b"XREAD" => (4, false),
+        | b"ZCOUNT" | b"XRANGE" | b"XREVRANGE" | b"XREAD" | b"GETRANGE" => (4, false),
         // arity 4 writes
-        b"LSET" | b"HSET" | b"HSETNX" | b"HINCRBY" | b"ZADD" | b"ZINCRBY" => (4, true),
+        b"LSET" | b"HSET" | b"HSETNX" | b"HINCRBY" | b"ZADD" | b"ZINCRBY" | b"SETEX"
+        | b"PSETEX" | b"SETRANGE" => (4, true),
         // arity 5 writes
         b"XADD" => (5, true),
         _ => return None,
@@ -341,6 +352,190 @@ fn incr_cmd(db: &mut Db, tokens: &[Vec<u8>], fixed_delta: i64, has_arg: bool) ->
         }
         None => error("ERR increment or decrement would overflow"),
     }
+}
+
+fn mget_cmd(db: &mut Db, tokens: &[Vec<u8>]) -> Vec<u8> {
+    if tokens.len() < 2 {
+        return wrong_args("mget");
+    }
+    // Like Redis, a non-string (or missing) key yields nil rather than an error.
+    let out: Vec<Vec<u8>> = tokens[1..]
+        .iter()
+        .map(|k| match db.get(k) {
+            Some(Value::Str(s)) => bulk_string(s),
+            _ => null_bulk(),
+        })
+        .collect();
+    array(&out)
+}
+
+fn mset_cmd(db: &mut Db, tokens: &[Vec<u8>]) -> Vec<u8> {
+    let pairs = &tokens[1..];
+    if pairs.is_empty() || !pairs.len().is_multiple_of(2) {
+        return wrong_args("mset");
+    }
+    for kv in pairs.chunks_exact(2) {
+        db.insert(kv[0].clone(), Value::Str(kv[1].clone()));
+        db.clear_expire(&kv[0]); // like SET, MSET discards any prior TTL
+    }
+    simple_string("OK")
+}
+
+fn msetnx_cmd(db: &mut Db, tokens: &[Vec<u8>]) -> Vec<u8> {
+    let pairs = &tokens[1..];
+    if pairs.is_empty() || !pairs.len().is_multiple_of(2) {
+        return wrong_args("msetnx");
+    }
+    // All-or-nothing: if any key exists, set none.
+    if pairs.chunks_exact(2).any(|kv| db.contains(&kv[0])) {
+        return integer(0);
+    }
+    for kv in pairs.chunks_exact(2) {
+        db.insert(kv[0].clone(), Value::Str(kv[1].clone()));
+    }
+    integer(1)
+}
+
+fn setnx_cmd(db: &mut Db, tokens: &[Vec<u8>]) -> Vec<u8> {
+    if tokens.len() != 3 {
+        return wrong_args("setnx");
+    }
+    if db.contains(&tokens[1]) {
+        return integer(0);
+    }
+    db.insert(tokens[1].clone(), Value::Str(tokens[2].clone()));
+    integer(1)
+}
+
+fn setex_cmd(db: &mut Db, tokens: &[Vec<u8>], unit_ms: u64, name: &str) -> Vec<u8> {
+    if tokens.len() != 4 {
+        return wrong_args(name);
+    }
+    let invalid = || error(&format!("ERR invalid expire time in '{name}' command"));
+    let n = match parse_int(&tokens[2]) {
+        Some(n) if n > 0 => n as u64,
+        Some(_) => return invalid(),
+        None => return not_integer(),
+    };
+    let at = match n
+        .checked_mul(unit_ms)
+        .and_then(|ms| now_ms().checked_add(ms))
+    {
+        Some(v) => v,
+        None => return invalid(),
+    };
+    db.insert(tokens[1].clone(), Value::Str(tokens[3].clone()));
+    db.set_expire(&tokens[1], at);
+    simple_string("OK")
+}
+
+fn getset_cmd(db: &mut Db, tokens: &[Vec<u8>]) -> Vec<u8> {
+    if tokens.len() != 3 {
+        return wrong_args("getset");
+    }
+    let old = match db.get(&tokens[1]) {
+        None => None,
+        Some(Value::Str(s)) => Some(s.clone()),
+        Some(_) => return wrongtype(),
+    };
+    db.insert(tokens[1].clone(), Value::Str(tokens[2].clone()));
+    db.clear_expire(&tokens[1]); // like SET, GETSET discards any prior TTL
+    old.map(|v| bulk_string(&v)).unwrap_or_else(null_bulk)
+}
+
+fn getrange_cmd(db: &mut Db, tokens: &[Vec<u8>]) -> Vec<u8> {
+    if tokens.len() != 4 {
+        return wrong_args("getrange");
+    }
+    let (start, end) = match (parse_int(&tokens[2]), parse_int(&tokens[3])) {
+        (Some(a), Some(b)) => (a, b),
+        _ => return not_integer(),
+    };
+    let s = match db.get(&tokens[1]) {
+        None => return bulk_string(b""),
+        Some(Value::Str(s)) => s,
+        Some(_) => return wrongtype(),
+    };
+    let len = s.len() as i64;
+    // Normalize inclusive [start, end] with negative-from-end indices (Redis).
+    let mut start = if start < 0 { len + start } else { start };
+    let mut end = if end < 0 { len + end } else { end };
+    if start < 0 {
+        start = 0;
+    }
+    if end >= len {
+        end = len - 1;
+    }
+    if len == 0 || start > end || start >= len {
+        return bulk_string(b"");
+    }
+    bulk_string(&s[start as usize..=end as usize])
+}
+
+fn setrange_cmd(db: &mut Db, tokens: &[Vec<u8>]) -> Vec<u8> {
+    const MAX_STR: usize = 512 * 1024 * 1024; // Redis proto-max-bulk-len
+    if tokens.len() != 4 {
+        return wrong_args("setrange");
+    }
+    let offset = match parse_int(&tokens[2]) {
+        Some(o) if o >= 0 => o as usize,
+        Some(_) => return error("ERR offset is out of range"),
+        None => return not_integer(),
+    };
+    let val = &tokens[3];
+    // An empty value is a no-op that just reports the current length.
+    if val.is_empty() {
+        return match db.get(&tokens[1]) {
+            Some(Value::Str(s)) => integer(s.len() as i64),
+            Some(_) => wrongtype(),
+            None => integer(0),
+        };
+    }
+    if offset + val.len() > MAX_STR {
+        return error("ERR string exceeds maximum allowed size (proto-max-bulk-len)");
+    }
+    let s = match db.get_or_insert_with(&tokens[1], || Value::Str(Vec::new())) {
+        Value::Str(s) => s,
+        _ => return wrongtype(),
+    };
+    let end = offset + val.len();
+    if s.len() < end {
+        s.resize(end, 0); // pad with zero bytes
+    }
+    s[offset..end].copy_from_slice(val);
+    integer(s.len() as i64)
+}
+
+fn incrbyfloat_cmd(db: &mut Db, tokens: &[Vec<u8>]) -> Vec<u8> {
+    if tokens.len() != 3 {
+        return wrong_args("incrbyfloat");
+    }
+    let not_float = || error("ERR value is not a valid float");
+    let incr = match parse_finite_float(&tokens[2]) {
+        Some(f) => f,
+        None => return not_float(),
+    };
+    let current = match db.get(&tokens[1]) {
+        None => 0.0,
+        Some(Value::Str(v)) => match parse_finite_float(v) {
+            Some(n) => n,
+            None => return not_float(),
+        },
+        Some(_) => return wrongtype(),
+    };
+    let next = current + incr;
+    if !next.is_finite() {
+        return error("ERR increment would produce NaN or Infinity");
+    }
+    let formatted = fmt_score(next);
+    db.insert(tokens[1].clone(), Value::Str(formatted.clone())); // preserves TTL
+    bulk_string(&formatted)
+}
+
+/// Parse a finite float (rejects inf/-inf/NaN — unlike `parse_score`).
+fn parse_finite_float(arg: &[u8]) -> Option<f64> {
+    let f = std::str::from_utf8(arg).ok()?.trim().parse::<f64>().ok()?;
+    f.is_finite().then_some(f)
 }
 
 struct SetOpts {
@@ -1637,11 +1832,98 @@ mod tests {
     }
 
     #[test]
+    fn string_family_commands() {
+        let mut db = Db::new();
+        // MSET / MGET
+        assert_eq!(
+            cmd(&mut db, &[b"MSET", b"a", b"1", b"b", b"2"]),
+            b"+OK\r\n".to_vec()
+        );
+        assert_eq!(
+            cmd(&mut db, &[b"MGET", b"a", b"b", b"missing"]),
+            array(&[bulk_string(b"1"), bulk_string(b"2"), null_bulk()])
+        );
+        // SETNX: only when absent
+        assert_eq!(cmd(&mut db, &[b"SETNX", b"a", b"x"]), b":0\r\n".to_vec());
+        assert_eq!(cmd(&mut db, &[b"SETNX", b"c", b"3"]), b":1\r\n".to_vec());
+        // MSETNX: all-or-nothing
+        assert_eq!(
+            cmd(&mut db, &[b"MSETNX", b"d", b"4", b"a", b"x"]),
+            b":0\r\n".to_vec()
+        );
+        assert_eq!(cmd(&mut db, &[b"EXISTS", b"d"]), b":0\r\n".to_vec()); // not set
+        // GETSET returns old, sets new
+        assert_eq!(
+            cmd(&mut db, &[b"GETSET", b"a", b"9"]),
+            b"$1\r\n1\r\n".to_vec()
+        );
+        assert_eq!(cmd(&mut db, &[b"GET", b"a"]), b"$1\r\n9\r\n".to_vec());
+        // SETEX sets a TTL
+        assert_eq!(
+            cmd(&mut db, &[b"SETEX", b"t", b"100", b"v"]),
+            b"+OK\r\n".to_vec()
+        );
+        assert!(matches!(
+            cmd(&mut db, &[b"TTL", b"t"]).as_slice(),
+            b":100\r\n" | b":99\r\n"
+        ));
+        assert!(cmd(&mut db, &[b"SETEX", b"t", b"0", b"v"]).starts_with(b"-ERR"));
+        // GETRANGE (inclusive, negative indices)
+        cmd(&mut db, &[b"SET", b"s", b"Hello World"]);
+        assert_eq!(
+            cmd(&mut db, &[b"GETRANGE", b"s", b"0", b"4"]),
+            bulk_string(b"Hello")
+        );
+        assert_eq!(
+            cmd(&mut db, &[b"GETRANGE", b"s", b"-5", b"-1"]),
+            bulk_string(b"World")
+        );
+        assert_eq!(
+            cmd(&mut db, &[b"GETRANGE", b"s", b"5", b"2"]),
+            bulk_string(b"")
+        );
+        // SETRANGE pads with zero bytes
+        assert_eq!(
+            cmd(&mut db, &[b"SETRANGE", b"p", b"3", b"abc"]),
+            b":6\r\n".to_vec()
+        );
+        assert_eq!(
+            cmd(&mut db, &[b"GET", b"p"]),
+            bulk_string(&[0, 0, 0, b'a', b'b', b'c'])
+        );
+        // INCRBYFLOAT (binary-exact operands so formatting is deterministic;
+        // an integer result drops the decimal, like Redis)
+        cmd(&mut db, &[b"SET", b"f", b"10.5"]);
+        assert_eq!(
+            cmd(&mut db, &[b"INCRBYFLOAT", b"f", b"0.25"]),
+            bulk_string(b"10.75")
+        );
+        assert_eq!(
+            cmd(&mut db, &[b"INCRBYFLOAT", b"f", b"-0.75"]),
+            bulk_string(b"10")
+        );
+        assert!(cmd(&mut db, &[b"INCRBYFLOAT", b"f", b"notnum"]).starts_with(b"-ERR"));
+        assert!(cmd(&mut db, &[b"INCRBYFLOAT", b"f", b"inf"]).starts_with(b"-ERR"));
+        // WRONGTYPE checks
+        cmd(&mut db, &[b"RPUSH", b"list", b"x"]);
+        assert!(cmd(&mut db, &[b"GETSET", b"list", b"y"]).starts_with(b"-WRONGTYPE"));
+        assert!(cmd(&mut db, &[b"INCRBYFLOAT", b"list", b"1"]).starts_with(b"-WRONGTYPE"));
+    }
+
+    #[test]
     fn command_table_write_set_is_exact() {
         // The exact set of write commands. A change here is a deliberate decision,
         // not an accident — guards the AOF/replication write-detection.
         let writes: &[&[u8]] = &[
             b"SET",
+            b"SETNX",
+            b"SETEX",
+            b"PSETEX",
+            b"GETSET",
+            b"MSET",
+            b"MSETNX",
+            b"SETRANGE",
+            b"INCRBYFLOAT",
             b"GETDEL",
             b"DEL",
             b"EXPIRE",
@@ -1685,7 +1967,8 @@ mod tests {
         // Reads and admin commands must not be writes.
         for r in [
             b"GET".as_slice(),
-            b"MGET".as_slice(), // not yet implemented -> unknown -> not a write
+            b"MGET".as_slice(),
+            b"GETRANGE".as_slice(),
             b"LRANGE".as_slice(),
             b"SMEMBERS".as_slice(),
             b"ZRANGE".as_slice(),

@@ -32,9 +32,14 @@ works. This is a curated subset of Redis — the common, useful commands per typ
 | Command | Notes |
 |---|---|
 | `SET key val [EX\|PX\|EXAT\|PXAT n] [NX\|XX] [KEEPTTL] [GET]` | |
+| `SETNX key val` / `GETSET key val` | set-if-absent / set-and-return-old |
+| `SETEX key sec val` / `PSETEX key ms val` | set with TTL |
 | `GET key` / `GETDEL key` | |
+| `MGET key [key ...]` / `MSET key val [key val ...]` / `MSETNX key val [...]` | bulk get/set; MSETNX is all-or-nothing |
 | `INCR` / `DECR` / `INCRBY` / `DECRBY` | integer, errors on non-int / overflow |
+| `INCRBYFLOAT key incr` | float; rejects nan/inf |
 | `APPEND key val` / `STRLEN key` | |
+| `GETRANGE key start end` / `SETRANGE key offset val` | substring (inclusive, neg indices) / overwrite-pad |
 
 ## Lists
 

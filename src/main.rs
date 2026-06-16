@@ -764,7 +764,8 @@ fn write_modified(cmd: &[u8], reply: &[u8]) -> bool {
     match cmd {
         // "count of elements changed" commands: 0 means nothing changed.
         b"DEL" | b"SREM" | b"HDEL" | b"ZREM" | b"SADD" | b"HSETNX" | b"LPUSHX" | b"RPUSHX"
-        | b"PERSIST" | b"EXPIRE" | b"PEXPIRE" | b"EXPIREAT" | b"PEXPIREAT" => !zero,
+        | b"PERSIST" | b"EXPIRE" | b"PEXPIRE" | b"EXPIREAT" | b"PEXPIREAT" | b"SETNX"
+        | b"MSETNX" => !zero,
         // ZADD: 0 added/changed, or nil from an aborted INCR (NX/XX/GT/LT).
         b"ZADD" => !(zero || nil),
         // Conditional write / delete: nil means it didn't happen.

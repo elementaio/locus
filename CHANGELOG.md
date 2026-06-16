@@ -6,6 +6,10 @@ All notable changes to Locus are documented here. The format is based on
 
 ## [Unreleased]
 
+### Added (commands)
+- String commands: `MGET`, `MSET`, `MSETNX`, `SETNX`, `SETEX`, `PSETEX`, `GETSET`, `GETRANGE`,
+  `SETRANGE`, `INCRBYFLOAT`.
+
 ### Changed (internal)
 - Consolidated command metadata (existence, minimum arity, write-or-read) into a single
   `commands::command_meta` table — the one source of truth. `aof::is_write` now delegates to it,
