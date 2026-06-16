@@ -116,7 +116,8 @@ struct TxState {
     in_multi: bool,
     queued: Vec<Vec<Vec<u8>>>,
     watched: Vec<Vec<u8>>,
-    dirty: bool, // a watched key changed -> EXEC aborts
+    dirty: bool,   // a watched key changed -> EXEC aborts (nil)
+    aborted: bool, // a queued command was invalid -> EXEC aborts (EXECABORT)
 }
 
 impl Hub {
@@ -182,7 +183,33 @@ impl Hub {
         }
 
         // In MULTI, queue everything except transaction-control commands.
+        // Validate at queue time (Redis semantics): an unknown command or one
+        // with too few arguments is rejected now and flags the transaction so
+        // EXEC fails with EXECABORT instead of running a half-valid batch.
         if self.txs.get(&id).is_some_and(|t| t.in_multi) && !is_tx_control(&cmd) {
+            match commands::min_arity(&cmd) {
+                None => {
+                    self.txs.get_mut(&id).unwrap().aborted = true;
+                    return self.send(
+                        id,
+                        resp::error(&format!(
+                            "ERR unknown command '{}'",
+                            String::from_utf8_lossy(&tokens[0])
+                        )),
+                    );
+                }
+                Some(min) if tokens.len() < min => {
+                    self.txs.get_mut(&id).unwrap().aborted = true;
+                    return self.send(
+                        id,
+                        resp::error(&format!(
+                            "ERR wrong number of arguments for '{}' command",
+                            String::from_utf8_lossy(&cmd).to_ascii_lowercase()
+                        )),
+                    );
+                }
+                _ => {}
+            }
             self.txs.get_mut(&id).unwrap().queued.push(tokens);
             return self.send(id, resp::simple_string("QUEUED"));
         }
@@ -211,7 +238,12 @@ impl Hub {
                 }
                 let t = self.txs.remove(&id).unwrap();
                 self.unwatch_keys(&t.watched, id);
-                if t.dirty {
+                if t.aborted {
+                    self.send(
+                        id,
+                        resp::error("EXECABORT Transaction discarded because of previous errors."),
+                    );
+                } else if t.dirty {
                     self.send(id, resp::null_array()); // a watched key changed -> abort
                 } else {
                     let mut replies = Vec::with_capacity(t.queued.len());
@@ -402,7 +434,9 @@ impl Hub {
             Err(e) => return self.send(id, resp::error(&format!("ERR {e}"))),
         };
         let specs = streams::resolve_specs(&mut self.db, &req);
-        if let Some(reply) = streams::xread_collect(&mut self.db, &specs, req.count) {
+        let collected = streams::xread_collect(&mut self.db, &specs, req.count);
+        self.dirty_expired_watchers();
+        if let Some(reply) = collected {
             return self.send(id, reply);
         }
         match req.block {
@@ -508,17 +542,13 @@ impl Hub {
         }
         let reply = execute(&tokens, &mut self.db);
         let errored = reply.first() == Some(&b'-');
-        if !errored && aof::is_write(&cmd) {
-            // WATCH: any modification of a watched key dirties its transaction.
+        // A write only counts if it actually changed the dataset. A no-op write
+        // (e.g. DEL of a missing key, SADD of an existing member) is not logged,
+        // not replicated, and does not dirty a WATCHer.
+        if !errored && aof::is_write(&cmd) && write_modified(&cmd, &reply) {
+            // WATCH: a real modification of a watched key dirties its transaction.
             for key in write_keys(&tokens) {
-                if let Some(watchers) = self.watched_keys.get(key) {
-                    let ids: Vec<u64> = watchers.iter().copied().collect();
-                    for wid in ids {
-                        if let Some(tx) = self.txs.get_mut(&wid) {
-                            tx.dirty = true;
-                        }
-                    }
-                }
+                self.dirty_watchers(key);
             }
             let entries = aof::entries_for(&tokens, &reply, &mut self.db);
             if let Some(a) = self.aof.as_mut() {
@@ -539,7 +569,29 @@ impl Hub {
         if let Some(a) = self.aof.as_mut() {
             a.maybe_fsync();
         }
+        // A watched key removed by passive expiry during this command must also
+        // abort its transaction.
+        self.dirty_expired_watchers();
         reply
+    }
+
+    /// Mark every transaction watching `key` as dirty (its EXEC will abort).
+    fn dirty_watchers(&mut self, key: &[u8]) {
+        if let Some(watchers) = self.watched_keys.get(key) {
+            let ids: Vec<u64> = watchers.iter().copied().collect();
+            for wid in ids {
+                if let Some(tx) = self.txs.get_mut(&wid) {
+                    tx.dirty = true;
+                }
+            }
+        }
+    }
+
+    /// Dirty the WATCHers of any key the keyspace expired since the last drain.
+    fn dirty_expired_watchers(&mut self) {
+        for key in self.db.take_expired() {
+            self.dirty_watchers(&key);
+        }
     }
 
     fn unwatch_keys(&mut self, watched: &[Vec<u8>], id: u64) {
@@ -641,6 +693,27 @@ fn write_keys(tokens: &[Vec<u8>]) -> Vec<&[u8]> {
     }
 }
 
+/// Did a successful write actually change its key? Used so no-op writes don't
+/// log to the AOF, replicate, or dirty a WATCHer (Redis signals a key modified
+/// only when it really changed). Conservative by design: when in doubt this
+/// returns `true` — a spurious WATCH abort is harmless, a *missed* one is not,
+/// and dropping a real write from the AOF/replicas would corrupt state. So a
+/// reply pattern is treated as "no change" only where it is unambiguous.
+fn write_modified(cmd: &[u8], reply: &[u8]) -> bool {
+    let zero = reply.starts_with(b":0\r\n"); // integer 0
+    let nil = reply == b"$-1\r\n"; // null bulk
+    match cmd {
+        // "count of elements changed" commands: 0 means nothing changed.
+        b"DEL" | b"SREM" | b"HDEL" | b"ZREM" | b"SADD" | b"HSETNX" | b"LPUSHX" | b"RPUSHX"
+        | b"PERSIST" | b"EXPIRE" | b"PEXPIRE" | b"EXPIREAT" | b"PEXPIREAT" => !zero,
+        // ZADD: 0 added/changed, or nil from an aborted INCR (NX/XX/GT/LT).
+        b"ZADD" => !(zero || nil),
+        // Conditional write / delete: nil means it didn't happen.
+        b"SET" | b"GETDEL" => !nil,
+        _ => true,
+    }
+}
+
 fn run_hub(rx: mpsc::Receiver<Msg>, tx: mpsc::Sender<Msg>) {
     let mut hub = Hub::new(tx);
     loop {
@@ -670,6 +743,7 @@ fn run_hub(rx: mpsc::Receiver<Msg>, tx: mpsc::Sender<Msg>) {
                     a.maybe_fsync();
                 }
                 hub.db.active_expire();
+                hub.dirty_expired_watchers();
                 hub.expire_blocked();
             }
             Err(mpsc::RecvTimeoutError::Disconnected) => break,
@@ -859,4 +933,37 @@ fn handle_conn(conn: TcpStream, id: u64, tx: mpsc::Sender<Msg>) -> io::Result<()
     let _ = writer.join();
     println!("client disconnected: {peer}");
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn min_arity_knows_commands_and_minimums() {
+        assert_eq!(commands::min_arity(b"GET"), Some(2));
+        assert_eq!(commands::min_arity(b"SET"), Some(3));
+        assert_eq!(commands::min_arity(b"XADD"), Some(5));
+        assert_eq!(commands::min_arity(b"PING"), Some(1));
+        assert_eq!(commands::min_arity(b"NOTACOMMAND"), None);
+    }
+
+    #[test]
+    fn write_modified_detects_noops() {
+        // No-op replies -> not a modification.
+        assert!(!write_modified(b"DEL", b":0\r\n"));
+        assert!(!write_modified(b"SADD", b":0\r\n"));
+        assert!(!write_modified(b"PERSIST", b":0\r\n"));
+        assert!(!write_modified(b"ZADD", b":0\r\n"));
+        assert!(!write_modified(b"ZADD", b"$-1\r\n")); // aborted INCR
+        assert!(!write_modified(b"SET", b"$-1\r\n")); // NX/XX failed
+        assert!(!write_modified(b"GETDEL", b"$-1\r\n"));
+        // Real modifications.
+        assert!(write_modified(b"DEL", b":1\r\n"));
+        assert!(write_modified(b"SADD", b":2\r\n"));
+        assert!(write_modified(b"SET", b"+OK\r\n"));
+        assert!(write_modified(b"INCR", b":0\r\n")); // INCR result of 0 IS a change
+        assert!(write_modified(b"APPEND", b":0\r\n")); // created empty key
+        assert!(write_modified(b"HSET", b":0\r\n")); // overwrote existing field
+    }
 }

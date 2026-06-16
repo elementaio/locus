@@ -6,12 +6,25 @@ All notable changes to Locus are documented here. The format is based on
 
 ## [Unreleased]
 
+### Fixed (transactions)
+- **`WATCH` now aborts `EXEC` when a watched key expires** (passive or active reaper), not only on an
+  explicit write — matching Redis optimistic-concurrency semantics.
+- **`MULTI` validates commands at queue time**: an unknown command or one with too few arguments now
+  flags the transaction so `EXEC` returns `EXECABORT` instead of running a half-valid batch.
+- **No-op writes no longer abort `WATCH`** (and are no longer logged to the AOF or replicated): e.g.
+  `DEL` of a missing key or `SADD` of an existing member no longer spuriously dirties a transaction.
+
 ### Fixed
 - **TTL integer overflow** in `EXPIRE`/`PEXPIRE`/`EXPIREAT`/`PEXPIREAT` and `SET … EX/PX/EXAT/PXAT`:
   very large TTLs now error cleanly instead of panicking (debug) or wrapping to a past deadline and
   silently deleting the key (release).
 - **`ZADD GT`/`LT`** now gate score updates (and `INCR`) correctly instead of being silently ignored;
   incompatible flag combinations (`GT`+`LT`, `NX`+`GT`/`LT`) are rejected.
+
+### Testing
+- Added an end-to-end integration harness (`tests/integration.rs`) that spawns the real server and
+  drives it over TCP: pipelining, MULTI/EXEC, EXECABORT, WATCH (change + expiry), no-op-WATCH,
+  pub/sub, blocking `XREAD`, and a replication round-trip.
 
 ### Added
 - **`RESET`** command — aborts `MULTI`, releases `WATCH`es, exits subscribe mode, drops to RESP2.

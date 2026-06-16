@@ -160,6 +160,39 @@ pub fn execute(tokens: &[Vec<u8>], db: &mut Db) -> Vec<u8> {
     }
 }
 
+/// Minimum argument count (including the command name) for each known command,
+/// or `None` if the command is unknown. Used for MULTI queue-time validation:
+/// an unknown command or one with too few arguments aborts the transaction
+/// (EXECABORT). Only the *minimum* is enforced — an over-long command still
+/// errors at execution time — so a valid command is never rejected at queue time.
+pub fn min_arity(cmd: &[u8]) -> Option<usize> {
+    Some(match cmd {
+        // arity 1: bare commands and those with all-optional args
+        b"PING" | b"QUIT" | b"COMMAND" | b"CONFIG" | b"SAVE" | b"BGSAVE" | b"BGREWRITEAOF"
+        | b"MULTI" | b"EXEC" | b"DISCARD" | b"UNWATCH" | b"RESET" | b"INFO" | b"HELLO"
+        | b"REPLCONF" | b"PSYNC" | b"SYNC" | b"UNSUBSCRIBE" | b"PUNSUBSCRIBE" => 1,
+        // arity 2: command + key (or one required arg)
+        b"ECHO" | b"TYPE" | b"TTL" | b"PTTL" | b"PERSIST" | b"GET" | b"GETDEL" | b"INCR"
+        | b"DECR" | b"STRLEN" | b"LLEN" | b"HGETALL" | b"HLEN" | b"HKEYS" | b"HVALS"
+        | b"SMEMBERS" | b"SCARD" | b"ZCARD" | b"XLEN" | b"LPOP" | b"RPOP" | b"SPOP"
+        | b"ZPOPMIN" | b"ZPOPMAX" | b"DEL" | b"EXISTS" | b"SINTER" | b"SUNION" | b"SDIFF"
+        | b"WATCH" | b"SUBSCRIBE" | b"PSUBSCRIBE" | b"PUBSUB" => 2,
+        // arity 3: command + key + one arg
+        b"INCRBY" | b"DECRBY" | b"APPEND" | b"LINDEX" | b"HGET" | b"HEXISTS" | b"HMGET"
+        | b"HDEL" | b"SADD" | b"SREM" | b"SISMEMBER" | b"SMISMEMBER" | b"ZSCORE" | b"ZMSCORE"
+        | b"ZREM" | b"ZRANK" | b"ZREVRANK" | b"PUBLISH" | b"EXPIRE" | b"PEXPIRE" | b"EXPIREAT"
+        | b"PEXPIREAT" | b"LPUSH" | b"RPUSH" | b"LPUSHX" | b"RPUSHX" | b"SET" | b"REPLICAOF"
+        | b"SLAVEOF" => 3,
+        // arity 4: command + key + two args
+        b"LRANGE" | b"LSET" | b"HSET" | b"HSETNX" | b"HINCRBY" | b"ZADD" | b"ZINCRBY"
+        | b"ZRANGE" | b"ZREVRANGE" | b"ZRANGEBYSCORE" | b"ZREVRANGEBYSCORE" | b"ZCOUNT"
+        | b"XRANGE" | b"XREVRANGE" | b"XREAD" => 4,
+        // arity 5: XADD key id field value
+        b"XADD" => 5,
+        _ => return None,
+    })
+}
+
 // === generic ================================================================
 
 fn del_cmd(db: &mut Db, tokens: &[Vec<u8>]) -> Vec<u8> {

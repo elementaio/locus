@@ -76,6 +76,10 @@ impl Value {
 pub struct Db {
     data: HashMap<Vec<u8>, Value>,
     expires: HashMap<Vec<u8>, u64>,
+    /// Keys removed by expiry (passive or active) since the last drain. The hub
+    /// drains this to dirty any WATCHers of an expired key (a watched key that
+    /// expires must abort EXEC, just like an explicit modification).
+    expired: Vec<Vec<u8>>,
 }
 
 impl Db {
@@ -83,6 +87,7 @@ impl Db {
         Db {
             data: HashMap::new(),
             expires: HashMap::new(),
+            expired: Vec::new(),
         }
     }
 
@@ -92,7 +97,13 @@ impl Db {
         {
             self.data.remove(key);
             self.expires.remove(key);
+            self.expired.push(key.to_vec());
         }
+    }
+
+    /// Drain the keys removed by expiry since the last call.
+    pub fn take_expired(&mut self) -> Vec<Vec<u8>> {
+        std::mem::take(&mut self.expired)
     }
 
     pub fn get(&mut self, key: &[u8]) -> Option<&Value> {
@@ -171,6 +182,7 @@ impl Db {
                 if self.expires.get(k).is_some_and(|&t| t <= now) {
                     self.data.remove(k);
                     self.expires.remove(k);
+                    self.expired.push(k.clone());
                     expired += 1;
                 }
             }
