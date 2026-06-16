@@ -100,6 +100,8 @@ struct Hub {
     blocked: Vec<BlockedReader>,
     // negotiated RESP version per client (2 or 3)
     protos: HashMap<u64, u8>,
+    // soft memory cap (bytes); None = unlimited
+    maxmemory: Option<usize>,
 }
 
 /// A client parked on a blocking XREAD.
@@ -157,6 +159,10 @@ impl Hub {
             watched_keys: HashMap::new(),
             blocked: Vec::new(),
             protos: HashMap::new(),
+            maxmemory: std::env::var("LOCUS_MAXMEMORY")
+                .ok()
+                .and_then(|s| parse_mem(&s))
+                .filter(|&m| m > 0),
         }
     }
 
@@ -390,7 +396,9 @@ impl Hub {
                     "master"
                 };
                 let mut s = format!(
-                    "# Replication\r\nrole:{role}\r\nconnected_slaves:{}\r\n",
+                    "# Memory\r\nused_memory:{}\r\nmaxmemory:{}\r\n# Replication\r\nrole:{role}\r\nconnected_slaves:{}\r\n",
+                    self.db.mem_used(),
+                    self.maxmemory.unwrap_or(0),
                     self.replicas.len()
                 );
                 if let Some((h, p)) = &self.master {
@@ -537,30 +545,43 @@ impl Hub {
     /// to replicas, and mark any watching transactions dirty. Returns the reply.
     fn exec_one(&mut self, id: u64, tokens: Vec<Vec<u8>>) -> Vec<u8> {
         let cmd = tokens[0].to_ascii_uppercase();
-        if self.master.is_some() && id != MASTER_ID && aof::is_write(&cmd) {
+        let is_write = aof::is_write(&cmd);
+        if self.master.is_some() && id != MASTER_ID && is_write {
             return resp::error("READONLY You can't write against a read only replica.");
+        }
+        // maxmemory: on a master/standalone, free memory before a write; if the
+        // cap still can't be met, reject the write instead of growing unbounded.
+        // (Replicas don't evict on their own — the master streams the DELs.)
+        if is_write && self.master.is_none() && !self.evict_if_needed() {
+            return resp::error("OOM command not allowed when used memory > 'maxmemory'.");
         }
         let reply = execute(&tokens, &mut self.db);
         let errored = reply.first() == Some(&b'-');
-        // A write only counts if it actually changed the dataset. A no-op write
-        // (e.g. DEL of a missing key, SADD of an existing member) is not logged,
-        // not replicated, and does not dirty a WATCHer.
-        if !errored && aof::is_write(&cmd) && write_modified(&cmd, &reply) {
-            // WATCH: a real modification of a watched key dirties its transaction.
+        if !errored && is_write {
+            // Keep the memory estimate in sync with whatever the command changed
+            // (including in-place collection growth like LPUSH/SADD).
             for key in write_keys(&tokens) {
-                self.dirty_watchers(key);
+                self.db.resync_size(key);
             }
-            let entries = aof::entries_for(&tokens, &reply, &mut self.db);
-            if let Some(a) = self.aof.as_mut() {
-                let _ = a.append(&entries);
-            }
-            // Propagate the deterministic form to every replica.
-            if !self.replicas.is_empty() {
-                for e in &entries {
-                    let bytes = resp::command(e);
-                    for rid in self.replicas.iter() {
-                        if let Some(out) = self.clients.get(rid) {
-                            let _ = out.send(bytes.clone());
+            // A write only counts as a modification if it actually changed the
+            // dataset. A no-op write (e.g. DEL of a missing key) is not logged,
+            // not replicated, and does not dirty a WATCHer.
+            if write_modified(&cmd, &reply) {
+                for key in write_keys(&tokens) {
+                    self.dirty_watchers(key);
+                }
+                let entries = aof::entries_for(&tokens, &reply, &mut self.db);
+                if let Some(a) = self.aof.as_mut() {
+                    let _ = a.append(&entries);
+                }
+                // Propagate the deterministic form to every replica.
+                if !self.replicas.is_empty() {
+                    for e in &entries {
+                        let bytes = resp::command(e);
+                        for rid in self.replicas.iter() {
+                            if let Some(out) = self.clients.get(rid) {
+                                let _ = out.send(bytes.clone());
+                            }
                         }
                     }
                 }
@@ -591,6 +612,44 @@ impl Hub {
     fn dirty_expired_watchers(&mut self) {
         for key in self.db.take_expired() {
             self.dirty_watchers(&key);
+        }
+    }
+
+    /// Enforce `maxmemory` by evicting arbitrary keys until under the cap.
+    /// Returns true if we are within budget (proceed), false if the cap cannot
+    /// be met (the caller should reject the write with OOM). Each eviction is
+    /// streamed to replicas/AOF as a DEL and dirties any WATCHers — just like a
+    /// client-issued delete, so replicas and snapshots stay consistent.
+    fn evict_if_needed(&mut self) -> bool {
+        let max = match self.maxmemory {
+            Some(m) => m,
+            None => return true,
+        };
+        while self.db.mem_used() > max {
+            match self.db.evict_one() {
+                Some(key) => {
+                    self.dirty_watchers(&key);
+                    self.propagate(&[b"DEL".to_vec(), key]);
+                }
+                None => break, // keyspace empty — nothing left to evict
+            }
+        }
+        self.db.mem_used() <= max
+    }
+
+    /// Append one command to the AOF and stream it to every replica.
+    fn propagate(&mut self, tokens: &[Vec<u8>]) {
+        let batch = vec![tokens.to_vec()];
+        if let Some(a) = self.aof.as_mut() {
+            let _ = a.append(&batch);
+        }
+        if !self.replicas.is_empty() {
+            let bytes = resp::command(tokens);
+            for rid in self.replicas.iter() {
+                if let Some(out) = self.clients.get(rid) {
+                    let _ = out.send(bytes.clone());
+                }
+            }
         }
     }
 
@@ -712,6 +771,27 @@ fn write_modified(cmd: &[u8], reply: &[u8]) -> bool {
         b"SET" | b"GETDEL" => !nil,
         _ => true,
     }
+}
+
+/// Parse a `LOCUS_MAXMEMORY` value into bytes. Accepts a plain integer or a
+/// `kb`/`mb`/`gb` suffix (decimal, case-insensitive): `0` / "" disable the cap.
+fn parse_mem(s: &str) -> Option<usize> {
+    let s = s.trim().to_ascii_lowercase();
+    if s.is_empty() {
+        return None;
+    }
+    let (num, mult) = if let Some(n) = s.strip_suffix("gb") {
+        (n, 1024 * 1024 * 1024)
+    } else if let Some(n) = s.strip_suffix("mb") {
+        (n, 1024 * 1024)
+    } else if let Some(n) = s.strip_suffix("kb") {
+        (n, 1024)
+    } else if let Some(n) = s.strip_suffix('b') {
+        (n, 1)
+    } else {
+        (s.as_str(), 1)
+    };
+    num.trim().parse::<usize>().ok().map(|n| n * mult)
 }
 
 fn run_hub(rx: mpsc::Receiver<Msg>, tx: mpsc::Sender<Msg>) {
@@ -965,5 +1045,17 @@ mod tests {
         assert!(write_modified(b"INCR", b":0\r\n")); // INCR result of 0 IS a change
         assert!(write_modified(b"APPEND", b":0\r\n")); // created empty key
         assert!(write_modified(b"HSET", b":0\r\n")); // overwrote existing field
+    }
+
+    #[test]
+    fn parse_mem_handles_suffixes() {
+        assert_eq!(parse_mem("0"), Some(0));
+        assert_eq!(parse_mem("1024"), Some(1024));
+        assert_eq!(parse_mem("1kb"), Some(1024));
+        assert_eq!(parse_mem("2MB"), Some(2 * 1024 * 1024));
+        assert_eq!(parse_mem("1gb"), Some(1024 * 1024 * 1024));
+        assert_eq!(parse_mem("512b"), Some(512));
+        assert_eq!(parse_mem(""), None);
+        assert_eq!(parse_mem("notanumber"), None);
     }
 }

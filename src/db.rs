@@ -80,6 +80,12 @@ pub struct Db {
     /// drains this to dirty any WATCHers of an expired key (a watched key that
     /// expires must abort EXEC, just like an explicit modification).
     expired: Vec<Vec<u8>>,
+    /// Approximate memory accounting for `maxmemory`. `mem_used` is the running
+    /// total; `sizes` is the last-known estimate per key so removals/updates can
+    /// be applied as deltas. Estimates are deliberately coarse (see
+    /// `estimate_size`) — enough to bound growth, not byte-exact like Redis.
+    mem_used: usize,
+    sizes: HashMap<Vec<u8>, usize>,
 }
 
 impl Db {
@@ -88,6 +94,8 @@ impl Db {
             data: HashMap::new(),
             expires: HashMap::new(),
             expired: Vec::new(),
+            mem_used: 0,
+            sizes: HashMap::new(),
         }
     }
 
@@ -97,6 +105,7 @@ impl Db {
         {
             self.data.remove(key);
             self.expires.remove(key);
+            self.forget_size(key);
             self.expired.push(key.to_vec());
         }
     }
@@ -104,6 +113,50 @@ impl Db {
     /// Drain the keys removed by expiry since the last call.
     pub fn take_expired(&mut self) -> Vec<Vec<u8>> {
         std::mem::take(&mut self.expired)
+    }
+
+    // --- memory accounting (for maxmemory / eviction) ---
+
+    pub fn mem_used(&self) -> usize {
+        self.mem_used
+    }
+
+    /// Recompute one key's estimated size and fold the delta into the total.
+    /// The hub calls this after every write so in-place collection growth
+    /// (LPUSH, SADD, …) is accounted for, not just whole-value inserts.
+    pub fn resync_size(&mut self, key: &[u8]) {
+        let new = self
+            .data
+            .get(key)
+            .map(|v| estimate_size(key.len(), v))
+            .unwrap_or(0);
+        let old = self.sizes.get(key).copied().unwrap_or(0);
+        if new == old {
+            return;
+        }
+        self.mem_used = self.mem_used.saturating_sub(old).saturating_add(new);
+        if new == 0 {
+            self.sizes.remove(key);
+        } else {
+            self.sizes.insert(key.to_vec(), new);
+        }
+    }
+
+    fn forget_size(&mut self, key: &[u8]) {
+        if let Some(sz) = self.sizes.remove(key) {
+            self.mem_used = self.mem_used.saturating_sub(sz);
+        }
+    }
+
+    /// Evict one arbitrary key (HashMap order — not true LRU/random; that's a
+    /// later refinement). Returns the evicted key, or None if the keyspace is
+    /// empty. Used by the hub's `maxmemory` eviction loop.
+    pub fn evict_one(&mut self) -> Option<Vec<u8>> {
+        let key = self.data.keys().next().cloned()?;
+        self.data.remove(&key);
+        self.expires.remove(&key);
+        self.forget_size(&key);
+        Some(key)
     }
 
     pub fn get(&mut self, key: &[u8]) -> Option<&Value> {
@@ -123,6 +176,7 @@ impl Db {
     pub fn remove(&mut self, key: &[u8]) -> Option<Value> {
         self.check_expiry(key);
         self.expires.remove(key);
+        self.forget_size(key);
         self.data.remove(key)
     }
 
@@ -151,6 +205,7 @@ impl Db {
         if empty {
             self.data.remove(key);
             self.expires.remove(key);
+            self.forget_size(key);
         }
     }
 
@@ -182,6 +237,7 @@ impl Db {
                 if self.expires.get(k).is_some_and(|&t| t <= now) {
                     self.data.remove(k);
                     self.expires.remove(k);
+                    self.forget_size(k);
                     self.expired.push(k.clone());
                     expired += 1;
                 }
@@ -206,6 +262,93 @@ impl Db {
         if let Some(deadline) = expire {
             self.expires.insert(key.clone(), deadline);
         }
-        self.data.insert(key, value);
+        self.data.insert(key.clone(), value);
+        self.resync_size(&key); // loaded data counts toward used memory
+    }
+}
+
+/// A coarse estimate of a key+value's memory footprint, in bytes. Not byte-exact
+/// (no allocator introspection in zero-deps `std`); a fixed per-key and
+/// per-element overhead approximates allocation bookkeeping well enough to bound
+/// growth under `maxmemory`.
+fn estimate_size(key_len: usize, v: &Value) -> usize {
+    const KEY_OVH: usize = 64; // HashMap entry + key/value headers
+    const ELEM_OVH: usize = 16; // per collection element
+    let val = match v {
+        Value::Str(s) => s.len(),
+        Value::List(l) => l.iter().map(|e| e.len() + ELEM_OVH).sum(),
+        Value::Hash(h) => h.iter().map(|(k, vv)| k.len() + vv.len() + ELEM_OVH).sum(),
+        Value::Set(s) => s.iter().map(|e| e.len() + ELEM_OVH).sum(),
+        Value::ZSet(z) => z.keys().map(|m| m.len() + 8 + ELEM_OVH).sum(),
+        Value::Stream(st) => st
+            .entries
+            .iter()
+            .map(|(_, fields)| {
+                fields
+                    .iter()
+                    .map(|(f, vv)| f.len() + vv.len() + ELEM_OVH)
+                    .sum::<usize>()
+                    + 24
+            })
+            .sum(),
+    };
+    KEY_OVH + key_len + val
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn memory_accounting_tracks_inserts_and_removals() {
+        let mut db = Db::new();
+        assert_eq!(db.mem_used(), 0);
+
+        db.insert(b"k".to_vec(), Value::Str(b"hello".to_vec()));
+        db.resync_size(b"k"); // the hub does this after each write
+        let after_insert = db.mem_used();
+        assert!(after_insert > 0);
+
+        // Growing the value increases the estimate.
+        db.insert(b"k".to_vec(), Value::Str(vec![b'x'; 1000]));
+        db.resync_size(b"k");
+        assert!(db.mem_used() > after_insert);
+
+        // Removal returns to zero.
+        db.remove(b"k");
+        assert_eq!(db.mem_used(), 0);
+    }
+
+    #[test]
+    fn expiry_and_eviction_free_memory() {
+        let mut db = Db::new();
+        for i in 0..50 {
+            let k = format!("k{i}").into_bytes();
+            db.insert(k.clone(), Value::Str(vec![b'v'; 100]));
+            db.resync_size(&k);
+        }
+        let full = db.mem_used();
+        assert!(full > 0);
+
+        // Evicting arbitrary keys reduces the running total.
+        assert!(db.evict_one().is_some());
+        assert!(db.mem_used() < full);
+
+        // Drain everything via eviction -> back to zero, then None.
+        while db.evict_one().is_some() {}
+        assert_eq!(db.mem_used(), 0);
+        assert!(db.evict_one().is_none());
+    }
+
+    #[test]
+    fn active_expire_decrements_memory() {
+        let mut db = Db::new();
+        let k = b"k".to_vec();
+        db.insert(k.clone(), Value::Str(vec![b'v'; 100]));
+        db.resync_size(&k);
+        db.set_expire(&k, now_ms().saturating_sub(1)); // already expired
+        db.active_expire();
+        assert_eq!(db.mem_used(), 0);
+        assert_eq!(db.take_expired(), vec![k]);
     }
 }

@@ -79,6 +79,7 @@ Locus is configured entirely through environment variables (minimal config by de
 | `LOCUS_PORT` | `6379` | TCP port to listen on |
 | `LOCUS_RDB` | `locus.rdb` | RDB snapshot file path |
 | `LOCUS_AOF` | _(off)_ | Set to a path (or `1`) to enable append-only persistence |
+| `LOCUS_MAXMEMORY` | _(unlimited)_ | Soft memory cap; accepts bytes or `kb`/`mb`/`gb` (e.g. `256mb`). Over the cap, a master evicts keys; writes get `OOM` only if the cap still can't be met |
 
 ```console
 LOCUS_AOF=1 cargo run --release          # durable, append-only mode

@@ -144,6 +144,17 @@ impl Conn {
     }
 }
 
+/// Pull a numeric field out of an INFO reply (e.g. "used_memory").
+fn info_field(c: &mut Conn, field: &str) -> u64 {
+    let info = c.cmd(&["INFO"]);
+    info.split("\r\n")
+        .find_map(|l| l.strip_prefix(field)?.strip_prefix(':'))
+        .unwrap_or_else(|| panic!("field {field} not found in INFO:\n{info}"))
+        .trim()
+        .parse()
+        .unwrap()
+}
+
 // === pipelining / basics ====================================================
 
 #[test]
@@ -280,6 +291,29 @@ fn blocking_xread_wakes_on_xadd() {
         reply.contains("v1"),
         "blocked XREAD should receive the new entry, got {reply}"
     );
+}
+
+// === maxmemory / eviction ===================================================
+
+#[test]
+fn maxmemory_evicts_to_stay_bounded() {
+    let cap_bytes: u64 = 50 * 1024;
+    let s = Server::start_inner(&[("LOCUS_MAXMEMORY", "50kb")]);
+    let mut c = s.connect();
+    assert_eq!(info_field(&mut c, "maxmemory"), cap_bytes);
+
+    // Write far more than the cap; eviction must make room so writes keep
+    // succeeding and used_memory stays near the limit (not 500×500 bytes).
+    let value = "x".repeat(500);
+    for i in 0..500 {
+        assert_eq!(c.cmd(&["SET", &format!("key:{i}"), &value]), "OK");
+    }
+    let used = info_field(&mut c, "used_memory");
+    assert!(
+        used <= cap_bytes + 4096,
+        "used_memory {used} should stay near the {cap_bytes}-byte cap"
+    );
+    assert_eq!(c.cmd(&["PING"]), "PONG"); // still responsive
 }
 
 // === replication ============================================================

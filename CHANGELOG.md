@@ -6,6 +6,13 @@ All notable changes to Locus are documented here. The format is based on
 
 ## [Unreleased]
 
+### Added
+- **`maxmemory` + eviction** (`LOCUS_MAXMEMORY`, accepts `kb`/`mb`/`gb` suffixes). Approximate memory
+  accounting bounds dataset growth; when over the cap a master evicts arbitrary keys (streamed to
+  replicas/AOF as `DEL`) and rejects a write with `OOM` only if the cap still can't be met. Replicas
+  don't self-evict — the master drives deletions. `INFO` now reports a `# Memory` section
+  (`used_memory`, `maxmemory`).
+
 ### Fixed (transactions)
 - **`WATCH` now aborts `EXEC` when a watched key expires** (passive or active reaper), not only on an
   explicit write — matching Redis optimistic-concurrency semantics.
