@@ -70,9 +70,12 @@ Compact, mergeable summaries. First up: a Bloom filter for dedup / set membershi
 | `TOPKLIST key` | current leaders, highest count first |
 | `TOPKCOUNT key item [item ...]` | estimated count per item |
 | `TOPKLOAD key bytes` | restore (AOF rewrite / replication) |
+| `TDADD key value [value ...]` | t-digest: add numeric samples |
+| `TDQUANTILE key q [q ...]` | estimated value at each quantile `q` (0..1); exact at min/max |
+| `TDLOAD key bytes` | restore (AOF rewrite / replication) |
 
-Auto-sized on first add (Bloom ≈10k @ 1% FPR; CMS 2000×5; TopK k=10 default); persist via RDB/AOF.
-(t-digest — live percentiles — is the next sketch.)
+Auto-sized on first add (Bloom ≈10k @ 1% FPR; CMS 2000×5; TopK k=10; t-digest compression 100);
+persist via RDB/AOF. The full a-la-carte sketch family is in place.
 
 ## Conditional writes (CAS family)
 

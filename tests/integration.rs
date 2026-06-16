@@ -329,6 +329,29 @@ fn bloom_filter_dedup() {
 }
 
 #[test]
+fn tdigest_percentiles() {
+    let s = Server::start();
+    let mut c = s.connect();
+    // add 1..=1000 in batches
+    for start in (1..=1000).step_by(50) {
+        let mut args = vec!["TDADD".to_string(), "lat".to_string()];
+        for v in start..start + 50 {
+            args.push(v.to_string());
+        }
+        let a: Vec<&str> = args.iter().map(|s| s.as_str()).collect();
+        assert_eq!(c.cmd(&a), "OK");
+    }
+    assert_eq!(c.cmd(&["TYPE", "lat"]), "tdigest");
+    // exact extremes
+    assert_eq!(c.cmd(&["TDQUANTILE", "lat", "0"]), "[1]");
+    assert_eq!(c.cmd(&["TDQUANTILE", "lat", "1"]), "[1000]");
+    // p99 within tolerance
+    let r = c.cmd(&["TDQUANTILE", "lat", "0.99"]); // "[<num>]"
+    let num: f64 = r.trim_matches(|ch| ch == '[' || ch == ']').parse().unwrap();
+    assert!((num - 990.0).abs() < 20.0, "p99={num}");
+}
+
+#[test]
 fn topk_heavy_hitters() {
     let s = Server::start();
     let mut c = s.connect();

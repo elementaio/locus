@@ -65,6 +65,7 @@ fn write_value<W: Write>(w: &mut W, key: &[u8], v: &Value) -> io::Result<()> {
         Value::Bloom(_) => 7,
         Value::Cms(_) => 8,
         Value::TopK(_) => 9,
+        Value::TDigest(_) => 10,
     };
     w.write_all(&[tag])?;
     write_bytes(w, key)?;
@@ -125,6 +126,7 @@ fn write_value<W: Write>(w: &mut W, key: &[u8], v: &Value) -> io::Result<()> {
             write_bytes(w, &c.to_bytes())?;
         }
         Value::TopK(t) => write_bytes(w, &t.to_bytes())?, // self-describing blob
+        Value::TDigest(t) => write_bytes(w, &t.to_bytes())?,
     }
     Ok(())
 }
@@ -279,6 +281,12 @@ fn read_value<R: Read>(r: &mut R, tag: u8) -> io::Result<Value> {
                 .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "bad TopK"))?;
             Value::TopK(tk)
         }
+        10 => {
+            let bytes = read_bytes(r)?;
+            let td = crate::sketch::TDigest::from_bytes(&bytes)
+                .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "bad TDigest"))?;
+            Value::TDigest(td)
+        }
         _ => {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidData,
@@ -340,6 +348,7 @@ mod tests {
         run(&mut db, &[b"CMSINCRBY", b"cm", b"x", b"7"]);
         run(&mut db, &[b"TOPKRESERVE", b"tk", b"3"]);
         run(&mut db, &[b"TOPKADD", b"tk", b"a", b"a", b"b"]);
+        run(&mut db, &[b"TDADD", b"td", b"10", b"20", b"30"]);
 
         save(&db, path).unwrap();
         let mut loaded = load(path).unwrap();
@@ -388,6 +397,11 @@ mod tests {
         assert_eq!(
             execute(&to(&[b"TOPKLIST", b"tk"]), &mut loaded),
             b"*2\r\n$1\r\na\r\n$1\r\nb\r\n".to_vec()
+        );
+        // t-digest survived (min is exact)
+        assert_eq!(
+            execute(&to(&[b"TDQUANTILE", b"td", b"0"]), &mut loaded),
+            b"*1\r\n$2\r\n10\r\n".to_vec()
         );
         let _ = fs::remove_file(path);
     }

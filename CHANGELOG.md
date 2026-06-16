@@ -13,7 +13,9 @@ All notable changes to Locus are documented here. The format is based on
 - **Count-Min sketch** `CMSINCRBY` / `CMSQUERY` (+ internal `CMSLOAD`) — frequency estimation
   ("trending now"); over-estimates, never under. Auto-sized (2000×5), RDB/AOF persistent.
 - **Top-K sketch** `TOPKRESERVE` / `TOPKADD` / `TOPKLIST` / `TOPKCOUNT` (+ internal `TOPKLOAD`) —
-  heavy hitters on top of Count-Min + a k-slot leaderboard; RDB/AOF persistent (opaque blob). (t-digest next.)
+  heavy hitters on top of Count-Min + a k-slot leaderboard; RDB/AOF persistent (opaque blob).
+- **t-digest** `TDADD` / `TDQUANTILE` (+ internal `TDLOAD`) — streaming quantiles / percentiles
+  (live p99), accurate at the tails via the `q(1-q)` scale; exact min/max. Completes the sketch family.
 
 ### Added (conditional writes — the CAS primitive)
 - **CAS family** `CAS key expected new`, `CADEL key expected`, `SETMAX key n` (monotonic cursor),

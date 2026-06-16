@@ -155,6 +155,9 @@ pub fn execute(tokens: &[Vec<u8>], db: &mut Db) -> Vec<u8> {
         b"TOPKLIST" => topklist_cmd(db, tokens),
         b"TOPKCOUNT" => topkcount_cmd(db, tokens),
         b"TOPKLOAD" => topkload_cmd(db, tokens),
+        b"TDADD" => tdadd_cmd(db, tokens),
+        b"TDQUANTILE" => tdquantile_cmd(db, tokens),
+        b"TDLOAD" => tdload_cmd(db, tokens),
         // bitmaps
         b"SETBIT" => setbit_cmd(db, tokens),
         b"GETBIT" => getbit_cmd(db, tokens),
@@ -300,13 +303,16 @@ pub fn command_meta(cmd: &[u8]) -> Option<CmdMeta> {
         b"LINDEX" | b"HGET" | b"HEXISTS" | b"HMGET" | b"SISMEMBER" | b"SMISMEMBER" | b"ZSCORE"
         | b"ZMSCORE" | b"ZRANK" | b"ZREVRANK" | b"PUBLISH" | b"REPLICAOF" | b"SLAVEOF"
         | b"LPOS" | b"SINTERCARD" | b"GETBIT" | b"BITPOS" | b"CDCGROUP" | b"CDCREADGROUP"
-        | b"CDCACK" | b"GEODIST" | b"BFEXISTS" | b"CMSQUERY" | b"TOPKCOUNT" => (3, false),
+        | b"CDCACK" | b"GEODIST" | b"BFEXISTS" | b"CMSQUERY" | b"TOPKCOUNT" | b"TDQUANTILE" => {
+            (3, false)
+        }
         // arity 3 writes
         b"INCRBY" | b"DECRBY" | b"APPEND" | b"HDEL" | b"SADD" | b"SREM" | b"ZREM" | b"EXPIRE"
         | b"PEXPIRE" | b"EXPIREAT" | b"PEXPIREAT" | b"LPUSH" | b"RPUSH" | b"LPUSHX" | b"RPUSHX"
         | b"SET" | b"SETNX" | b"GETSET" | b"MSET" | b"MSETNX" | b"INCRBYFLOAT" | b"RENAME"
         | b"RENAMENX" | b"RPOPLPUSH" | b"SINTERSTORE" | b"SUNIONSTORE" | b"SDIFFSTORE"
-        | b"CADEL" | b"SETMAX" | b"BFADD" | b"TOPKRESERVE" | b"TOPKADD" | b"TOPKLOAD" => (3, true),
+        | b"CADEL" | b"SETMAX" | b"BFADD" | b"TOPKRESERVE" | b"TOPKADD" | b"TOPKLOAD"
+        | b"TDADD" | b"TDLOAD" => (3, true),
         // arity 4 reads
         b"LRANGE" | b"ZRANGE" | b"ZREVRANGE" | b"ZRANGEBYSCORE" | b"ZREVRANGEBYSCORE"
         | b"ZCOUNT" | b"XRANGE" | b"XREVRANGE" | b"XREAD" | b"GETRANGE" => (4, false),
@@ -1810,6 +1816,76 @@ fn topkload_cmd(db: &mut Db, tokens: &[Vec<u8>]) -> Vec<u8> {
             simple_string("OK")
         }
         None => error("ERR invalid TopK blob"),
+    }
+}
+
+// === sketches: t-digest =====================================================
+
+fn tdadd_cmd(db: &mut Db, tokens: &[Vec<u8>]) -> Vec<u8> {
+    if tokens.len() < 3 {
+        return wrong_args("tdadd");
+    }
+    let mut vals: Vec<f64> = Vec::with_capacity(tokens.len() - 2);
+    for v in &tokens[2..] {
+        match parse_finite_float(v) {
+            Some(x) => vals.push(x),
+            None => return error("ERR TDADD: value is not a valid float"),
+        }
+    }
+    let td = match db.get_or_insert_with(&tokens[1], || {
+        Value::TDigest(crate::sketch::TDigest::default_td())
+    }) {
+        Value::TDigest(t) => t,
+        _ => return wrongtype(),
+    };
+    for x in vals {
+        td.add(x);
+    }
+    simple_string("OK")
+}
+
+fn tdquantile_cmd(db: &mut Db, tokens: &[Vec<u8>]) -> Vec<u8> {
+    if tokens.len() < 3 {
+        return wrong_args("tdquantile");
+    }
+    let mut qs: Vec<f64> = Vec::with_capacity(tokens.len() - 2);
+    for q in &tokens[2..] {
+        match parse_finite_float(q) {
+            Some(x) => qs.push(x),
+            None => return error("ERR TDQUANTILE: quantile is not a valid float"),
+        }
+    }
+    match db.get(&tokens[1]) {
+        None => array(&qs.iter().map(|_| null_bulk()).collect::<Vec<_>>()),
+        Some(Value::TDigest(t)) => {
+            let out: Vec<Vec<u8>> = qs
+                .iter()
+                .map(|&q| {
+                    let v = t.quantile(q);
+                    if v.is_finite() {
+                        bulk_string(&fmt_score(v))
+                    } else {
+                        null_bulk()
+                    }
+                })
+                .collect();
+            array(&out)
+        }
+        Some(_) => wrongtype(),
+    }
+}
+
+/// TDLOAD key blob — restore a t-digest from its opaque blob (AOF / replication).
+fn tdload_cmd(db: &mut Db, tokens: &[Vec<u8>]) -> Vec<u8> {
+    if tokens.len() != 3 {
+        return wrong_args("tdload");
+    }
+    match crate::sketch::TDigest::from_bytes(&tokens[2]) {
+        Some(td) => {
+            db.insert(tokens[1].clone(), Value::TDigest(td));
+            simple_string("OK")
+        }
+        None => error("ERR invalid t-digest blob"),
     }
 }
 
@@ -4010,6 +4086,44 @@ mod tests {
     }
 
     #[test]
+    fn tdigest_commands() {
+        let mut db = Db::new();
+        // add 1..=100 in a few batches
+        for start in (1..=100).step_by(10) {
+            let mut args: Vec<Vec<u8>> = vec![b"TDADD".to_vec(), b"lat".to_vec()];
+            for v in start..start + 10 {
+                args.push(v.to_string().into_bytes());
+            }
+            let t: Vec<&[u8]> = args.iter().map(|a| a.as_slice()).collect();
+            assert_eq!(cmd(&mut db, &t), b"+OK\r\n".to_vec());
+        }
+        assert_eq!(cmd(&mut db, &[b"TYPE", b"lat"]), b"+tdigest\r\n".to_vec());
+        // exact extremes
+        assert_eq!(
+            cmd(&mut db, &[b"TDQUANTILE", b"lat", b"0"]),
+            array(&[bulk_string(b"1")])
+        );
+        assert_eq!(
+            cmd(&mut db, &[b"TDQUANTILE", b"lat", b"1"]),
+            array(&[bulk_string(b"100")])
+        );
+        // median within tolerance — parse the bulk string back
+        let med = cmd(&mut db, &[b"TDQUANTILE", b"lat", b"0.5"]);
+        // reply: *1\r\n$N\r\n<num>\r\n — extract the number
+        let s = String::from_utf8(med).unwrap();
+        let num: f64 = s.rsplit("\r\n").nth(1).unwrap().parse().unwrap();
+        assert!((num - 50.0).abs() < 10.0, "p50={num}");
+        // missing key -> nil per quantile
+        assert_eq!(
+            cmd(&mut db, &[b"TDQUANTILE", b"nope", b"0.5"]),
+            array(&[null_bulk()])
+        );
+        // WRONGTYPE
+        cmd(&mut db, &[b"SET", b"s", b"x"]);
+        assert!(cmd(&mut db, &[b"TDADD", b"s", b"1"]).starts_with(b"-WRONGTYPE"));
+    }
+
+    #[test]
     fn command_table_write_set_is_exact() {
         // The exact set of write commands. A change here is a deliberate decision,
         // not an accident — guards the AOF/replication write-detection.
@@ -4086,6 +4200,8 @@ mod tests {
             b"TOPKRESERVE",
             b"TOPKADD",
             b"TOPKLOAD",
+            b"TDADD",
+            b"TDLOAD",
             b"XADD",
         ];
         for w in writes {
@@ -4113,6 +4229,7 @@ mod tests {
             b"CMSQUERY".as_slice(),
             b"TOPKLIST".as_slice(),
             b"TOPKCOUNT".as_slice(),
+            b"TDQUANTILE".as_slice(),
             b"SRANDMEMBER".as_slice(),
             b"RANDOMKEY".as_slice(),
             b"SMEMBERS".as_slice(),

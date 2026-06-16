@@ -312,6 +312,7 @@ fn reconstruct(key: &[u8], value: &Value) -> Vec<Vec<Vec<u8>>> {
             c.to_bytes(),
         ]],
         Value::TopK(t) => vec![vec![b"TOPKLOAD".to_vec(), k, t.to_bytes()]],
+        Value::TDigest(t) => vec![vec![b"TDLOAD".to_vec(), k, t.to_bytes()]],
     }
 }
 

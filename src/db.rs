@@ -36,6 +36,8 @@ pub enum Value {
     Cms(crate::sketch::Cms),
     /// A Top-K heavy-hitters sketch.
     TopK(crate::sketch::TopK),
+    /// A t-digest (streaming quantiles / percentiles).
+    TDigest(crate::sketch::TDigest),
 }
 
 /// A stream entry id: (milliseconds, sequence).
@@ -72,6 +74,7 @@ impl Value {
             Value::Bloom(_) => "bloom",
             Value::Cms(_) => "cms",
             Value::TopK(_) => "topk",
+            Value::TDigest(_) => "tdigest",
         }
     }
 
@@ -82,9 +85,12 @@ impl Value {
             Value::Set(s) => s.is_empty(),
             Value::ZSet(z) => z.is_empty(),
             Value::Stream(s) => s.entries.is_empty(),
-            Value::Str(_) | Value::Geo(..) | Value::Bloom(_) | Value::Cms(_) | Value::TopK(_) => {
-                false
-            }
+            Value::Str(_)
+            | Value::Geo(..)
+            | Value::Bloom(_)
+            | Value::Cms(_)
+            | Value::TopK(_)
+            | Value::TDigest(_) => false,
         }
     }
 }
@@ -366,6 +372,7 @@ fn estimate_size(key_len: usize, v: &Value) -> usize {
         Value::TopK(t) => {
             t.cms.counters.len() * 4 + t.top.iter().map(|(it, _)| it.len() + 16).sum::<usize>()
         }
+        Value::TDigest(t) => t.centroids.len() * 16 + 32,
     };
     KEY_OVH + key_len + val
 }
