@@ -95,6 +95,21 @@ redis-cli -p 6379 zrange board 0 -1 withscores
 cargo test
 ```
 
+### Install (Docker / prebuilt binary)
+
+No Rust toolchain required to *run* Locus:
+
+```console
+# Docker — pull and run (RESP on 6379)
+docker run -p 6379:6379 ghcr.io/intenttext/locus:latest
+# persist across restarts:
+docker run -p 6379:6379 -v locus-data:/data -e LOCUS_RDB=/data/locus.rdb ghcr.io/intenttext/locus:latest
+```
+
+Or grab a prebuilt static binary from the [latest release](https://github.com/intenttext/locus/releases/latest)
+(Linux x86_64/aarch64, macOS x86_64/aarch64): download the archive for your platform, verify the
+`.sha256`, extract, and run `./locus`.
+
 ### Configuration
 
 Locus is configured entirely through environment variables (minimal config by design):

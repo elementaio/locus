@@ -6,6 +6,14 @@ All notable changes to Locus are documented here. The format is based on
 
 ## [Unreleased]
 
+## [0.2.0] — 2026-06-16
+
+The reactive + geo-first release. On top of the Redis-compatible core (0.1.0), Locus gains its
+differentiator layer — a reliable changefeed, a geo-first spatial model with live geofencing,
+mergeable probabilistic sketches, conditional-write verbs, and an auto-maintained secondary index —
+plus transaction-correctness fixes and `maxmemory` eviction. Still pre-1.0 and not production-hardened
+(no AUTH/TLS; bind to a trusted network).
+
 ### Added (sketches — mergeable probabilistic summaries)
 - **Bloom filter** `BFADD` / `BFEXISTS` (+ internal `BFLOAD` for AOF rewrite/replication) — dedup /
   set membership ("seen this id?"). Zero-deps (std `DefaultHasher` + double hashing), auto-sized, RDB/AOF
@@ -144,5 +152,6 @@ milestone. Zero third-party dependencies (pure `std`).
   a skiplist for O(log n) sorted-set ops; full RESP3 typing of every reply; thread-per-core execution.
 - No authentication or TLS yet — bind to a trusted network only.
 
-[Unreleased]: https://github.com/intenttext/locus/compare/v0.1.0...HEAD
+[Unreleased]: https://github.com/intenttext/locus/compare/v0.2.0...HEAD
+[0.2.0]: https://github.com/intenttext/locus/compare/v0.1.0...v0.2.0
 [0.1.0]: https://github.com/intenttext/locus/releases/tag/v0.1.0

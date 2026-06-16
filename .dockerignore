@@ -1,0 +1,7 @@
+target
+.git
+.github
+plans
+docs
+*.rdb
+*.aof
