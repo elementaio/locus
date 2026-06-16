@@ -30,6 +30,8 @@ pub enum Value {
     /// model): a spatial index over these keys powers GEOSEARCH and, later, the
     /// region changefeed.
     Geo(f64, f64),
+    /// A Bloom filter (probabilistic set membership / dedup).
+    Bloom(crate::sketch::Bloom),
 }
 
 /// A stream entry id: (milliseconds, sequence).
@@ -63,6 +65,7 @@ impl Value {
             Value::ZSet(_) => "zset",
             Value::Stream(_) => "stream",
             Value::Geo(..) => "geo",
+            Value::Bloom(_) => "bloom",
         }
     }
 
@@ -73,7 +76,7 @@ impl Value {
             Value::Set(s) => s.is_empty(),
             Value::ZSet(z) => z.is_empty(),
             Value::Stream(s) => s.entries.is_empty(),
-            Value::Str(_) | Value::Geo(..) => false,
+            Value::Str(_) | Value::Geo(..) | Value::Bloom(_) => false,
         }
     }
 }
@@ -350,6 +353,7 @@ fn estimate_size(key_len: usize, v: &Value) -> usize {
             })
             .sum(),
         Value::Geo(..) => 16, // two f64
+        Value::Bloom(b) => b.bits.len(),
     };
     KEY_OVH + key_len + val
 }

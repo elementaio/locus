@@ -6,6 +6,11 @@ All notable changes to Locus are documented here. The format is based on
 
 ## [Unreleased]
 
+### Added (sketches — mergeable probabilistic summaries)
+- **Bloom filter** `BFADD` / `BFEXISTS` (+ internal `BFLOAD` for AOF rewrite/replication) — dedup /
+  set membership ("seen this id?"). Zero-deps (std `DefaultHasher` + double hashing), auto-sized, RDB/AOF
+  persistent. First of the a-la-carte sketch family (Count-Min / Top-K / t-digest next).
+
 ### Added (conditional writes — the CAS primitive)
 - **CAS family** `CAS key expected new`, `CADEL key expected`, `SETMAX key n` (monotonic cursor),
   `INCRCAP key delta cap` (quota). Atomic check-and-write under single-threaded execution — no WATCH/Lua.

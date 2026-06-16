@@ -53,6 +53,19 @@ works. This is a curated subset of Redis — the common, useful commands per typ
 `LINDEX` `LSET` `LINSERT key BEFORE|AFTER pivot value` `LREM key count value` `LTRIM key start stop`
 `LPOS key value [RANK r] [COUNT n]` `RPOPLPUSH src dst` `LMOVE src dst LEFT|RIGHT LEFT|RIGHT`
 
+## Sketches (probabilistic)
+
+Compact, mergeable summaries. First up: a Bloom filter for dedup / set membership.
+
+| Command | Notes |
+|---|---|
+| `BFADD key item` | add an item → `1` if probably new, `0` if probably already seen |
+| `BFEXISTS key item` | `1` if probably present, `0` if **definitely** absent (no false negatives) |
+| `BFLOAD key k nbits bits` | restore raw bits (used by AOF rewrite / replication) |
+
+Auto-sized on first `BFADD` (≈10k items at 1% false-positive rate); persists via RDB/AOF.
+(Count-Min, Top-K, and t-digest are the next sketches.)
+
 ## Conditional writes (CAS family)
 
 Check-and-write in a single atomic step (no WATCH/Lua needed) — for persist-before-ack, dedup,

@@ -143,6 +143,10 @@ pub fn execute(tokens: &[Vec<u8>], db: &mut Db) -> Vec<u8> {
         b"CADEL" => cadel_cmd(db, tokens),
         b"SETMAX" => setmax_cmd(db, tokens),
         b"INCRCAP" => incrcap_cmd(db, tokens),
+        // sketches
+        b"BFADD" => bfadd_cmd(db, tokens),
+        b"BFEXISTS" => bfexists_cmd(db, tokens),
+        b"BFLOAD" => bfload_cmd(db, tokens),
         // bitmaps
         b"SETBIT" => setbit_cmd(db, tokens),
         b"GETBIT" => getbit_cmd(db, tokens),
@@ -288,13 +292,13 @@ pub fn command_meta(cmd: &[u8]) -> Option<CmdMeta> {
         b"LINDEX" | b"HGET" | b"HEXISTS" | b"HMGET" | b"SISMEMBER" | b"SMISMEMBER" | b"ZSCORE"
         | b"ZMSCORE" | b"ZRANK" | b"ZREVRANK" | b"PUBLISH" | b"REPLICAOF" | b"SLAVEOF"
         | b"LPOS" | b"SINTERCARD" | b"GETBIT" | b"BITPOS" | b"CDCGROUP" | b"CDCREADGROUP"
-        | b"CDCACK" | b"GEODIST" => (3, false),
+        | b"CDCACK" | b"GEODIST" | b"BFEXISTS" => (3, false),
         // arity 3 writes
         b"INCRBY" | b"DECRBY" | b"APPEND" | b"HDEL" | b"SADD" | b"SREM" | b"ZREM" | b"EXPIRE"
         | b"PEXPIRE" | b"EXPIREAT" | b"PEXPIREAT" | b"LPUSH" | b"RPUSH" | b"LPUSHX" | b"RPUSHX"
         | b"SET" | b"SETNX" | b"GETSET" | b"MSET" | b"MSETNX" | b"INCRBYFLOAT" | b"RENAME"
         | b"RENAMENX" | b"RPOPLPUSH" | b"SINTERSTORE" | b"SUNIONSTORE" | b"SDIFFSTORE"
-        | b"CADEL" | b"SETMAX" => (3, true),
+        | b"CADEL" | b"SETMAX" | b"BFADD" => (3, true),
         // arity 4 reads
         b"LRANGE" | b"ZRANGE" | b"ZREVRANGE" | b"ZRANGEBYSCORE" | b"ZREVRANGEBYSCORE"
         | b"ZCOUNT" | b"XRANGE" | b"XREVRANGE" | b"XREAD" | b"GETRANGE" => (4, false),
@@ -304,7 +308,7 @@ pub fn command_meta(cmd: &[u8]) -> Option<CmdMeta> {
         | b"ZREMRANGEBYSCORE" | b"ZUNIONSTORE" | b"ZINTERSTORE" | b"SETBIT" | b"BITOP"
         | b"GEOSET" | b"CAS" | b"INCRCAP" => (4, true),
         // arity 5 writes
-        b"XADD" | b"LINSERT" | b"LMOVE" => (5, true),
+        b"XADD" | b"LINSERT" | b"LMOVE" | b"BFLOAD" => (5, true),
         // geosearch: GEOSEARCH FROMKEY k BYRADIUS r unit (6) is the shortest form
         b"GEOSEARCH" => (6, false),
         _ => return None,
@@ -1596,6 +1600,61 @@ fn incrcap_cmd(db: &mut Db, tokens: &[Vec<u8>]) -> Vec<u8> {
     } else {
         null_bulk() // capped — rejected, value unchanged
     }
+}
+
+// === sketches: Bloom filter =================================================
+
+fn bfadd_cmd(db: &mut Db, tokens: &[Vec<u8>]) -> Vec<u8> {
+    if tokens.len() != 3 {
+        return wrong_args("bfadd");
+    }
+    // Auto-create with sane defaults (≈10k items at 1% false-positive rate).
+    let bloom = match db.get_or_insert_with(&tokens[1], || {
+        Value::Bloom(crate::sketch::Bloom::with_capacity(10_000, 0.01))
+    }) {
+        Value::Bloom(b) => b,
+        _ => return wrongtype(),
+    };
+    integer(bloom.add(&tokens[2]) as i64) // 1 if probably new, 0 if probably seen
+}
+
+fn bfexists_cmd(db: &mut Db, tokens: &[Vec<u8>]) -> Vec<u8> {
+    if tokens.len() != 3 {
+        return wrong_args("bfexists");
+    }
+    match db.get(&tokens[1]) {
+        None => integer(0),
+        Some(Value::Bloom(b)) => integer(b.contains(&tokens[2]) as i64),
+        Some(_) => wrongtype(),
+    }
+}
+
+/// BFLOAD key k nbits bits — restore a Bloom from raw parts (used by AOF rewrite
+/// and replication; binary-safe in the bits argument).
+fn bfload_cmd(db: &mut Db, tokens: &[Vec<u8>]) -> Vec<u8> {
+    if tokens.len() != 5 {
+        return wrong_args("bfload");
+    }
+    let k = match parse_int(&tokens[2]) {
+        Some(k) if (1..=32).contains(&k) => k as u8,
+        _ => return error("ERR invalid bloom k"),
+    };
+    let nbits = match std::str::from_utf8(&tokens[3])
+        .ok()
+        .and_then(|s| s.parse::<u64>().ok())
+    {
+        Some(n) if n > 0 => n,
+        _ => return error("ERR invalid bloom nbits"),
+    };
+    let bits = tokens[4].clone();
+    if bits.len() < nbits.div_ceil(8) as usize {
+        return error("ERR bloom bits too short");
+    }
+    db.insert(
+        tokens[1].clone(),
+        Value::Bloom(crate::sketch::Bloom::from_raw(k, nbits, bits)),
+    );
+    simple_string("OK")
 }
 
 // === hashes =================================================================
@@ -3720,6 +3779,30 @@ mod tests {
     }
 
     #[test]
+    fn bloom_filter_commands() {
+        let mut db = Db::new();
+        assert_eq!(cmd(&mut db, &[b"BFADD", b"seen", b"a"]), b":1\r\n".to_vec()); // new
+        assert_eq!(cmd(&mut db, &[b"BFADD", b"seen", b"a"]), b":0\r\n".to_vec()); // already seen
+        assert_eq!(
+            cmd(&mut db, &[b"BFEXISTS", b"seen", b"a"]),
+            b":1\r\n".to_vec()
+        );
+        assert_eq!(
+            cmd(&mut db, &[b"BFEXISTS", b"seen", b"b"]),
+            b":0\r\n".to_vec()
+        ); // no false negative
+        assert_eq!(cmd(&mut db, &[b"TYPE", b"seen"]), b"+bloom\r\n".to_vec());
+        assert_eq!(
+            cmd(&mut db, &[b"BFEXISTS", b"missing", b"x"]),
+            b":0\r\n".to_vec()
+        );
+        // WRONGTYPE
+        cmd(&mut db, &[b"SET", b"s", b"x"]);
+        assert!(cmd(&mut db, &[b"BFADD", b"s", b"y"]).starts_with(b"-WRONGTYPE"));
+        assert!(cmd(&mut db, &[b"BFEXISTS", b"s", b"y"]).starts_with(b"-WRONGTYPE"));
+    }
+
+    #[test]
     fn command_table_write_set_is_exact() {
         // The exact set of write commands. A change here is a deliberate decision,
         // not an accident — guards the AOF/replication write-detection.
@@ -3789,6 +3872,8 @@ mod tests {
             b"SETBIT",
             b"BITOP",
             b"GEOSET",
+            b"BFADD",
+            b"BFLOAD",
             b"XADD",
         ];
         for w in writes {
@@ -3812,6 +3897,7 @@ mod tests {
             b"GEOPOS".as_slice(),
             b"GEODIST".as_slice(),
             b"GEOSEARCH".as_slice(),
+            b"BFEXISTS".as_slice(),
             b"SRANDMEMBER".as_slice(),
             b"RANDOMKEY".as_slice(),
             b"SMEMBERS".as_slice(),

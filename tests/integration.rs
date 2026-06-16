@@ -310,6 +310,17 @@ fn conditional_writes_over_the_wire() {
     assert_eq!(c.cmd(&["INCRCAP", "quota", "1", "2"]), "(nil)"); // capped
 }
 
+#[test]
+fn bloom_filter_dedup() {
+    let s = Server::start();
+    let mut c = s.connect();
+    assert_eq!(c.cmd(&["BFADD", "seen", "msg-1"]), "1"); // first time
+    assert_eq!(c.cmd(&["BFADD", "seen", "msg-1"]), "0"); // duplicate
+    assert_eq!(c.cmd(&["BFEXISTS", "seen", "msg-1"]), "1");
+    assert_eq!(c.cmd(&["BFEXISTS", "seen", "msg-2"]), "0");
+    assert_eq!(c.cmd(&["TYPE", "seen"]), "bloom");
+}
+
 // === geo ====================================================================
 
 #[test]

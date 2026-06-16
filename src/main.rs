@@ -17,6 +17,7 @@ mod db;
 mod pubsub;
 mod rdb;
 mod resp;
+mod sketch;
 mod streams;
 
 use std::collections::{HashMap, HashSet, VecDeque};
@@ -1353,7 +1354,7 @@ fn write_modified(cmd: &[u8], reply: &[u8]) -> bool {
         b"DEL" | b"UNLINK" | b"SREM" | b"HDEL" | b"ZREM" | b"SADD" | b"HSETNX" | b"LPUSHX"
         | b"RPUSHX" | b"PERSIST" | b"EXPIRE" | b"PEXPIRE" | b"EXPIREAT" | b"PEXPIREAT"
         | b"SETNX" | b"MSETNX" | b"RENAMENX" | b"LREM" | b"SMOVE" | b"ZREMRANGEBYRANK"
-        | b"ZREMRANGEBYSCORE" | b"CAS" | b"CADEL" | b"SETMAX" => !zero,
+        | b"ZREMRANGEBYSCORE" | b"CAS" | b"CADEL" | b"SETMAX" | b"BFADD" => !zero,
         // ZADD: 0 added/changed, or nil from an aborted INCR (NX/XX/GT/LT).
         b"ZADD" => !(zero || nil),
         // LINSERT: 0 (no key) or -1 (pivot not found) means nothing was inserted.

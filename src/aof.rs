@@ -296,6 +296,14 @@ fn reconstruct(key: &[u8], value: &Value) -> Vec<Vec<Vec<u8>>> {
             format!("{lon}").into_bytes(),
             format!("{lat}").into_bytes(),
         ]],
+        // A sketch can't be rebuilt from its add-history; restore raw bits.
+        Value::Bloom(b) => vec![vec![
+            b"BFLOAD".to_vec(),
+            k,
+            b.k.to_string().into_bytes(),
+            b.nbits.to_string().into_bytes(),
+            b.bits.clone(),
+        ]],
     }
 }
 

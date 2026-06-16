@@ -62,6 +62,7 @@ fn write_value<W: Write>(w: &mut W, key: &[u8], v: &Value) -> io::Result<()> {
         Value::ZSet(_) => 4,
         Value::Stream(_) => 5,
         Value::Geo(..) => 6,
+        Value::Bloom(_) => 7,
     };
     w.write_all(&[tag])?;
     write_bytes(w, key)?;
@@ -110,6 +111,11 @@ fn write_value<W: Write>(w: &mut W, key: &[u8], v: &Value) -> io::Result<()> {
         Value::Geo(lon, lat) => {
             w.write_all(&lon.to_le_bytes())?;
             w.write_all(&lat.to_le_bytes())?;
+        }
+        Value::Bloom(b) => {
+            w.write_all(&[b.k])?;
+            w.write_all(&b.nbits.to_le_bytes())?;
+            write_bytes(w, &b.bits)?;
         }
     }
     Ok(())
@@ -245,6 +251,12 @@ fn read_value<R: Read>(r: &mut R, tag: u8) -> io::Result<Value> {
             Value::Stream(Stream { entries, last_id })
         }
         6 => Value::Geo(read_f64(r)?, read_f64(r)?),
+        7 => {
+            let k = read_u8(r)?;
+            let nbits = read_u64(r)?;
+            let bits = read_bytes(r)?;
+            Value::Bloom(crate::sketch::Bloom::from_raw(k, nbits, bits))
+        }
         _ => {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidData,
@@ -301,6 +313,8 @@ mod tests {
         run(&mut db, &[b"SADD", b"st", b"x", b"y"]);
         run(&mut db, &[b"ZADD", b"z", b"1.5", b"m"]);
         run(&mut db, &[b"SET", b"e", b"v", b"EX", b"1000"]);
+        run(&mut db, &[b"GEOSET", b"g", b"13.361389", b"38.115556"]);
+        run(&mut db, &[b"BFADD", b"bf", b"alice"]);
 
         save(&db, path).unwrap();
         let mut loaded = load(path).unwrap();
@@ -328,6 +342,15 @@ mod tests {
         // TTL survived (roughly)
         let ttl = execute(&to(&[b"TTL", b"e"]), &mut loaded);
         assert!(ttl.starts_with(b":") && ttl != b":-1\r\n".to_vec() && ttl != b":-2\r\n".to_vec());
+        // geo point + bloom survived
+        assert_eq!(
+            execute(&to(&[b"TYPE", b"g"]), &mut loaded),
+            b"+geo\r\n".to_vec()
+        );
+        assert_eq!(
+            execute(&to(&[b"BFEXISTS", b"bf", b"alice"]), &mut loaded),
+            b":1\r\n".to_vec()
+        );
         let _ = fs::remove_file(path);
     }
 
