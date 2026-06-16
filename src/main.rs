@@ -8,6 +8,7 @@
 //! Milestones so far: M0 PONG · M1 RESP+SET/GET · M2 concurrency+strings ·
 //! M3 key expiry (passive + active).
 
+mod aof;
 mod commands;
 mod db;
 mod rdb;
@@ -57,19 +58,61 @@ fn main() -> io::Result<()> {
 /// The single keyspace owner: runs commands one at a time, and — when idle or
 /// periodically — runs an active-expiration pass to reclaim TTL'd memory.
 fn run_keyspace(rx: mpsc::Receiver<Request>) {
-    let path = rdb::configured_path();
-    let mut db = match rdb::load(&path) {
-        Ok(db) => db,
-        Err(e) => {
-            eprintln!("failed to load {path}: {e} — starting with an empty dataset");
-            Db::new()
+    // Load order: if AOF is enabled, it's the source of truth; otherwise RDB.
+    let aof_path = aof::configured_path();
+    let (mut db, mut aof) = match &aof_path {
+        Some(path) => {
+            let db = aof::load(path).unwrap_or_else(|e| {
+                eprintln!("AOF load failed: {e} — starting empty");
+                Db::new()
+            });
+            let aof = aof::Aof::open(path)
+                .map_err(|e| eprintln!("AOF open failed: {e}"))
+                .ok();
+            (db, aof)
+        }
+        None => {
+            let path = rdb::configured_path();
+            let db = rdb::load(&path).unwrap_or_else(|e| {
+                eprintln!("RDB load failed: {e} — starting empty");
+                Db::new()
+            });
+            (db, None)
         }
     };
+
     let mut since_expire = 0u32;
     loop {
         match rx.recv_timeout(Duration::from_millis(100)) {
             Ok(req) => {
+                // BGREWRITEAOF is handled here — the owner owns the AOF file.
+                if !req.tokens.is_empty() && req.tokens[0].eq_ignore_ascii_case(b"BGREWRITEAOF") {
+                    let reply = match (&aof_path, aof.is_some()) {
+                        (Some(path), true) => match aof::rewrite(&db, path) {
+                            Ok(()) => {
+                                aof = aof::Aof::open(path).ok(); // reopen onto the compacted file
+                                resp::simple_string("Background append only file rewriting started")
+                            }
+                            Err(e) => resp::error(&format!("ERR {e}")),
+                        },
+                        _ => resp::error("ERR AOF is not enabled"),
+                    };
+                    let _ = req.reply_tx.send(reply);
+                    continue;
+                }
+
                 let reply = execute(&req.tokens, &mut db);
+
+                // Append the (rewritten) command to the AOF, unless it errored.
+                if let Some(a) = aof.as_mut() {
+                    let errored = reply.first() == Some(&b'-');
+                    if !req.tokens.is_empty() && !errored && aof::is_write(&req.tokens[0]) {
+                        let entries = aof::entries_for(&req.tokens, &reply, &mut db);
+                        let _ = a.append(&entries);
+                    }
+                    a.maybe_fsync();
+                }
+
                 let _ = req.reply_tx.send(reply);
                 since_expire += 1;
                 if since_expire >= 1000 {
@@ -78,6 +121,9 @@ fn run_keyspace(rx: mpsc::Receiver<Request>) {
                 }
             }
             Err(mpsc::RecvTimeoutError::Timeout) => {
+                if let Some(a) = aof.as_mut() {
+                    a.maybe_fsync();
+                }
                 db.active_expire();
                 since_expire = 0;
             }
