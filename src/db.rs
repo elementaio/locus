@@ -31,9 +31,12 @@ pub enum Value {
 /// A stream entry id: (milliseconds, sequence).
 pub type StreamId = (u64, u64);
 
-/// An append-only stream of (id, field-value pairs), ordered by id.
+/// One stream entry: an id plus its field/value pairs.
+pub type StreamEntry = (StreamId, Vec<(Vec<u8>, Vec<u8>)>);
+
+/// An append-only stream of entries, ordered by id.
 pub struct Stream {
-    pub entries: Vec<(StreamId, Vec<(Vec<u8>, Vec<u8>)>)>,
+    pub entries: Vec<StreamEntry>,
     pub last_id: StreamId,
 }
 
@@ -84,12 +87,11 @@ impl Db {
     }
 
     fn check_expiry(&mut self, key: &[u8]) {
-        if let Some(&deadline) = self.expires.get(key) {
-            if deadline <= now_ms() {
+        if let Some(&deadline) = self.expires.get(key)
+            && deadline <= now_ms() {
                 self.data.remove(key);
                 self.expires.remove(key);
             }
-        }
     }
 
     pub fn get(&mut self, key: &[u8]) -> Option<&Value> {
@@ -133,7 +135,7 @@ impl Db {
     /// Delete the key if it now holds an empty collection (Redis removes empty
     /// lists/hashes/sets so they don't linger).
     pub fn remove_if_empty(&mut self, key: &[u8]) {
-        let empty = self.data.get(key).map_or(false, |v| v.is_empty_collection());
+        let empty = self.data.get(key).is_some_and(|v| v.is_empty_collection());
         if empty {
             self.data.remove(key);
             self.expires.remove(key);
@@ -165,7 +167,7 @@ impl Db {
             let total = sample.len();
             let mut expired = 0usize;
             for k in &sample {
-                if self.expires.get(k).map_or(false, |&t| t <= now) {
+                if self.expires.get(k).is_some_and(|&t| t <= now) {
                     self.data.remove(k);
                     self.expires.remove(k);
                     expired += 1;

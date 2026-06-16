@@ -13,6 +13,9 @@ use crate::resp::{
 };
 use crate::streams;
 
+/// A hash value: field -> value.
+type HashVal = HashMap<Vec<u8>, Vec<u8>>;
+
 // --- shared helpers ---------------------------------------------------------
 
 fn wrong_args(cmd: &str) -> Vec<u8> {
@@ -394,7 +397,7 @@ fn ttl_cmd(db: &mut Db, tokens: &[Vec<u8>], unit_ms: u64) -> Vec<u8> {
         None => integer(-1),
         Some(deadline) => {
             let remaining = deadline.saturating_sub(now_ms());
-            integer(((remaining + unit_ms - 1) / unit_ms) as i64)
+            integer(remaining.div_ceil(unit_ms) as i64)
         }
     }
 }
@@ -563,7 +566,7 @@ fn lset_cmd(db: &mut Db, tokens: &[Vec<u8>]) -> Vec<u8> {
 
 // === hashes =================================================================
 
-fn with_hash<'a>(db: &'a mut Db, key: &[u8]) -> Result<Option<&'a HashMap<Vec<u8>, Vec<u8>>>, ()> {
+fn with_hash<'a>(db: &'a mut Db, key: &[u8]) -> Result<Option<&'a HashVal>, ()> {
     match db.get(key) {
         None => Ok(None),
         Some(Value::Hash(h)) => Ok(Some(h)),
@@ -572,7 +575,7 @@ fn with_hash<'a>(db: &'a mut Db, key: &[u8]) -> Result<Option<&'a HashMap<Vec<u8
 }
 
 fn hset_cmd(db: &mut Db, tokens: &[Vec<u8>], _nx: bool) -> Vec<u8> {
-    if tokens.len() < 4 || (tokens.len() - 2) % 2 != 0 {
+    if tokens.len() < 4 || !(tokens.len() - 2).is_multiple_of(2) {
         return wrong_args("hset");
     }
     let h = match db.get_or_insert_with(&tokens[1], || Value::Hash(HashMap::new())) {
@@ -795,7 +798,7 @@ fn smismember_cmd(db: &mut Db, tokens: &[Vec<u8>]) -> Vec<u8> {
     };
     let elems: Vec<Vec<u8>> = tokens[2..]
         .iter()
-        .map(|m| integer(set.map_or(false, |s| s.contains(m)) as i64))
+        .map(|m| integer(set.is_some_and(|s| s.contains(m)) as i64))
         .collect();
     array(&elems)
 }
@@ -948,7 +951,7 @@ fn zadd_cmd(db: &mut Db, tokens: &[Vec<u8>]) -> Vec<u8> {
         i += 1;
     }
     let pairs = &tokens[i..];
-    if pairs.is_empty() || pairs.len() % 2 != 0 {
+    if pairs.is_empty() || !pairs.len().is_multiple_of(2) {
         return error("ERR syntax error");
     }
     if nx && xx {

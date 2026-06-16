@@ -66,7 +66,7 @@ fn gen_id(arg: &[u8], last: StreamId) -> Result<StreamId, String> {
 
 pub fn xadd(db: &mut Db, tokens: &[Vec<u8>]) -> Vec<u8> {
     // XADD key id field value [field value ...]
-    if tokens.len() < 5 || tokens.len() % 2 == 0 {
+    if tokens.len() < 5 || tokens.len().is_multiple_of(2) {
         return error("ERR wrong number of arguments for 'xadd' command");
     }
     let key = &tokens[1];
@@ -204,7 +204,7 @@ pub fn parse_xread(tokens: &[Vec<u8>]) -> Result<XReadReq, String> {
         }
     }
     let rest = &tokens[i..];
-    if rest.is_empty() || rest.len() % 2 != 0 {
+    if rest.is_empty() || !rest.len().is_multiple_of(2) {
         return Err("Unbalanced XREAD list of streams: for each stream key an ID or '$' must be specified.".into());
     }
     let n = rest.len() / 2;

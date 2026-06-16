@@ -79,7 +79,7 @@ pub fn parse_command(buf: &[u8]) -> Parsed {
             Count::Incomplete => return Parsed::Incomplete,
             Count::Bad => return Parsed::Error("invalid bulk length".into()),
         };
-        if len < 0 || len > MAX_BULK_LEN {
+        if !(0..=MAX_BULK_LEN).contains(&len) {
             return Parsed::Error("invalid bulk length".into());
         }
         let len = len as usize;

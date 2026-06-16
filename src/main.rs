@@ -172,7 +172,7 @@ impl Hub {
         }
 
         // In MULTI, queue everything except transaction-control commands.
-        if self.txs.get(&id).map_or(false, |t| t.in_multi) && !is_tx_control(&cmd) {
+        if self.txs.get(&id).is_some_and(|t| t.in_multi) && !is_tx_control(&cmd) {
             self.txs.get_mut(&id).unwrap().queued.push(tokens);
             return self.send(id, resp::simple_string("QUEUED"));
         }
@@ -188,7 +188,7 @@ impl Hub {
                 self.send(id, resp::simple_string("OK"));
             }
             b"DISCARD" => {
-                if !self.txs.get(&id).map_or(false, |t| t.in_multi) {
+                if !self.txs.get(&id).is_some_and(|t| t.in_multi) {
                     return self.send(id, resp::error("ERR DISCARD without MULTI"));
                 }
                 let t = self.txs.remove(&id).unwrap();
@@ -196,7 +196,7 @@ impl Hub {
                 self.send(id, resp::simple_string("OK"));
             }
             b"EXEC" => {
-                if !self.txs.get(&id).map_or(false, |t| t.in_multi) {
+                if !self.txs.get(&id).is_some_and(|t| t.in_multi) {
                     return self.send(id, resp::error("ERR EXEC without MULTI"));
                 }
                 let t = self.txs.remove(&id).unwrap();
@@ -215,7 +215,7 @@ impl Hub {
                 if tokens.len() < 2 {
                     return self.send(id, resp::error("ERR wrong number of arguments for 'watch' command"));
                 }
-                if self.txs.get(&id).map_or(false, |t| t.in_multi) {
+                if self.txs.get(&id).is_some_and(|t| t.in_multi) {
                     return self.send(id, resp::error("ERR WATCH inside MULTI is not allowed"));
                 }
                 {
@@ -520,7 +520,7 @@ impl Hub {
                     .pubsub
                     .active_channels()
                     .into_iter()
-                    .filter(|c| pat.map_or(true, |p| pubsub::glob_match(p, c)))
+                    .filter(|c| pat.is_none_or(|p| pubsub::glob_match(p, c)))
                     .collect();
                 resp::bulk_array(&chans)
             }

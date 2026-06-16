@@ -44,11 +44,10 @@ impl PubSub {
 
     pub fn unsubscribe(&mut self, id: u64, channel: &[u8]) -> usize {
         if let Some(subs) = self.channels.get_mut(channel) {
-            if subs.remove(&id) {
-                if let Some(c) = self.counts.get_mut(&id) {
+            if subs.remove(&id)
+                && let Some(c) = self.counts.get_mut(&id) {
                     *c = c.saturating_sub(1);
                 }
-            }
             if subs.is_empty() {
                 self.channels.remove(channel);
             }
@@ -58,11 +57,10 @@ impl PubSub {
 
     pub fn punsubscribe(&mut self, id: u64, pat: &[u8]) -> usize {
         if let Some(subs) = self.patterns.get_mut(pat) {
-            if subs.remove(&id) {
-                if let Some(c) = self.counts.get_mut(&id) {
+            if subs.remove(&id)
+                && let Some(c) = self.counts.get_mut(&id) {
                     *c = c.saturating_sub(1);
                 }
-            }
             if subs.is_empty() {
                 self.patterns.remove(pat);
             }
@@ -111,22 +109,20 @@ impl PubSub {
         if let Some(subs) = self.channels.get(channel) {
             let msg = message(channel, payload);
             for id in subs {
-                if let Some(out) = clients.get(id) {
-                    if out.send(msg.clone()).is_ok() {
+                if let Some(out) = clients.get(id)
+                    && out.send(msg.clone()).is_ok() {
                         n += 1;
                     }
-                }
             }
         }
         for (pat, subs) in &self.patterns {
             if glob_match(pat, channel) {
                 let msg = pmessage(pat, channel, payload);
                 for id in subs {
-                    if let Some(out) = clients.get(id) {
-                        if out.send(msg.clone()).is_ok() {
+                    if let Some(out) = clients.get(id)
+                        && out.send(msg.clone()).is_ok() {
                             n += 1;
                         }
-                    }
                 }
             }
         }
