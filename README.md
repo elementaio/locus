@@ -2,7 +2,7 @@
 
 **An in-memory datastore that speaks the Redis protocol — written from scratch in Rust, with zero dependencies.**
 
-[![CI](https://github.com/emadjumaah/locus/actions/workflows/ci.yml/badge.svg)](https://github.com/emadjumaah/locus/actions/workflows/ci.yml)
+[![CI](https://github.com/intenttext/locus/actions/workflows/ci.yml/badge.svg)](https://github.com/intenttext/locus/actions/workflows/ci.yml)
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
 [![Rust](https://img.shields.io/badge/rust-2024-orange.svg)](https://www.rust-lang.org/)
 

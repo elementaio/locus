@@ -12,5 +12,6 @@
 .DS_Store
 .idea/
 .vscode/
+*.code-workspace
 
 # Note: Cargo.lock IS committed (this is a binary application).

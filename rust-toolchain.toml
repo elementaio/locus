@@ -1,0 +1,6 @@
+# Pins the toolchain so local builds, CI, and contributors all compile Locus with the
+# same compiler — reproducible builds and consistent lint/format behavior.
+# Locus targets the 2024 edition (requires Rust >= 1.85). Bump this in lockstep with CI.
+[toolchain]
+channel = "1.93.1"
+components = ["clippy", "rustfmt"]
