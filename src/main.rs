@@ -871,6 +871,10 @@ fn replica_sync(addr: String, hub_tx: mpsc::Sender<Msg>, stop: Arc<AtomicBool>) 
 
 fn try_sync(addr: &str, hub_tx: &mpsc::Sender<Msg>, stop: &Arc<AtomicBool>) -> io::Result<()> {
     let mut stream = TcpStream::connect(addr)?;
+    // Bound the handshake + snapshot reads so a master that accepts the TCP
+    // connection but never replies can't hang this thread forever (a stuck read
+    // errors out, replica_sync retries, and REPLICAOF NO ONE can take effect).
+    stream.set_read_timeout(Some(Duration::from_secs(5)))?;
     // Handshake: PING -> REPLCONF -> PSYNC.
     send_cmd(&mut stream, &[b"PING"])?;
     read_line(&mut stream)?;

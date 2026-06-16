@@ -86,6 +86,7 @@ pub fn execute(tokens: &[Vec<u8>], db: &mut Db) -> Vec<u8> {
         b"ECHO" if tokens.len() == 2 => bulk_string(&tokens[1]),
         b"ECHO" => wrong_args("echo"),
         b"QUIT" => simple_string("OK"),
+        b"SELECT" => select_cmd(tokens),
         b"DEL" => del_cmd(db, tokens),
         b"UNLINK" => del_cmd(db, tokens), // synchronous here, like DEL
         b"EXISTS" => exists_cmd(db, tokens),
@@ -268,9 +269,8 @@ pub fn command_meta(cmd: &[u8]) -> Option<CmdMeta> {
         b"ECHO" | b"TYPE" | b"TTL" | b"PTTL" | b"GET" | b"STRLEN" | b"LLEN" | b"HGETALL"
         | b"HLEN" | b"HKEYS" | b"HVALS" | b"SMEMBERS" | b"SCARD" | b"ZCARD" | b"XLEN"
         | b"EXISTS" | b"TOUCH" | b"KEYS" | b"MGET" | b"SINTER" | b"SUNION" | b"SDIFF"
-        | b"WATCH" | b"SUBSCRIBE" | b"PSUBSCRIBE" | b"PUBSUB" | b"BITCOUNT" | b"SRANDMEMBER" => {
-            (2, false)
-        }
+        | b"WATCH" | b"SUBSCRIBE" | b"PSUBSCRIBE" | b"PUBSUB" | b"BITCOUNT" | b"SRANDMEMBER"
+        | b"SELECT" => (2, false),
         // arity 2 writes
         b"PERSIST" | b"INCR" | b"DECR" | b"GETDEL" | b"LPOP" | b"RPOP" | b"SPOP" | b"ZPOPMIN"
         | b"ZPOPMAX" | b"DEL" | b"UNLINK" => (2, true),
@@ -311,6 +311,19 @@ pub fn is_write(cmd: &[u8]) -> bool {
 
 fn cmd_name(tokens: &[Vec<u8>]) -> String {
     String::from_utf8_lossy(&tokens[0]).to_ascii_lowercase()
+}
+
+fn select_cmd(tokens: &[Vec<u8>]) -> Vec<u8> {
+    // Single logical DB: SELECT 0 is a no-op OK so clients that select on connect
+    // work; any other index is rejected. (Full multi-DB is a deliberate non-goal.)
+    if tokens.len() != 2 {
+        return wrong_args("select");
+    }
+    match parse_int(&tokens[1]) {
+        Some(0) => simple_string("OK"),
+        Some(_) => error("ERR DB index is out of range"),
+        None => not_integer(),
+    }
 }
 
 fn del_cmd(db: &mut Db, tokens: &[Vec<u8>]) -> Vec<u8> {
@@ -2825,6 +2838,14 @@ mod tests {
         cmd(&mut db, &[b"RPUSH", b"list", b"x"]);
         assert!(cmd(&mut db, &[b"GETSET", b"list", b"y"]).starts_with(b"-WRONGTYPE"));
         assert!(cmd(&mut db, &[b"INCRBYFLOAT", b"list", b"1"]).starts_with(b"-WRONGTYPE"));
+    }
+
+    #[test]
+    fn select_single_db() {
+        let mut db = Db::new();
+        assert_eq!(cmd(&mut db, &[b"SELECT", b"0"]), b"+OK\r\n".to_vec());
+        assert!(cmd(&mut db, &[b"SELECT", b"1"]).starts_with(b"-ERR"));
+        assert!(cmd(&mut db, &[b"SELECT", b"x"]).starts_with(b"-ERR"));
     }
 
     #[test]

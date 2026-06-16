@@ -346,7 +346,40 @@ fn maxmemory_evicts_to_stay_bounded() {
     assert_eq!(c.cmd(&["PING"]), "PONG"); // still responsive
 }
 
+#[test]
+fn select_zero_ok_others_rejected() {
+    let s = Server::start();
+    let mut c = s.connect();
+    assert_eq!(c.cmd(&["SELECT", "0"]), "OK");
+    assert!(c.cmd(&["SELECT", "1"]).starts_with("-ERR"));
+    assert!(c.cmd(&["SELECT", "nope"]).starts_with("-ERR"));
+}
+
 // === replication ============================================================
+
+#[test]
+fn replica_pointed_at_silent_master_stays_responsive() {
+    let replica = Server::start();
+    // A "master" that accepts the TCP connection but never replies, so the
+    // replica's handshake stalls — the read-timeout must keep it from hanging.
+    let silent = TcpListener::bind("127.0.0.1:0").unwrap();
+    let port = silent.local_addr().unwrap().port();
+    std::thread::spawn(move || {
+        let mut held = Vec::new();
+        for s in silent.incoming().flatten() {
+            held.push(s); // keep connections open, never write
+        }
+    });
+    let mut c = replica.connect();
+    assert_eq!(c.cmd(&["REPLICAOF", "127.0.0.1", &port.to_string()]), "OK");
+    sleep(Duration::from_millis(200));
+    // The replica stays fully responsive despite the stalled handshake; it's in
+    // read-only mode, and can be promoted back without hanging.
+    assert_eq!(c.cmd(&["PING"]), "PONG");
+    assert!(c.cmd(&["SET", "k", "v"]).starts_with("-READONLY"));
+    assert_eq!(c.cmd(&["REPLICAOF", "NO", "ONE"]), "OK");
+    assert_eq!(c.cmd(&["SET", "k", "v"]), "OK"); // promoted -> writable again
+}
 
 #[test]
 fn replica_receives_writes_from_master() {

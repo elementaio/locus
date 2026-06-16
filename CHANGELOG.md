@@ -35,6 +35,14 @@ All notable changes to Locus are documented here. The format is based on
   don't self-evict — the master drives deletions. `INFO` now reports a `# Memory` section
   (`used_memory`, `maxmemory`).
 
+### Added
+- `SELECT` — single logical DB: `SELECT 0` returns OK (so clients that select on connect work);
+  other indexes are rejected. Full multi-DB is a deliberate non-goal.
+
+### Fixed (replication)
+- The replica handshake now uses a read timeout, so a master that accepts the TCP connection but
+  never replies can no longer hang the replication thread (and `REPLICAOF NO ONE` can take effect).
+
 ### Fixed (transactions)
 - **`WATCH` now aborts `EXEC` when a watched key expires** (passive or active reaper), not only on an
   explicit write — matching Redis optimistic-concurrency semantics.

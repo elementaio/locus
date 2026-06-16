@@ -13,6 +13,7 @@ works. This is a curated subset of Redis — the common, useful commands per typ
 | `HELLO [2\|3]` | RESP version negotiation; returns server info |
 | `INFO` | replication section (`role`, `connected_slaves`, master link) |
 | `RESET` | abort MULTI, UNWATCH, exit subscribe mode, drop to RESP2 |
+| `SELECT 0` | single logical DB; `SELECT 0` is OK, other indexes error |
 | `QUIT` | |
 | `COMMAND` / `CONFIG GET` | minimal stubs so clients connect cleanly |
 
