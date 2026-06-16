@@ -1,5 +1,8 @@
 [package]
-name = "locus"
+# Published to crates.io as `locusdb` ("locus" was already taken); the binary,
+# repo, and Docker image are all still `locus`. So `cargo install locusdb`
+# installs a `locus` command (see [[bin]] below).
+name = "locusdb"
 version = "0.2.0"
 edition = "2024"
 description = "An in-memory datastore that speaks the Redis protocol — from scratch in Rust, zero dependencies."
@@ -9,6 +12,10 @@ repository = "https://github.com/intenttext/locus"
 readme = "README.md"
 keywords = ["redis", "key-value", "in-memory", "database", "resp"]
 categories = ["database-implementations", "caching"]
+
+[[bin]]
+name = "locus"
+path = "src/main.rs"
 
 [dependencies]
 

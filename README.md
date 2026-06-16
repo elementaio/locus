@@ -110,6 +110,12 @@ Or grab a prebuilt static binary from the [latest release](https://github.com/in
 (Linux x86_64/aarch64, macOS x86_64/aarch64): download the archive for your platform, verify the
 `.sha256`, extract, and run `./locus`.
 
+With a Rust toolchain, install from crates.io (the crate is `locusdb`; the command it installs is `locus`):
+
+```console
+cargo install locusdb && locus
+```
+
 ### Configuration
 
 Locus is configured entirely through environment variables (minimal config by design):
