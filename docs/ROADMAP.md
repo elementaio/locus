@@ -45,10 +45,26 @@ See [CHANGEFEED.md](CHANGEFEED.md), [GEO.md](GEO.md), [SKETCHES.md](SKETCHES.md)
 - **Full RESP3 typing** of every reply (we negotiate `HELLO` but keep RESP2-compatible encoders)
 - **Thread-per-core** execution for multi-core throughput
 
+## Distribution (shipped in v0.2.0)
+
+- **GitHub Releases** with prebuilt static binaries (Linux x86_64/aarch64, macOS x86_64/arm64).
+- **Docker image** — `ghcr.io/intenttext/locus` (multi-tag, public).
+- **crates.io** — `cargo install locusdb` (crate `locusdb`; the command stays `locus`).
+- Any **Redis client** works over RESP; the custom verbs go through each client's raw-command API
+  (see [CLIENTS.md](CLIENTS.md)).
+
 ## Next major arc — geo phase 3 & clustering
 
 - A real **S2-cell / R-tree** spatial index (sub-linear `GEOSEARCH`) with **combined attribute filters**
   (`nearby AND status=…`) and keyset pagination.
 - **Spatial clustering** — horizontal sharding that preserves locality — the empty market intersection
   (in-memory · geo-first · clustered) that even Tile38 leaves open.
+
+## Ecosystem & smaller follow-ups
+
+- A thin **reactive client wrapper** (TypeScript/npm first) for the changefeed/geofence *push* API —
+  `feed.on('change', …)` / `locus.geofence(…)` — wrapping an existing client, not reimplementing RESP.
+  A Python helper if there's demand. (Standard clients already work today; this is DX sugar.)
 - Adopt-later primitives: per-element TTL, per-command durability, time-based changefeed retention.
+- Release tooling: bump release actions once upstream ships Node-24 builds (current deprecation warnings
+  are cosmetic); optional Docker Hub mirror.

@@ -69,8 +69,9 @@ $ redis-cli -p 6379 get hello
 
 **Zero dependencies.** Pure `std`, ~8k lines across 9 modules.
 
-See [docs/COMMANDS.md](docs/COMMANDS.md) for the full command reference, the guides above for the
-differentiators, and [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) for how it works inside.
+See [docs/COMMANDS.md](docs/COMMANDS.md) for the full command reference, [docs/CLIENTS.md](docs/CLIENTS.md)
+for driving Locus from Node/Python (any Redis client works), the guides above for the differentiators,
+and [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) for how it works inside.
 
 ---
 
