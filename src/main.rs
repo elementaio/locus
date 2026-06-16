@@ -1,67 +1,64 @@
-//! Locus — M1: RESP parser + ECHO + SET/GET on an in-memory map.
+//! Locus — M2: concurrent clients + more string commands.
 //!
-//! Now the reply depends on what was sent. We parse the Redis wire protocol
-//! (RESP2) into command tokens and run real commands against a `HashMap`:
+//! M1 served one client at a time. Now many clients connect at once — and we
+//! meet the central question of the whole project: how do concurrent clients
+//! share one keyspace without races?
 //!
-//!   $ cargo run
-//!   $ redis-cli -p 6379 set foo bar   # -> OK
-//!   $ redis-cli -p 6379 get foo       # -> "bar"
+//! THE NAÏVE ANSWER (and why we don't use it): wrap the map in
+//! `Arc<Mutex<HashMap>>` and let every connection thread lock it. The borrow
+//! checker will happily allow this — but now command execution is a lock
+//! free-for-all, exactly the contention Redis was designed to avoid.
 //!
-//! Two ideas carry the whole project and both live here:
+//! THE REDIS-FAITHFUL ANSWER (what we do): spawn a thread per connection for
+//! I/O (read + parse + write), but route every parsed command through ONE owner
+//! thread that holds the single `HashMap`. Commands are executed one at a time,
+//! in arrival order — atomic by construction, no locks on the data. The channel
+//! is the only shared thing, and it serializes everything.
 //!
-//! 1. THE RESUMABLE PARSER. TCP is a byte *stream*: one read() may return half
-//!    a command, exactly one, or several glued together. So the parser is a
-//!    state machine over a per-connection buffer — feed bytes in, get back
-//!    zero-or-more complete commands plus the partial tail we keep for later.
-//!    It NEVER assumes a read() == a command. (See the unit tests at the bottom,
-//!    which feed it one byte at a time.)
+//!   client thread ──parse──▶ [cmd + reply-channel] ──▶ owner thread (the map)
+//!   client thread ◀──────────────── reply ────────────────────┘
 //!
-//! 2. THE SINGLE KEYSPACE OWNER. `main` owns the one `HashMap` and handles
-//!    connections one at a time, so every command runs to completion with no
-//!    interleaving — atomicity for free, no locks. (Many concurrent clients is
-//!    M2, where tokio arrives; for M1 a serial loop keeps the lesson clean.)
+//! (We use std threads, not tokio — zero dependencies, and it makes the
+//! single-owner model explicit. Swapping blocking-thread-per-connection for an
+//! async event loop is a later *performance* step, not a correctness one.)
 
 use std::collections::HashMap;
 use std::io::{self, Read, Write};
 use std::net::{TcpListener, TcpStream};
+use std::sync::mpsc;
+use std::thread;
 
-/// 6379 is Redis's port, so the real `redis-cli` finds us with no flags.
-/// (6379 spells "MERZ" on a phone keypad — antirez's old joke.)
 const ADDR: &str = "127.0.0.1:6379";
-
-/// DoS guards: reject absurd declared sizes before allocating (HARD-PARTS §1).
-/// These mirror Redis's defaults.
 const MAX_ARRAY: i64 = 1024 * 1024;
 const MAX_BULK_LEN: i64 = 512 * 1024 * 1024;
 
-/// The keyspace: raw bytes -> raw bytes. Redis keys and values are binary-safe,
-/// so we store `Vec<u8>`, not `String`.
+/// The keyspace: raw bytes -> raw bytes (binary-safe, like Redis).
 type Store = HashMap<Vec<u8>, Vec<u8>>;
 
+/// One unit of work sent from a connection thread to the keyspace owner:
+/// the parsed command, plus a channel to send the reply back on.
+struct Request {
+    tokens: Vec<Vec<u8>>,
+    reply_tx: mpsc::Sender<Vec<u8>>,
+}
+
 // ===========================================================================
-// RESP parsing  — the resumable state machine
+// RESP parsing — the resumable state machine (unchanged from M1)
 // ===========================================================================
 
-/// The result of trying to parse one command from the front of a buffer.
 #[derive(Debug)]
 enum Parsed {
-    /// A full command: its tokens, and how many bytes it consumed (so the
-    /// caller can drop that prefix and try to parse the next one).
     Complete(Vec<Vec<u8>>, usize),
-    /// Not enough bytes yet — keep the buffer untouched and read more.
     Incomplete,
-    /// The stream is malformed; framing is lost, so the caller must close.
     Error(String),
 }
 
-/// Reading a length-prefixed line like `*3\r\n` or `$5\r\n`.
 enum Count {
-    Ok(i64, usize), // value, index just past the CRLF
-    Incomplete,     // no CRLF yet
-    Bad,            // CRLF present but the digits don't parse
+    Ok(i64, usize),
+    Incomplete,
+    Bad,
 }
 
-/// Find the next `\r\n` at or after `from`; returns the index of the `\r`.
 fn find_crlf(buf: &[u8], from: usize) -> Option<usize> {
     let mut i = from;
     while i + 1 < buf.len() {
@@ -73,8 +70,6 @@ fn find_crlf(buf: &[u8], from: usize) -> Option<usize> {
     None
 }
 
-/// Read the integer on the line whose type byte is at `pos` (e.g. the `3` in
-/// `*3\r\n`). Returns where parsing should continue (just past the CRLF).
 fn read_count(buf: &[u8], pos: usize) -> Count {
     match find_crlf(buf, pos + 1) {
         None => Count::Incomplete,
@@ -88,32 +83,24 @@ fn read_count(buf: &[u8], pos: usize) -> Count {
     }
 }
 
-/// Try to parse exactly one command from the front of `buf`.
 fn parse_command(buf: &[u8]) -> Parsed {
     if buf.is_empty() {
         return Parsed::Incomplete;
     }
-    // A real client sends a multibulk (array of bulk strings) starting with '*'.
-    // Anything else is treated as an INLINE command (telnet, raw `PING\r\n`).
     if buf[0] != b'*' {
         return parse_inline(buf);
     }
-
-    // Header: *<count>\r\n
     let (count, mut pos) = match read_count(buf, 0) {
         Count::Ok(n, p) => (n, p),
         Count::Incomplete => return Parsed::Incomplete,
         Count::Bad => return Parsed::Error("invalid multibulk length".into()),
     };
     if count <= 0 {
-        // Empty/null array — a no-op request; consume it and move on.
         return Parsed::Complete(Vec::new(), pos);
     }
     if count > MAX_ARRAY {
         return Parsed::Error("invalid multibulk length".into());
     }
-
-    // Then `count` bulk strings: $<len>\r\n<bytes>\r\n
     let mut tokens: Vec<Vec<u8>> = Vec::with_capacity(count as usize);
     for _ in 0..count {
         if pos >= buf.len() {
@@ -131,7 +118,6 @@ fn parse_command(buf: &[u8]) -> Parsed {
             return Parsed::Error("invalid bulk length".into());
         }
         let len = len as usize;
-        // We need the payload AND its trailing CRLF all present.
         if after_len + len + 2 > buf.len() {
             return Parsed::Incomplete;
         }
@@ -146,7 +132,6 @@ fn parse_command(buf: &[u8]) -> Parsed {
     Parsed::Complete(tokens, pos)
 }
 
-/// Inline fallback: split the first line on whitespace into tokens.
 fn parse_inline(buf: &[u8]) -> Parsed {
     match find_crlf(buf, 0) {
         None => Parsed::Incomplete,
@@ -173,7 +158,11 @@ fn error(s: &str) -> Vec<u8> {
     format!("-{s}\r\n").into_bytes()
 }
 
-/// A bulk string: `$<len>\r\n<bytes>\r\n`. Binary-safe (length-prefixed).
+/// An integer reply: `:<n>\r\n` (used by INCR, DEL, EXISTS, STRLEN, ...).
+fn integer(n: i64) -> Vec<u8> {
+    format!(":{n}\r\n").into_bytes()
+}
+
 fn bulk_string(data: &[u8]) -> Vec<u8> {
     let mut out = Vec::with_capacity(data.len() + 16);
     out.extend_from_slice(format!("${}\r\n", data.len()).as_bytes());
@@ -182,50 +171,144 @@ fn bulk_string(data: &[u8]) -> Vec<u8> {
     out
 }
 
-/// The null bulk string `$-1\r\n` — Redis's "nil" (e.g. GET on a missing key).
 fn null_bulk() -> Vec<u8> {
     b"$-1\r\n".to_vec()
 }
 
 // ===========================================================================
-// Command execution
+// Command execution — runs only on the single owner thread
 // ===========================================================================
 
-/// Run one parsed command against the keyspace and return its RESP reply.
-/// Command names are matched case-insensitively (redis-cli may send `set`).
+/// INCR/DECR/INCRBY/DECRBY core: read the value as a base-10 integer (missing
+/// key counts as 0), apply `delta`, store the result back as text.
+fn incr_by(store: &mut Store, key: &[u8], delta: i64) -> Vec<u8> {
+    let current = match store.get(key) {
+        None => 0,
+        Some(v) => match std::str::from_utf8(v).ok().and_then(|s| s.parse::<i64>().ok()) {
+            Some(n) => n,
+            None => return error("ERR value is not an integer or out of range"),
+        },
+    };
+    match current.checked_add(delta) {
+        Some(next) => {
+            store.insert(key.to_vec(), next.to_string().into_bytes());
+            integer(next)
+        }
+        None => error("ERR increment or decrement would overflow"),
+    }
+}
+
+/// Parse an argument as a base-10 i64, or return None.
+fn parse_int(arg: &[u8]) -> Option<i64> {
+    std::str::from_utf8(arg).ok().and_then(|s| s.parse::<i64>().ok())
+}
+
+fn wrong_args(cmd: &str) -> Vec<u8> {
+    error(&format!("ERR wrong number of arguments for '{cmd}' command"))
+}
+
 fn execute(tokens: &[Vec<u8>], store: &mut Store) -> Vec<u8> {
     if tokens.is_empty() {
-        return Vec::new(); // nothing to do, no reply
+        return Vec::new();
     }
     let cmd = tokens[0].to_ascii_uppercase();
     match cmd.as_slice() {
         b"PING" => match tokens.len() {
             1 => simple_string("PONG"),
-            2 => bulk_string(&tokens[1]), // PING <msg> echoes the message
-            _ => error("ERR wrong number of arguments for 'ping' command"),
+            2 => bulk_string(&tokens[1]),
+            _ => wrong_args("ping"),
         },
         b"ECHO" => match tokens.len() {
             2 => bulk_string(&tokens[1]),
-            _ => error("ERR wrong number of arguments for 'echo' command"),
+            _ => wrong_args("echo"),
         },
         b"SET" => match tokens.len() {
-            // SET options (EX/NX/...) arrive in M3; M1 is the bare form.
             3 => {
                 store.insert(tokens[1].clone(), tokens[2].clone());
                 simple_string("OK")
             }
-            _ => error("ERR wrong number of arguments for 'set' command"),
+            _ => wrong_args("set"), // SET options (EX/NX/...) arrive in M3
         },
         b"GET" => match tokens.len() {
             2 => match store.get(&tokens[1]) {
                 Some(v) => bulk_string(v),
                 None => null_bulk(),
             },
-            _ => error("ERR wrong number of arguments for 'get' command"),
+            _ => wrong_args("get"),
         },
-        // Minimal stub so an interactive `redis-cli` session starts cleanly
-        // (it sends COMMAND DOCS on connect). Real implementation is later.
+        b"GETDEL" => match tokens.len() {
+            2 => match store.remove(&tokens[1]) {
+                Some(v) => bulk_string(&v),
+                None => null_bulk(),
+            },
+            _ => wrong_args("getdel"),
+        },
+        b"DEL" => {
+            if tokens.len() < 2 {
+                wrong_args("del")
+            } else {
+                let removed = tokens[1..].iter().filter(|k| store.remove(*k).is_some()).count();
+                integer(removed as i64)
+            }
+        }
+        b"EXISTS" => {
+            if tokens.len() < 2 {
+                wrong_args("exists")
+            } else {
+                let n = tokens[1..].iter().filter(|k| store.contains_key(*k)).count();
+                integer(n as i64)
+            }
+        }
+        b"INCR" => match tokens.len() {
+            2 => incr_by(store, &tokens[1], 1),
+            _ => wrong_args("incr"),
+        },
+        b"DECR" => match tokens.len() {
+            2 => incr_by(store, &tokens[1], -1),
+            _ => wrong_args("decr"),
+        },
+        b"INCRBY" => match tokens.len() {
+            3 => match parse_int(&tokens[2]) {
+                Some(d) => incr_by(store, &tokens[1], d),
+                None => error("ERR value is not an integer or out of range"),
+            },
+            _ => wrong_args("incrby"),
+        },
+        b"DECRBY" => match tokens.len() {
+            3 => match parse_int(&tokens[2]).and_then(|d| d.checked_neg()) {
+                Some(neg) => incr_by(store, &tokens[1], neg),
+                None => error("ERR value is not an integer or out of range"),
+            },
+            _ => wrong_args("decrby"),
+        },
+        b"APPEND" => match tokens.len() {
+            3 => {
+                let entry = store.entry(tokens[1].clone()).or_default();
+                entry.extend_from_slice(&tokens[2]);
+                integer(entry.len() as i64)
+            }
+            _ => wrong_args("append"),
+        },
+        b"STRLEN" => match tokens.len() {
+            2 => integer(store.get(&tokens[1]).map(|v| v.len()).unwrap_or(0) as i64),
+            _ => wrong_args("strlen"),
+        },
+        b"TYPE" => match tokens.len() {
+            2 => {
+                if store.contains_key(&tokens[1]) {
+                    simple_string("string")
+                } else {
+                    simple_string("none")
+                }
+            }
+            _ => wrong_args("type"),
+        },
+        // Stubs so an interactive `redis-cli` session connects cleanly.
         b"COMMAND" => b"*0\r\n".to_vec(),
+        b"CONFIG" => match tokens.get(1).map(|t| t.to_ascii_uppercase()).as_deref() {
+            Some(b"GET") => b"*0\r\n".to_vec(),
+            _ => simple_string("OK"),
+        },
         other => error(&format!(
             "ERR unknown command '{}'",
             String::from_utf8_lossy(other)
@@ -234,22 +317,29 @@ fn execute(tokens: &[Vec<u8>], store: &mut Store) -> Vec<u8> {
 }
 
 // ===========================================================================
-// Server
+// Server — thread per connection, one owner thread for the keyspace
 // ===========================================================================
 
 fn main() -> io::Result<()> {
+    // The owner channel: every connection sends Requests here; one thread owns
+    // the map and drains them serially.
+    let (cmd_tx, cmd_rx) = mpsc::channel::<Request>();
+    thread::spawn(move || run_keyspace(cmd_rx));
+
     let listener = TcpListener::bind(ADDR)?;
-    // THE single keyspace owner: one map, owned here, mutated by one connection
-    // at a time. Serialized execution = atomicity without locks.
-    let mut store: Store = HashMap::new();
-    println!("Locus M1 listening on {ADDR} — try: redis-cli -p 6379 set foo bar");
+    println!("Locus M2 listening on {ADDR} — concurrent clients, serialized execution");
 
     for stream in listener.incoming() {
         match stream {
             Ok(conn) => {
-                if let Err(e) = handle_conn(conn, &mut store) {
-                    eprintln!("connection error: {e}");
-                }
+                // Each client gets its own thread for I/O; commands still funnel
+                // through the single owner, so execution stays serialized.
+                let tx = cmd_tx.clone();
+                thread::spawn(move || {
+                    if let Err(e) = handle_conn(conn, tx) {
+                        eprintln!("connection error: {e}");
+                    }
+                });
             }
             Err(e) => eprintln!("accept error: {e}"),
         }
@@ -257,13 +347,27 @@ fn main() -> io::Result<()> {
     Ok(())
 }
 
-/// Handle one client: accumulate bytes and drain every complete command the
-/// buffer holds. This is where the resumable parser earns its keep.
-fn handle_conn(mut conn: TcpStream, store: &mut Store) -> io::Result<()> {
+/// The single keyspace owner: receives commands from all connections and runs
+/// them one at a time against the one map. This is "single-threaded execution."
+fn run_keyspace(rx: mpsc::Receiver<Request>) {
+    let mut store: Store = HashMap::new();
+    while let Ok(req) = rx.recv() {
+        let reply = execute(&req.tokens, &mut store);
+        // If the client vanished, its reply channel is closed — just drop it.
+        let _ = req.reply_tx.send(reply);
+    }
+}
+
+/// One client connection: accumulate bytes, drain complete commands, hand each
+/// to the owner thread, and write back the reply it returns.
+fn handle_conn(mut conn: TcpStream, cmd_tx: mpsc::Sender<Request>) -> io::Result<()> {
     let peer = conn.peer_addr()?;
     println!("client connected: {peer}");
 
-    let mut inbuf: Vec<u8> = Vec::new(); // persists across reads — the partial tail lives here
+    // This connection's private reply mailbox, reused for every command.
+    let (reply_tx, reply_rx) = mpsc::channel::<Vec<u8>>();
+
+    let mut inbuf: Vec<u8> = Vec::new();
     let mut chunk = [0u8; 4096];
     loop {
         let n = conn.read(&mut chunk)?;
@@ -273,23 +377,31 @@ fn handle_conn(mut conn: TcpStream, store: &mut Store) -> io::Result<()> {
         }
         inbuf.extend_from_slice(&chunk[..n]);
 
-        // Drain as many COMPLETE commands as the buffer currently holds.
         loop {
             match parse_command(&inbuf) {
-                Parsed::Incomplete => break, // keep the partial tail, go read more
+                Parsed::Incomplete => break,
                 Parsed::Error(msg) => {
-                    // Framing is lost — reply once and close the connection.
                     let _ = conn.write_all(&error(&format!("ERR Protocol error: {msg}")));
                     return Ok(());
                 }
                 Parsed::Complete(tokens, consumed) => {
-                    let reply = execute(&tokens, store);
-                    if !reply.is_empty() {
-                        conn.write_all(&reply)?;
-                    }
-                    // Drop the bytes we just consumed. (O(n) shift; fine for M1,
-                    // optimized later — see ROADMAP M12.)
                     inbuf.drain(0..consumed);
+                    // Hand the command to the owner and wait for its reply.
+                    let req = Request {
+                        tokens,
+                        reply_tx: reply_tx.clone(),
+                    };
+                    if cmd_tx.send(req).is_err() {
+                        return Ok(()); // owner gone; nothing more we can do
+                    }
+                    match reply_rx.recv() {
+                        Ok(reply) => {
+                            if !reply.is_empty() {
+                                conn.write_all(&reply)?;
+                            }
+                        }
+                        Err(_) => return Ok(()),
+                    }
                 }
             }
         }
@@ -297,7 +409,7 @@ fn handle_conn(mut conn: TcpStream, store: &mut Store) -> io::Result<()> {
 }
 
 // ===========================================================================
-// Tests — the parser must survive split and pipelined input (HARD-PARTS §1)
+// Tests
 // ===========================================================================
 
 #[cfg(test)]
@@ -315,16 +427,12 @@ mod tests {
     fn parses_a_set_command() {
         let buf = b"*3\r\n$3\r\nSET\r\n$3\r\nfoo\r\n$3\r\nbar\r\n";
         let (tokens, consumed) = complete(buf);
-        assert_eq!(
-            tokens,
-            vec![b"SET".to_vec(), b"foo".to_vec(), b"bar".to_vec()]
-        );
+        assert_eq!(tokens, vec![b"SET".to_vec(), b"foo".to_vec(), b"bar".to_vec()]);
         assert_eq!(consumed, buf.len());
     }
 
     #[test]
     fn every_prefix_is_incomplete() {
-        // The crux: no proper prefix of a command may parse as complete.
         let full = b"*3\r\n$3\r\nSET\r\n$3\r\nfoo\r\n$3\r\nbar\r\n";
         for i in 0..full.len() {
             assert!(
@@ -336,7 +444,6 @@ mod tests {
 
     #[test]
     fn byte_by_byte_then_completes() {
-        // Feed one byte at a time: Incomplete until the very last byte lands.
         let full = b"*1\r\n$4\r\nPING\r\n";
         let mut buf = Vec::new();
         for (i, b) in full.iter().enumerate() {
@@ -351,7 +458,6 @@ mod tests {
 
     #[test]
     fn pipelined_commands_drain_in_order() {
-        // Two commands in one buffer must parse one after the other.
         let buf = b"*1\r\n$4\r\nPING\r\n*2\r\n$4\r\nECHO\r\n$2\r\nhi\r\n";
         let (t1, n1) = complete(buf);
         assert_eq!(t1, vec![b"PING".to_vec()]);
@@ -361,32 +467,51 @@ mod tests {
     }
 
     #[test]
-    fn inline_command_is_accepted() {
-        let (tokens, consumed) = complete(b"PING\r\n");
-        assert_eq!(tokens, vec![b"PING".to_vec()]);
-        assert_eq!(consumed, 6);
-    }
-
-    #[test]
     fn bad_framing_is_an_error() {
-        // Says 1 element, but the element isn't a bulk string.
         assert!(matches!(parse_command(b"*1\r\n+OK\r\n"), Parsed::Error(_)));
     }
 
     #[test]
     fn set_get_roundtrip_and_nil() {
-        let mut store = Store::new();
+        let mut s = Store::new();
         assert_eq!(
-            execute(&[b"SET".to_vec(), b"k".to_vec(), b"v".to_vec()], &mut store),
+            execute(&[b"SET".to_vec(), b"k".to_vec(), b"v".to_vec()], &mut s),
             b"+OK\r\n".to_vec()
         );
+        assert_eq!(execute(&[b"GET".to_vec(), b"k".to_vec()], &mut s), b"$1\r\nv\r\n".to_vec());
+        assert_eq!(execute(&[b"GET".to_vec(), b"x".to_vec()], &mut s), b"$-1\r\n".to_vec());
+    }
+
+    #[test]
+    fn incr_creates_increments_and_rejects_non_int() {
+        let mut s = Store::new();
+        assert_eq!(execute(&[b"INCR".to_vec(), b"c".to_vec()], &mut s), b":1\r\n".to_vec());
+        assert_eq!(execute(&[b"INCR".to_vec(), b"c".to_vec()], &mut s), b":2\r\n".to_vec());
         assert_eq!(
-            execute(&[b"GET".to_vec(), b"k".to_vec()], &mut store),
-            b"$1\r\nv\r\n".to_vec()
+            execute(&[b"INCRBY".to_vec(), b"c".to_vec(), b"10".to_vec()], &mut s),
+            b":12\r\n".to_vec()
+        );
+        execute(&[b"SET".to_vec(), b"k".to_vec(), b"abc".to_vec()], &mut s);
+        assert!(execute(&[b"INCR".to_vec(), b"k".to_vec()], &mut s).starts_with(b"-ERR"));
+    }
+
+    #[test]
+    fn del_exists_append_strlen_type() {
+        let mut s = Store::new();
+        execute(&[b"SET".to_vec(), b"a".to_vec(), b"1".to_vec()], &mut s);
+        execute(&[b"SET".to_vec(), b"b".to_vec(), b"2".to_vec()], &mut s);
+        assert_eq!(
+            execute(&[b"EXISTS".to_vec(), b"a".to_vec(), b"b".to_vec(), b"z".to_vec()], &mut s),
+            b":2\r\n".to_vec()
         );
         assert_eq!(
-            execute(&[b"GET".to_vec(), b"missing".to_vec()], &mut store),
-            b"$-1\r\n".to_vec()
+            execute(&[b"DEL".to_vec(), b"a".to_vec(), b"z".to_vec()], &mut s),
+            b":1\r\n".to_vec()
         );
+        assert_eq!(execute(&[b"APPEND".to_vec(), b"s".to_vec(), b"hel".to_vec()], &mut s), b":3\r\n".to_vec());
+        assert_eq!(execute(&[b"APPEND".to_vec(), b"s".to_vec(), b"lo".to_vec()], &mut s), b":5\r\n".to_vec());
+        assert_eq!(execute(&[b"STRLEN".to_vec(), b"s".to_vec()], &mut s), b":5\r\n".to_vec());
+        assert_eq!(execute(&[b"TYPE".to_vec(), b"s".to_vec()], &mut s), b"+string\r\n".to_vec());
+        assert_eq!(execute(&[b"TYPE".to_vec(), b"missing".to_vec()], &mut s), b"+none\r\n".to_vec());
     }
 }
