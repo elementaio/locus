@@ -62,9 +62,12 @@ Compact, mergeable summaries. First up: a Bloom filter for dedup / set membershi
 | `BFADD key item` | add an item → `1` if probably new, `0` if probably already seen |
 | `BFEXISTS key item` | `1` if probably present, `0` if **definitely** absent (no false negatives) |
 | `BFLOAD key k nbits bits` | restore raw bits (used by AOF rewrite / replication) |
+| `CMSINCRBY key item count [item count ...]` | Count-Min: add to frequencies → new estimate per item |
+| `CMSQUERY key item [item ...]` | estimated frequency per item (over-estimate, never under) |
+| `CMSLOAD key width depth bytes` | restore raw counters (AOF rewrite / replication) |
 
-Auto-sized on first `BFADD` (≈10k items at 1% false-positive rate); persists via RDB/AOF.
-(Count-Min, Top-K, and t-digest are the next sketches.)
+Auto-sized on first add (Bloom ≈10k @ 1% FPR; CMS 2000×5); persist via RDB/AOF.
+(Top-K and t-digest are the next sketches.)
 
 ## Conditional writes (CAS family)
 

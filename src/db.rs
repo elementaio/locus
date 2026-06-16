@@ -32,6 +32,8 @@ pub enum Value {
     Geo(f64, f64),
     /// A Bloom filter (probabilistic set membership / dedup).
     Bloom(crate::sketch::Bloom),
+    /// A Count-Min sketch (probabilistic frequency / "trending").
+    Cms(crate::sketch::Cms),
 }
 
 /// A stream entry id: (milliseconds, sequence).
@@ -66,6 +68,7 @@ impl Value {
             Value::Stream(_) => "stream",
             Value::Geo(..) => "geo",
             Value::Bloom(_) => "bloom",
+            Value::Cms(_) => "cms",
         }
     }
 
@@ -76,7 +79,7 @@ impl Value {
             Value::Set(s) => s.is_empty(),
             Value::ZSet(z) => z.is_empty(),
             Value::Stream(s) => s.entries.is_empty(),
-            Value::Str(_) | Value::Geo(..) | Value::Bloom(_) => false,
+            Value::Str(_) | Value::Geo(..) | Value::Bloom(_) | Value::Cms(_) => false,
         }
     }
 }
@@ -354,6 +357,7 @@ fn estimate_size(key_len: usize, v: &Value) -> usize {
             .sum(),
         Value::Geo(..) => 16, // two f64
         Value::Bloom(b) => b.bits.len(),
+        Value::Cms(c) => c.counters.len() * 4,
     };
     KEY_OVH + key_len + val
 }

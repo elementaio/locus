@@ -321,6 +321,22 @@ fn bloom_filter_dedup() {
     assert_eq!(c.cmd(&["TYPE", "seen"]), "bloom");
 }
 
+#[test]
+fn count_min_trending() {
+    let s = Server::start();
+    let mut c = s.connect();
+    assert_eq!(c.cmd(&["CMSINCRBY", "trend", "rust", "5"]), "[5]");
+    assert_eq!(
+        c.cmd(&["CMSINCRBY", "trend", "rust", "2", "go", "1"]),
+        "[7, 1]"
+    );
+    assert_eq!(
+        c.cmd(&["CMSQUERY", "trend", "rust", "go", "zig"]),
+        "[7, 1, 0]"
+    );
+    assert_eq!(c.cmd(&["TYPE", "trend"]), "cms");
+}
+
 // === geo ====================================================================
 
 #[test]

@@ -147,6 +147,9 @@ pub fn execute(tokens: &[Vec<u8>], db: &mut Db) -> Vec<u8> {
         b"BFADD" => bfadd_cmd(db, tokens),
         b"BFEXISTS" => bfexists_cmd(db, tokens),
         b"BFLOAD" => bfload_cmd(db, tokens),
+        b"CMSINCRBY" => cmsincrby_cmd(db, tokens),
+        b"CMSQUERY" => cmsquery_cmd(db, tokens),
+        b"CMSLOAD" => cmsload_cmd(db, tokens),
         // bitmaps
         b"SETBIT" => setbit_cmd(db, tokens),
         b"GETBIT" => getbit_cmd(db, tokens),
@@ -292,7 +295,7 @@ pub fn command_meta(cmd: &[u8]) -> Option<CmdMeta> {
         b"LINDEX" | b"HGET" | b"HEXISTS" | b"HMGET" | b"SISMEMBER" | b"SMISMEMBER" | b"ZSCORE"
         | b"ZMSCORE" | b"ZRANK" | b"ZREVRANK" | b"PUBLISH" | b"REPLICAOF" | b"SLAVEOF"
         | b"LPOS" | b"SINTERCARD" | b"GETBIT" | b"BITPOS" | b"CDCGROUP" | b"CDCREADGROUP"
-        | b"CDCACK" | b"GEODIST" | b"BFEXISTS" => (3, false),
+        | b"CDCACK" | b"GEODIST" | b"BFEXISTS" | b"CMSQUERY" => (3, false),
         // arity 3 writes
         b"INCRBY" | b"DECRBY" | b"APPEND" | b"HDEL" | b"SADD" | b"SREM" | b"ZREM" | b"EXPIRE"
         | b"PEXPIRE" | b"EXPIREAT" | b"PEXPIREAT" | b"LPUSH" | b"RPUSH" | b"LPUSHX" | b"RPUSHX"
@@ -306,9 +309,9 @@ pub fn command_meta(cmd: &[u8]) -> Option<CmdMeta> {
         b"LSET" | b"HSET" | b"HSETNX" | b"HINCRBY" | b"ZADD" | b"ZINCRBY" | b"SETEX"
         | b"PSETEX" | b"SETRANGE" | b"LREM" | b"LTRIM" | b"SMOVE" | b"ZREMRANGEBYRANK"
         | b"ZREMRANGEBYSCORE" | b"ZUNIONSTORE" | b"ZINTERSTORE" | b"SETBIT" | b"BITOP"
-        | b"GEOSET" | b"CAS" | b"INCRCAP" => (4, true),
+        | b"GEOSET" | b"CAS" | b"INCRCAP" | b"CMSINCRBY" => (4, true),
         // arity 5 writes
-        b"XADD" | b"LINSERT" | b"LMOVE" | b"BFLOAD" => (5, true),
+        b"XADD" | b"LINSERT" | b"LMOVE" | b"BFLOAD" | b"CMSLOAD" => (5, true),
         // geosearch: GEOSEARCH FROMKEY k BYRADIUS r unit (6) is the shortest form
         b"GEOSEARCH" => (6, false),
         _ => return None,
@@ -1655,6 +1658,75 @@ fn bfload_cmd(db: &mut Db, tokens: &[Vec<u8>]) -> Vec<u8> {
         Value::Bloom(crate::sketch::Bloom::from_raw(k, nbits, bits)),
     );
     simple_string("OK")
+}
+
+// === sketches: Count-Min ====================================================
+
+fn cmsincrby_cmd(db: &mut Db, tokens: &[Vec<u8>]) -> Vec<u8> {
+    // CMSINCRBY key item count [item count ...]
+    let pairs = &tokens[2..];
+    if tokens.len() < 4 || !pairs.len().is_multiple_of(2) {
+        return wrong_args("cmsincrby");
+    }
+    // Validate all counts up front so a bad arg doesn't half-apply.
+    let mut parsed: Vec<(&Vec<u8>, u32)> = Vec::with_capacity(pairs.len() / 2);
+    for kv in pairs.chunks_exact(2) {
+        match parse_int(&kv[1]) {
+            Some(c) if (0..=u32::MAX as i64).contains(&c) => parsed.push((&kv[0], c as u32)),
+            _ => return error("ERR CMSINCRBY: count must be a non-negative integer"),
+        }
+    }
+    let cms = match db.get_or_insert_with(&tokens[1], || {
+        Value::Cms(crate::sketch::Cms::default_sketch())
+    }) {
+        Value::Cms(c) => c,
+        _ => return wrongtype(),
+    };
+    let out: Vec<Vec<u8>> = parsed
+        .iter()
+        .map(|(item, count)| integer(cms.incr(item, *count) as i64))
+        .collect();
+    array(&out)
+}
+
+fn cmsquery_cmd(db: &mut Db, tokens: &[Vec<u8>]) -> Vec<u8> {
+    if tokens.len() < 3 {
+        return wrong_args("cmsquery");
+    }
+    match db.get(&tokens[1]) {
+        None => array(&tokens[2..].iter().map(|_| integer(0)).collect::<Vec<_>>()),
+        Some(Value::Cms(c)) => array(
+            &tokens[2..]
+                .iter()
+                .map(|it| integer(c.query(it) as i64))
+                .collect::<Vec<_>>(),
+        ),
+        Some(_) => wrongtype(),
+    }
+}
+
+/// CMSLOAD key width depth bytes — restore a Count-Min from raw counters (used
+/// by AOF rewrite / replication).
+fn cmsload_cmd(db: &mut Db, tokens: &[Vec<u8>]) -> Vec<u8> {
+    if tokens.len() != 5 {
+        return wrong_args("cmsload");
+    }
+    let parse_u32 = |b: &[u8]| {
+        std::str::from_utf8(b)
+            .ok()
+            .and_then(|s| s.parse::<u32>().ok())
+    };
+    let (width, depth) = match (parse_u32(&tokens[2]), parse_u32(&tokens[3])) {
+        (Some(w), Some(d)) if w > 0 && d > 0 => (w, d),
+        _ => return error("ERR invalid CMS dimensions"),
+    };
+    match crate::sketch::Cms::from_bytes(width, depth, &tokens[4]) {
+        Some(cms) => {
+            db.insert(tokens[1].clone(), Value::Cms(cms));
+            simple_string("OK")
+        }
+        None => error("ERR CMS counters length mismatch"),
+    }
 }
 
 // === hashes =================================================================
@@ -3803,6 +3875,33 @@ mod tests {
     }
 
     #[test]
+    fn count_min_sketch_commands() {
+        let mut db = Db::new();
+        // increments return the running (over-)estimate
+        assert_eq!(
+            cmd(&mut db, &[b"CMSINCRBY", b"trend", b"a", b"3"]),
+            array(&[integer(3)])
+        );
+        assert_eq!(
+            cmd(&mut db, &[b"CMSINCRBY", b"trend", b"a", b"2", b"b", b"5"]),
+            array(&[integer(5), integer(5)])
+        );
+        // query estimates (never under the true count)
+        let q = cmd(&mut db, &[b"CMSQUERY", b"trend", b"a", b"b", b"missing"]);
+        assert_eq!(q, array(&[integer(5), integer(5), integer(0)]));
+        assert_eq!(cmd(&mut db, &[b"TYPE", b"trend"]), b"+cms\r\n".to_vec());
+        // query on a missing key -> zeros
+        assert_eq!(
+            cmd(&mut db, &[b"CMSQUERY", b"nope", b"x"]),
+            array(&[integer(0)])
+        );
+        // WRONGTYPE
+        cmd(&mut db, &[b"SET", b"s", b"x"]);
+        assert!(cmd(&mut db, &[b"CMSINCRBY", b"s", b"a", b"1"]).starts_with(b"-WRONGTYPE"));
+        assert!(cmd(&mut db, &[b"CMSQUERY", b"s", b"a"]).starts_with(b"-WRONGTYPE"));
+    }
+
+    #[test]
     fn command_table_write_set_is_exact() {
         // The exact set of write commands. A change here is a deliberate decision,
         // not an accident — guards the AOF/replication write-detection.
@@ -3874,6 +3973,8 @@ mod tests {
             b"GEOSET",
             b"BFADD",
             b"BFLOAD",
+            b"CMSINCRBY",
+            b"CMSLOAD",
             b"XADD",
         ];
         for w in writes {
@@ -3898,6 +3999,7 @@ mod tests {
             b"GEODIST".as_slice(),
             b"GEOSEARCH".as_slice(),
             b"BFEXISTS".as_slice(),
+            b"CMSQUERY".as_slice(),
             b"SRANDMEMBER".as_slice(),
             b"RANDOMKEY".as_slice(),
             b"SMEMBERS".as_slice(),

@@ -63,6 +63,7 @@ fn write_value<W: Write>(w: &mut W, key: &[u8], v: &Value) -> io::Result<()> {
         Value::Stream(_) => 5,
         Value::Geo(..) => 6,
         Value::Bloom(_) => 7,
+        Value::Cms(_) => 8,
     };
     w.write_all(&[tag])?;
     write_bytes(w, key)?;
@@ -116,6 +117,11 @@ fn write_value<W: Write>(w: &mut W, key: &[u8], v: &Value) -> io::Result<()> {
             w.write_all(&[b.k])?;
             w.write_all(&b.nbits.to_le_bytes())?;
             write_bytes(w, &b.bits)?;
+        }
+        Value::Cms(c) => {
+            w.write_all(&c.width.to_le_bytes())?;
+            w.write_all(&c.depth.to_le_bytes())?;
+            write_bytes(w, &c.to_bytes())?;
         }
     }
     Ok(())
@@ -257,6 +263,14 @@ fn read_value<R: Read>(r: &mut R, tag: u8) -> io::Result<Value> {
             let bits = read_bytes(r)?;
             Value::Bloom(crate::sketch::Bloom::from_raw(k, nbits, bits))
         }
+        8 => {
+            let width = read_u32(r)? as u32;
+            let depth = read_u32(r)? as u32;
+            let bytes = read_bytes(r)?;
+            let cms = crate::sketch::Cms::from_bytes(width, depth, &bytes)
+                .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "bad CMS"))?;
+            Value::Cms(cms)
+        }
         _ => {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidData,
@@ -315,6 +329,7 @@ mod tests {
         run(&mut db, &[b"SET", b"e", b"v", b"EX", b"1000"]);
         run(&mut db, &[b"GEOSET", b"g", b"13.361389", b"38.115556"]);
         run(&mut db, &[b"BFADD", b"bf", b"alice"]);
+        run(&mut db, &[b"CMSINCRBY", b"cm", b"x", b"7"]);
 
         save(&db, path).unwrap();
         let mut loaded = load(path).unwrap();
@@ -350,6 +365,10 @@ mod tests {
         assert_eq!(
             execute(&to(&[b"BFEXISTS", b"bf", b"alice"]), &mut loaded),
             b":1\r\n".to_vec()
+        );
+        assert_eq!(
+            execute(&to(&[b"CMSQUERY", b"cm", b"x"]), &mut loaded),
+            b"*1\r\n:7\r\n".to_vec()
         );
         let _ = fs::remove_file(path);
     }
