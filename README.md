@@ -116,6 +116,7 @@ Locus is configured entirely through environment variables (minimal config by de
 
 | Variable | Default | Meaning |
 |---|---|---|
+| `LOCUS_BIND` | `127.0.0.1` | Interface to bind. Defaults to loopback (no AUTH/TLS — don't expose by accident); the Docker image sets `0.0.0.0` |
 | `LOCUS_PORT` | `6379` | TCP port to listen on |
 | `LOCUS_RDB` | `locus.rdb` | RDB snapshot file path |
 | `LOCUS_AOF` | _(off)_ | Set to a path (or `1`) to enable append-only persistence |

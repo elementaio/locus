@@ -9,8 +9,9 @@ RUN cargo build --release && strip target/release/locus
 
 FROM scratch
 COPY --from=build /src/target/release/locus /locus
-# RESP port. Override host/port/persistence via env (see README).
-ENV LOCUS_PORT=6379
+# Listen on all interfaces so a published port (-p) is reachable; the binary
+# defaults to 127.0.0.1 when run directly. RESP on 6379.
+ENV LOCUS_BIND=0.0.0.0 LOCUS_PORT=6379
 EXPOSE 6379
 # Default RDB path is ./locus.rdb (CWD = /). Mount a volume and set LOCUS_RDB
 # for persistence across restarts, e.g. -v locus-data:/data -e LOCUS_RDB=/data/locus.rdb

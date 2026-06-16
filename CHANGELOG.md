@@ -14,6 +14,12 @@ mergeable probabilistic sketches, conditional-write verbs, and an auto-maintaine
 plus transaction-correctness fixes and `maxmemory` eviction. Still pre-1.0 and not production-hardened
 (no AUTH/TLS; bind to a trusted network).
 
+### Added (distribution)
+- **`LOCUS_BIND`** — configurable listen interface (default `127.0.0.1`, so Locus isn't exposed by
+  accident given it has no AUTH/TLS). An official **Docker image** (`ghcr.io/intenttext/locus`, sets
+  `LOCUS_BIND=0.0.0.0`) and **prebuilt static binaries** (Linux/macOS, x86_64/arm64) are now published
+  per release.
+
 ### Added (sketches — mergeable probabilistic summaries)
 - **Bloom filter** `BFADD` / `BFEXISTS` (+ internal `BFLOAD` for AOF rewrite/replication) — dedup /
   set membership ("seen this id?"). Zero-deps (std `DefaultHasher` + double hashing), auto-sized, RDB/AOF

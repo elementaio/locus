@@ -58,7 +58,11 @@ fn main() -> io::Result<()> {
     thread::spawn(move || run_hub(rx, hub_tx));
 
     let port = std::env::var("LOCUS_PORT").unwrap_or_else(|_| "6379".to_string());
-    let listener = TcpListener::bind(format!("127.0.0.1:{port}"))?;
+    // Bind to loopback by default (Locus has no AUTH/TLS — don't expose it by
+    // accident). Set LOCUS_BIND=0.0.0.0 to listen on all interfaces, as the
+    // Docker image does so a published port is reachable.
+    let bind = std::env::var("LOCUS_BIND").unwrap_or_else(|_| "127.0.0.1".to_string());
+    let listener = TcpListener::bind(format!("{bind}:{port}"))?;
     // Print the ACTUAL bound address (port may be OS-assigned when LOCUS_PORT=0).
     println!("Locus listening on {}", listener.local_addr()?);
 
