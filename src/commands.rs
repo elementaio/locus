@@ -2593,7 +2593,7 @@ fn zstore_cmd(db: &mut Db, tokens: &[Vec<u8>], inter: bool) -> Vec<u8> {
 
 const EARTH_R_M: f64 = 6_372_797.560_856; // Redis's earth radius, in meters
 
-fn geo_unit(u: &[u8]) -> Option<f64> {
+pub fn geo_unit(u: &[u8]) -> Option<f64> {
     match u.to_ascii_lowercase().as_slice() {
         b"m" => Some(1.0),
         b"km" => Some(1000.0),
@@ -2603,8 +2603,8 @@ fn geo_unit(u: &[u8]) -> Option<f64> {
     }
 }
 
-/// Great-circle distance in meters (haversine).
-fn haversine_m(lon1: f64, lat1: f64, lon2: f64, lat2: f64) -> f64 {
+/// Great-circle distance in meters (haversine). Also used by the region changefeed.
+pub fn haversine_m(lon1: f64, lat1: f64, lon2: f64, lat2: f64) -> f64 {
     let (p1, p2) = (lat1.to_radians(), lat2.to_radians());
     let dlat = (lat2 - lat1).to_radians();
     let dlon = (lon2 - lon1).to_radians();

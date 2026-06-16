@@ -102,8 +102,8 @@ struct Hub {
     protos: HashMap<u64, u8>,
     // soft memory cap (bytes); None = unlimited
     maxmemory: Option<usize>,
-    // changefeed subscribers: client id -> key prefix (empty = all keys)
-    changefeeds: HashMap<u64, Vec<u8>>,
+    // changefeed subscribers: client id -> filter (key prefix or geo region)
+    changefeeds: HashMap<u64, CdcFilter>,
     // retained change-log (for CDCREAD catch-up); empty/unused when maxlen == 0
     cdc_log: VecDeque<ChangeRecord>,
     cdc_next_offset: u64,
@@ -118,6 +118,19 @@ struct ChangeRecord {
     event: Vec<u8>, // "write" | "del" | "expire"
     key: Vec<u8>,
     value: Option<Vec<u8>>, // new value for string writes; None otherwise
+}
+
+/// What a changefeed subscriber wants: keys under a prefix, or geo keys inside a
+/// circular region (live geofencing). A region tracks its current members so it
+/// can emit enter (`write`) and leave (`del`) transitions.
+enum CdcFilter {
+    Prefix(Vec<u8>),
+    Region {
+        lon: f64,
+        lat: f64,
+        radius_m: f64,
+        members: HashSet<Vec<u8>>,
+    },
 }
 
 /// A changefeed consumer group: a shared cursor over the log plus a pending list
@@ -521,13 +534,18 @@ impl Hub {
         }
     }
 
-    /// CDCSUBSCRIBE [prefix] — enter changefeed push mode: send an atomic
-    /// snapshot of the matching keyspace, then live-stream every matching change.
-    /// Snapshot + registration happen in this single hub turn, so no change can
-    /// slip between them (no gap, no dup) — that's the single-thread guarantee.
+    /// CDCSUBSCRIBE [prefix] | CDCSUBSCRIBE REGION <lon> <lat> <radius> <unit>
+    /// — enter changefeed push mode: send an atomic snapshot of the matching
+    /// keyspace, then live-stream every matching change. Snapshot + registration
+    /// happen in one hub turn, so no change can slip between them (no gap/dup).
     fn handle_cdc_subscribe(&mut self, id: u64, tokens: &[Vec<u8>]) {
+        if tokens
+            .get(1)
+            .is_some_and(|t| t.eq_ignore_ascii_case(b"REGION"))
+        {
+            return self.handle_cdc_subscribe_region(id, tokens);
+        }
         let prefix = tokens.get(1).cloned().unwrap_or_default();
-        self.changefeeds.insert(id, prefix.clone());
         let keys: Vec<Vec<u8>> = self
             .db
             .live_keys()
@@ -549,14 +567,77 @@ impl Hub {
                 ]),
             );
         }
-        // The high-water offset tells the subscriber where live changes resume
-        // from, so it can CDCREAD that offset to catch up after a disconnect.
+        self.changefeeds.insert(id, CdcFilter::Prefix(prefix));
+        self.send_snapshot_done(id, n);
+    }
+
+    /// Live geofencing: snapshot the geo keys currently inside the circle, then
+    /// stream enter/move (`write`) and leave (`del`) transitions.
+    fn handle_cdc_subscribe_region(&mut self, id: u64, tokens: &[Vec<u8>]) {
+        // CDCSUBSCRIBE REGION <lon> <lat> <radius> <unit>
+        let parsed = (|| {
+            let lon = std::str::from_utf8(tokens.get(2)?)
+                .ok()?
+                .parse::<f64>()
+                .ok()?;
+            let lat = std::str::from_utf8(tokens.get(3)?)
+                .ok()?
+                .parse::<f64>()
+                .ok()?;
+            let r = std::str::from_utf8(tokens.get(4)?)
+                .ok()?
+                .parse::<f64>()
+                .ok()?;
+            let unit = commands::geo_unit(tokens.get(5)?)?;
+            Some((lon, lat, r * unit))
+        })();
+        let (lon, lat, radius_m) = match parsed {
+            Some(p) if tokens.len() == 6 => p,
+            _ => return self.send(id, resp::error("ERR syntax error")),
+        };
+        let mut members = HashSet::new();
+        let mut n = 0;
+        for k in self.db.geo_keys() {
+            let point = match self.db.get(&k) {
+                Some(Value::Geo(klon, klat)) => Some((*klon, *klat)),
+                _ => None,
+            };
+            if let Some((klon, klat)) = point
+                && commands::haversine_m(lon, lat, klon, klat) <= radius_m
+            {
+                self.send(
+                    id,
+                    resp::array(&[
+                        resp::bulk_string(b"cdc-snapshot"),
+                        resp::bulk_string(&k),
+                        resp::bulk_string(format!("{klon},{klat}").as_bytes()),
+                    ]),
+                );
+                members.insert(k);
+                n += 1;
+            }
+        }
+        self.changefeeds.insert(
+            id,
+            CdcFilter::Region {
+                lon,
+                lat,
+                radius_m,
+                members,
+            },
+        );
+        self.send_snapshot_done(id, n);
+    }
+
+    /// `snapshot-done` carries the count and the high-water offset, so a dropped
+    /// subscriber can CDCREAD that offset to catch up before resubscribing.
+    fn send_snapshot_done(&self, id: u64, count: usize) {
         let hwm = self.cdc_next_offset.saturating_sub(1);
         self.send(
             id,
             resp::array(&[
                 resp::bulk_string(b"cdc-snapshot-done"),
-                resp::integer(n as i64),
+                resp::integer(count as i64),
                 resp::integer(hwm as i64),
             ]),
         );
@@ -589,10 +670,16 @@ impl Hub {
                 resp::bulk_string(key),
                 val,
             ]);
-            for (cid, prefix) in &self.changefeeds {
-                if key.starts_with(prefix) {
-                    self.send(*cid, msg.clone());
+            let mut has_region = false;
+            for (cid, filter) in &self.changefeeds {
+                match filter {
+                    CdcFilter::Prefix(p) if key.starts_with(p) => self.send(*cid, msg.clone()),
+                    CdcFilter::Prefix(_) => {}
+                    CdcFilter::Region { .. } => has_region = true,
                 }
+            }
+            if has_region {
+                self.push_region_changes(key, offset);
             }
         }
         if self.cdc_maxlen > 0 {
@@ -604,6 +691,74 @@ impl Hub {
             });
             while self.cdc_log.len() > self.cdc_maxlen {
                 self.cdc_log.pop_front();
+            }
+        }
+    }
+
+    /// Emit enter/leave transitions to region (geofence) subscribers for a key
+    /// that just changed. Enter/move -> `write` with `"lon,lat"`; a key that left
+    /// the circle (moved out, deleted, or expired) -> `del`.
+    fn push_region_changes(&mut self, key: &[u8], offset: u64) {
+        let point = match self.db.get(key) {
+            Some(Value::Geo(lon, lat)) => Some((*lon, *lat)),
+            _ => None,
+        };
+        let ids: Vec<u64> = self
+            .changefeeds
+            .iter()
+            .filter(|(_, f)| matches!(f, CdcFilter::Region { .. }))
+            .map(|(id, _)| *id)
+            .collect();
+        for cid in ids {
+            // Decide the transition under a short mutable borrow, then send.
+            let action = {
+                let Some(CdcFilter::Region {
+                    lon,
+                    lat,
+                    radius_m,
+                    members,
+                }) = self.changefeeds.get_mut(&cid)
+                else {
+                    continue;
+                };
+                let inside = point
+                    .is_some_and(|(kl, ka)| commands::haversine_m(*lon, *lat, kl, ka) <= *radius_m);
+                let was = members.contains(key);
+                if inside {
+                    members.insert(key.to_vec());
+                    Some(true) // enter or move-within
+                } else if was {
+                    members.remove(key);
+                    Some(false) // left the region
+                } else {
+                    None
+                }
+            };
+            match action {
+                Some(true) => {
+                    let (kl, ka) = point.unwrap();
+                    self.send(
+                        cid,
+                        resp::array(&[
+                            resp::bulk_string(b"cdc-change"),
+                            resp::integer(offset as i64),
+                            resp::bulk_string(b"write"),
+                            resp::bulk_string(key),
+                            resp::bulk_string(format!("{kl},{ka}").as_bytes()),
+                        ]),
+                    );
+                }
+                Some(false) => self.send(
+                    cid,
+                    resp::array(&[
+                        resp::bulk_string(b"cdc-change"),
+                        resp::integer(offset as i64),
+                        resp::bulk_string(b"del"),
+                        resp::bulk_string(key),
+                        resp::null_bulk(),
+                    ]),
+                ),
+                None => {}
             }
         }
     }

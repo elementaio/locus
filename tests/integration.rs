@@ -521,6 +521,46 @@ fn changefeed_consumer_groups() {
     assert_eq!(g.cmd(&["CDCGROUP", "DESTROY", "grp"]), "0");
 }
 
+#[test]
+fn changefeed_region_geofencing() {
+    let s = Server::start();
+    let mut w = s.connect();
+    w.cmd(&["GEOSET", "in1", "0.0", "0.0"]); // at the region center
+    w.cmd(&["GEOSET", "out1", "10.0", "10.0"]); // ~1500 km away
+
+    let mut feed = s.connect();
+    feed.send(&["CDCSUBSCRIBE", "REGION", "0", "0", "50", "km"]);
+    // Snapshot: only the in-region object, then the done marker.
+    let snap = feed.read_reply();
+    assert!(
+        snap.contains("cdc-snapshot") && snap.contains("in1"),
+        "snap: {snap}"
+    );
+    assert_eq!(feed.read_reply(), "[cdc-snapshot-done, 1, 0]");
+
+    // A new object enters the circle -> write.
+    w.cmd(&["GEOSET", "in2", "0.1", "0.1"]); // ~15 km from center
+    let enter = feed.read_reply();
+    assert!(
+        enter.contains("cdc-change") && enter.contains("write") && enter.contains("in2"),
+        "enter: {enter}"
+    );
+
+    // A change outside the region is filtered out; moving in1 away -> leave (del).
+    w.cmd(&["GEOSET", "out2", "20", "20"]); // outside -> no message
+    w.cmd(&["GEOSET", "in1", "30", "30"]); // was inside, now far -> leave
+    let leave = feed.read_reply();
+    assert!(
+        leave.contains("cdc-change") && leave.contains("del") && leave.contains("in1"),
+        "leave: {leave}"
+    );
+
+    // Deleting an in-region object -> leave (del).
+    w.cmd(&["DEL", "in2"]);
+    let del = feed.read_reply();
+    assert!(del.contains("del") && del.contains("in2"), "del: {del}");
+}
+
 // === pub/sub ================================================================
 
 #[test]

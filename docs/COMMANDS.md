@@ -120,6 +120,7 @@ single-threaded hub guarantees it). The connection enters push mode (like pub/su
 | Command | Notes |
 |---|---|
 | `CDCSUBSCRIBE [prefix]` | snapshot (`["cdc-snapshot", key, value]` …, then `["cdc-snapshot-done", count, offset]`), then live `["cdc-change", offset, write\|del\|expire, key, value]` |
+| `CDCSUBSCRIBE REGION <lon> <lat> <radius> <unit>` | **live geofencing**: snapshot of geo keys in the circle, then live `write` as keys enter/move and `del` as they leave (move out / delete / expire); change value is `"lon,lat"` |
 | `CDCUNSUBSCRIBE` | leave push mode |
 | `CDCREAD <offset> [COUNT n] [PREFIX p]` | pull retained changes after `offset` (catch-up after a disconnect); each entry `[offset, event, key, value]` |
 | `CDCGROUP CREATE <group> [offset\|$\|0]` / `CDCGROUP DESTROY <group>` | consumer group (load-balanced read mode); `$`/default = only new, `0` = all retained |

@@ -7,6 +7,10 @@ All notable changes to Locus are documented here. The format is based on
 ## [Unreleased]
 
 ### Added (geo — the geo-first differentiator)
+- **Live geofencing** — `CDCSUBSCRIBE REGION <lon> <lat> <radius> <unit>`: an atomic snapshot of the geo
+  keys inside the circle, then a live stream as keys **enter/move** (`write`) and **leave** (`del` — on
+  move-out, delete, or expire). The geo index + changefeed converge: a *region* filter on the per-key
+  feed *is* geofencing. Per-subscriber membership tracking gives proper enter/leave transitions.
 - **Geo commands** `GEOSET`, `GEOPOS`, `GEODIST`, `GEOSEARCH` (`BYRADIUS`/`BYBOX`, `FROMLONLAT`/`FROMKEY`,
   `ASC`/`DESC`, `COUNT`, `WITHCOORD`/`WITHDIST`). Geo-first model: each object is its own key
   (`Value::Geo`), with a geo-key index for search and full RDB/AOF persistence. Haversine distance.
