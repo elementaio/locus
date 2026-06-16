@@ -77,6 +77,19 @@ Compact, mergeable summaries. First up: a Bloom filter for dedup / set membershi
 Auto-sized on first add (Bloom ≈10k @ 1% FPR; CMS 2000×5; TopK k=10; t-digest compression 100);
 persist via RDB/AOF. The full a-la-carte sketch family is in place.
 
+## Secondary index (query by field)
+
+Index a **hash field** so you can query objects by value. Auto-maintained on every write in the same
+hub turn — **no drift, no crash-time GC** (the single-threaded win). In-memory (rebuild with `IDXCREATE`
+after a restart). Equality + lexicographic range; refuses full-text/scoring/query-language by design.
+
+| Command | Notes |
+|---|---|
+| `IDXCREATE name field` | build an index over a hash `field` (scans existing keys, then auto-maintains) |
+| `IDXDROP name` | remove an index → `1`/`0` |
+| `IDXGET name value` | keys whose field == `value` (equality) |
+| `IDXRANGE name min max [COUNT n]` | keys whose field is in `[min, max]` (lexicographic), in field order |
+
 ## Conditional writes (CAS family)
 
 Check-and-write in a single atomic step (no WATCH/Lua needed) — for persist-before-ack, dedup,

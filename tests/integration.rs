@@ -383,6 +383,43 @@ fn count_min_trending() {
     assert_eq!(c.cmd(&["TYPE", "trend"]), "cms");
 }
 
+#[test]
+fn secondary_index_query_by_field() {
+    let s = Server::start();
+    let mut c = s.connect();
+    // objects are hashes
+    c.cmd(&["HSET", "u:1", "city", "NYC", "age", "30"]);
+    c.cmd(&["HSET", "u:2", "city", "LA", "age", "25"]);
+    c.cmd(&["HSET", "u:3", "city", "NYC", "age", "40"]);
+    // index existing data by the "city" field, then equality query
+    assert_eq!(c.cmd(&["IDXCREATE", "by_city", "city"]), "OK");
+    let nyc = c.cmd(&["IDXGET", "by_city", "NYC"]);
+    assert!(
+        nyc.contains("u:1") && nyc.contains("u:3") && !nyc.contains("u:2"),
+        "{nyc}"
+    );
+    // auto-maintained: a new hash is indexed; a changed value re-buckets
+    c.cmd(&["HSET", "u:4", "city", "NYC"]);
+    assert!(c.cmd(&["IDXGET", "by_city", "NYC"]).contains("u:4"));
+    c.cmd(&["HSET", "u:1", "city", "LA"]); // moves u:1 NYC -> LA
+    assert!(!c.cmd(&["IDXGET", "by_city", "NYC"]).contains("u:1"));
+    assert!(c.cmd(&["IDXGET", "by_city", "LA"]).contains("u:1"));
+    // delete drops it from the index (no drift)
+    c.cmd(&["DEL", "u:3"]);
+    assert!(!c.cmd(&["IDXGET", "by_city", "NYC"]).contains("u:3"));
+    // range query (lexicographic) over a numeric-looking field
+    assert_eq!(c.cmd(&["IDXCREATE", "by_age", "age"]), "OK");
+    let r = c.cmd(&["IDXRANGE", "by_age", "20", "35"]); // 25 (u:2), 30 (u:1)
+    assert!(
+        r.contains("u:2") && r.contains("u:1") && !r.contains("u:3"),
+        "{r}"
+    );
+    // errors + lifecycle
+    assert!(c.cmd(&["IDXGET", "nope", "x"]).starts_with("-ERR"));
+    assert_eq!(c.cmd(&["IDXDROP", "by_city"]), "1");
+    assert_eq!(c.cmd(&["IDXDROP", "by_city"]), "0");
+}
+
 // === geo ====================================================================
 
 #[test]

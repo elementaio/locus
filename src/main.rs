@@ -20,7 +20,7 @@ mod resp;
 mod sketch;
 mod streams;
 
-use std::collections::{HashMap, HashSet, VecDeque};
+use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 use std::io::{self, Read, Write};
 use std::net::{TcpListener, TcpStream};
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -111,6 +111,17 @@ struct Hub {
     cdc_maxlen: usize,
     // changefeed consumer groups (load-balanced read mode), by group name
     cdc_groups: HashMap<Vec<u8>, CdcGroup>,
+    // secondary indexes over a hash field, by index name (in-memory)
+    indexes: HashMap<Vec<u8>, SecondaryIndex>,
+}
+
+/// A secondary index over one hash field: a sorted field-value → keys map, plus
+/// a reverse key → indexed-value map so a key can be re-indexed in place. Kept
+/// in sync with every write in the same hub turn (no drift, no crash-time GC).
+struct SecondaryIndex {
+    field: Vec<u8>,
+    forward: BTreeMap<Vec<u8>, HashSet<Vec<u8>>>,
+    reverse: HashMap<Vec<u8>, Vec<u8>>,
 }
 
 /// One retained keyspace change, addressable by a monotonic offset.
@@ -209,6 +220,7 @@ impl Hub {
                 .and_then(|s| s.trim().parse::<usize>().ok())
                 .unwrap_or(0),
             cdc_groups: HashMap::new(),
+            indexes: HashMap::new(),
         }
     }
 
@@ -422,6 +434,10 @@ impl Hub {
             b"CDCSUBSCRIBE" => self.handle_cdc_subscribe(id, &tokens),
             b"CDCUNSUBSCRIBE" => self.handle_cdc_unsubscribe(id),
             b"CDCREAD" => self.handle_cdc_read(id, &tokens),
+            b"IDXCREATE" => self.handle_idx_admin(id, &tokens, true),
+            b"IDXDROP" => self.handle_idx_admin(id, &tokens, false),
+            b"IDXGET" => self.handle_idx_get(id, &tokens),
+            b"IDXRANGE" => self.handle_idx_range(id, &tokens),
             b"CDCGROUP" => self.handle_cdc_group(id, &tokens),
             b"CDCREADGROUP" => self.handle_cdc_readgroup(id, &tokens),
             b"CDCACK" => self.handle_cdc_ack(id, &tokens),
@@ -762,6 +778,128 @@ impl Hub {
                 None => {}
             }
         }
+    }
+
+    /// Re-index a key against every secondary index, from its post-write state.
+    /// Idempotent and drift-free: remove the key's old bucket entry, then add it
+    /// to the bucket for its current field value (if it's a hash with that field).
+    fn reindex_key(&mut self, key: &[u8]) {
+        if self.indexes.is_empty() {
+            return;
+        }
+        let names: Vec<Vec<u8>> = self.indexes.keys().cloned().collect();
+        for name in names {
+            let field = self.indexes[&name].field.clone();
+            let newval = match self.db.get(key) {
+                Some(Value::Hash(h)) => h.get(&field).cloned(),
+                _ => None,
+            };
+            let ix = self.indexes.get_mut(&name).unwrap();
+            if let Some(old) = ix.reverse.remove(key)
+                && let Some(set) = ix.forward.get_mut(&old)
+            {
+                set.remove(key);
+                if set.is_empty() {
+                    ix.forward.remove(&old);
+                }
+            }
+            if let Some(v) = newval {
+                ix.forward
+                    .entry(v.clone())
+                    .or_default()
+                    .insert(key.to_vec());
+                ix.reverse.insert(key.to_vec(), v);
+            }
+        }
+    }
+
+    /// IDXCREATE <name> <field> | IDXDROP <name>.
+    fn handle_idx_admin(&mut self, id: u64, tokens: &[Vec<u8>], create: bool) {
+        if (create && tokens.len() != 3) || (!create && tokens.len() != 2) {
+            return self.send(id, resp::error("ERR wrong number of arguments"));
+        }
+        if !create {
+            let removed = self.indexes.remove(&tokens[1]).is_some();
+            return self.send(id, resp::integer(removed as i64));
+        }
+        if self.indexes.contains_key(&tokens[1]) {
+            return self.send(id, resp::error("ERR index already exists"));
+        }
+        // Build the index from the current keyspace (then writes keep it in sync).
+        let field = tokens[2].clone();
+        let mut ix = SecondaryIndex {
+            field: field.clone(),
+            forward: BTreeMap::new(),
+            reverse: HashMap::new(),
+        };
+        for k in self.db.live_keys() {
+            if let Some(Value::Hash(h)) = self.db.get(&k)
+                && let Some(v) = h.get(&field)
+            {
+                let v = v.clone();
+                ix.forward.entry(v.clone()).or_default().insert(k.clone());
+                ix.reverse.insert(k, v);
+            }
+        }
+        self.indexes.insert(tokens[1].clone(), ix);
+        self.send(id, resp::simple_string("OK"));
+    }
+
+    /// IDXGET <name> <value> — keys whose indexed field equals `value`.
+    fn handle_idx_get(&mut self, id: u64, tokens: &[Vec<u8>]) {
+        if tokens.len() != 3 {
+            return self.send(id, resp::error("ERR wrong number of arguments"));
+        }
+        let keys: Vec<Vec<u8>> = match self.indexes.get(&tokens[1]) {
+            None => return self.send(id, resp::error("ERR no such index")),
+            Some(ix) => ix
+                .forward
+                .get(&tokens[2])
+                .map(|s| s.iter().cloned().collect())
+                .unwrap_or_default(),
+        };
+        self.send(id, resp::bulk_array(&keys));
+    }
+
+    /// IDXRANGE <name> <min> <max> [COUNT n] — keys whose field is in [min, max]
+    /// (lexicographic), in field order, capped at COUNT.
+    fn handle_idx_range(&mut self, id: u64, tokens: &[Vec<u8>]) {
+        if tokens.len() != 4 && tokens.len() != 6 {
+            return self.send(id, resp::error("ERR wrong number of arguments"));
+        }
+        let count = if tokens.len() == 6 {
+            if !tokens[4].eq_ignore_ascii_case(b"COUNT") {
+                return self.send(id, resp::error("ERR syntax error"));
+            }
+            match std::str::from_utf8(&tokens[5])
+                .ok()
+                .and_then(|s| s.parse::<usize>().ok())
+            {
+                Some(c) => Some(c),
+                None => {
+                    return self.send(
+                        id,
+                        resp::error("ERR value is not an integer or out of range"),
+                    );
+                }
+            }
+        } else {
+            None
+        };
+        let ix = match self.indexes.get(&tokens[1]) {
+            None => return self.send(id, resp::error("ERR no such index")),
+            Some(ix) => ix,
+        };
+        let mut out: Vec<Vec<u8>> = Vec::new();
+        for (_, keys) in ix.forward.range(tokens[2].clone()..=tokens[3].clone()) {
+            for k in keys {
+                out.push(k.clone());
+                if count.is_some_and(|c| out.len() >= c) {
+                    return self.send(id, resp::bulk_array(&out));
+                }
+            }
+        }
+        self.send(id, resp::bulk_array(&out));
     }
 
     /// CDCREAD <offset> [COUNT n] [PREFIX p] — pull retained changes after an
@@ -1126,6 +1264,7 @@ impl Hub {
             // (including in-place collection growth like LPUSH/SADD).
             for key in write_keys(&tokens) {
                 self.db.resync_size(key);
+                self.reindex_key(key); // keep secondary indexes in sync (no drift)
             }
             // A write only counts as a modification if it actually changed the
             // dataset. A no-op write (e.g. DEL of a missing key) is not logged,
@@ -1180,6 +1319,7 @@ impl Hub {
         for key in self.db.take_expired() {
             self.dirty_watchers(&key);
             self.record_change(b"expire", &key, None);
+            self.reindex_key(&key); // drop expired key from secondary indexes
         }
     }
 
@@ -1198,6 +1338,7 @@ impl Hub {
                 Some(key) => {
                     self.dirty_watchers(&key);
                     self.record_change(b"del", &key, None);
+                    self.reindex_key(&key); // drop evicted key from secondary indexes
                     self.propagate(&[b"DEL".to_vec(), key]);
                 }
                 None => break, // keyspace empty — nothing left to evict

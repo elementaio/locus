@@ -17,6 +17,12 @@ All notable changes to Locus are documented here. The format is based on
 - **t-digest** `TDADD` / `TDQUANTILE` (+ internal `TDLOAD`) — streaming quantiles / percentiles
   (live p99), accurate at the tails via the `q(1-q)` scale; exact min/max. Completes the sketch family.
 
+### Added (secondary index — query by field)
+- **`IDXCREATE` / `IDXDROP` / `IDXGET` / `IDXRANGE`** — index a hash field for equality and
+  lexicographic-range queries. Auto-maintained on every write/expiry/eviction in the same hub turn, so
+  the index never drifts from the data (the single-threaded guarantee). In-memory; equality + range +
+  COUNT (no query language — by design).
+
 ### Added (conditional writes — the CAS primitive)
 - **CAS family** `CAS key expected new`, `CADEL key expected`, `SETMAX key n` (monotonic cursor),
   `INCRCAP key delta cap` (quota). Atomic check-and-write under single-threaded execution — no WATCH/Lua.
