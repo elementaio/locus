@@ -12,6 +12,9 @@ All notable changes to Locus are documented here. The format is based on
   no gap or duplication (guaranteed by single-threaded execution). Values are inlined for string keys.
   Fed from the same modification choke points as WATCH/AOF/replication, so it never misses a write and
   never reports a no-op. The foundation for live-query and geofencing.
+- **Changefeed consumer groups** — `CDCGROUP CREATE|DESTROY`, `CDCREADGROUP <group> <consumer>`
+  (load-balanced: each record delivered to one consumer), `CDCACK`, `CDCPENDING`. In-memory; built on
+  the retained log/offsets. The second of the change-log's two read modes (broadcast + load-balanced).
 - **Changefeed offsets + retention + `CDCREAD`** — every change carries a monotonic offset;
   `CDCREAD <offset> [COUNT n] [PREFIX p]` pulls retained changes after an offset for reconnect catch-up.
   Retention is opt-in via `LOCUS_CDC_MAXLEN` (a ring buffer); falling behind the retained window returns

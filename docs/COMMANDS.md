@@ -107,6 +107,10 @@ single-threaded hub guarantees it). The connection enters push mode (like pub/su
 | `CDCSUBSCRIBE [prefix]` | snapshot (`["cdc-snapshot", key, value]` …, then `["cdc-snapshot-done", count, offset]`), then live `["cdc-change", offset, write\|del\|expire, key, value]` |
 | `CDCUNSUBSCRIBE` | leave push mode |
 | `CDCREAD <offset> [COUNT n] [PREFIX p]` | pull retained changes after `offset` (catch-up after a disconnect); each entry `[offset, event, key, value]` |
+| `CDCGROUP CREATE <group> [offset\|$\|0]` / `CDCGROUP DESTROY <group>` | consumer group (load-balanced read mode); `$`/default = only new, `0` = all retained |
+| `CDCREADGROUP <group> <consumer> [COUNT n]` | deliver the next un-delivered records to a consumer (disjoint across the group); tracked as pending until acked |
+| `CDCACK <group> <offset> [offset ...]` | acknowledge delivery (drop from the pending list) |
+| `CDCPENDING <group>` | `[total, [[consumer, count], …]]` |
 
 Every change carries a **monotonic offset**. Retention for `CDCREAD` is opt-in via
 `LOCUS_CDC_MAXLEN=<records>` (a ring buffer); reading from an offset older than what's retained returns

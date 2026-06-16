@@ -386,6 +386,46 @@ fn changefeed_offset_out_of_range_when_truncated() {
     assert_eq!(rd.cmd(&["CDCREAD", "4"]), "[[5, write, k4, v]]");
 }
 
+#[test]
+fn changefeed_consumer_groups() {
+    let s = Server::start_inner(&[("LOCUS_CDC_MAXLEN", "100")]);
+    let mut w = s.connect();
+    w.cmd(&["SET", "a", "1"]); // offset 1
+    w.cmd(&["SET", "b", "2"]); // offset 2
+    w.cmd(&["SET", "c", "3"]); // offset 3
+
+    let mut g = s.connect();
+    assert_eq!(g.cmd(&["CDCGROUP", "CREATE", "grp", "0"]), "OK"); // from start
+    // Load-balanced: c1 takes the first two, c2 takes the next — disjoint.
+    assert_eq!(
+        g.cmd(&["CDCREADGROUP", "grp", "c1", "COUNT", "2"]),
+        "[[1, write, a, 1], [2, write, b, 2]]"
+    );
+    assert_eq!(g.cmd(&["CDCREADGROUP", "grp", "c2"]), "[[3, write, c, 3]]");
+    assert_eq!(g.cmd(&["CDCREADGROUP", "grp", "c1"]), "[]"); // nothing new
+
+    // 3 delivered + unacked.
+    assert!(g.cmd(&["CDCPENDING", "grp"]).starts_with("[3,"));
+    assert_eq!(g.cmd(&["CDCACK", "grp", "1", "2"]), "2");
+    assert!(g.cmd(&["CDCPENDING", "grp"]).starts_with("[1,"));
+
+    // A new write is delivered to whoever reads next.
+    w.cmd(&["SET", "d", "4"]); // offset 4
+    assert_eq!(g.cmd(&["CDCREADGROUP", "grp", "c2"]), "[[4, write, d, 4]]");
+
+    // Errors + lifecycle.
+    assert!(
+        g.cmd(&["CDCREADGROUP", "nope", "c1"])
+            .starts_with("-NOGROUP")
+    );
+    assert!(
+        g.cmd(&["CDCGROUP", "CREATE", "grp"])
+            .starts_with("-BUSYGROUP")
+    );
+    assert_eq!(g.cmd(&["CDCGROUP", "DESTROY", "grp"]), "1");
+    assert_eq!(g.cmd(&["CDCGROUP", "DESTROY", "grp"]), "0");
+}
+
 // === pub/sub ================================================================
 
 #[test]

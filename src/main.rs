@@ -108,6 +108,8 @@ struct Hub {
     cdc_log: VecDeque<ChangeRecord>,
     cdc_next_offset: u64,
     cdc_maxlen: usize,
+    // changefeed consumer groups (load-balanced read mode), by group name
+    cdc_groups: HashMap<Vec<u8>, CdcGroup>,
 }
 
 /// One retained keyspace change, addressable by a monotonic offset.
@@ -116,6 +118,14 @@ struct ChangeRecord {
     event: Vec<u8>, // "write" | "del" | "expire"
     key: Vec<u8>,
     value: Option<Vec<u8>>, // new value for string writes; None otherwise
+}
+
+/// A changefeed consumer group: a shared cursor over the log plus a pending list
+/// (delivered-but-unacked offsets → the consumer that got them). In-memory only.
+#[derive(Default)]
+struct CdcGroup {
+    last_delivered: u64,
+    pending: HashMap<u64, Vec<u8>>,
 }
 
 /// A client parked on a blocking XREAD.
@@ -184,6 +194,7 @@ impl Hub {
                 .ok()
                 .and_then(|s| s.trim().parse::<usize>().ok())
                 .unwrap_or(0),
+            cdc_groups: HashMap::new(),
         }
     }
 
@@ -397,6 +408,10 @@ impl Hub {
             b"CDCSUBSCRIBE" => self.handle_cdc_subscribe(id, &tokens),
             b"CDCUNSUBSCRIBE" => self.handle_cdc_unsubscribe(id),
             b"CDCREAD" => self.handle_cdc_read(id, &tokens),
+            b"CDCGROUP" => self.handle_cdc_group(id, &tokens),
+            b"CDCREADGROUP" => self.handle_cdc_readgroup(id, &tokens),
+            b"CDCACK" => self.handle_cdc_ack(id, &tokens),
+            b"CDCPENDING" => self.handle_cdc_pending(id, &tokens),
             b"XREAD" => self.handle_xread(id, &tokens),
             b"HELLO" => self.handle_hello(id, &tokens),
 
@@ -681,6 +696,174 @@ impl Hub {
             }
         }
         self.send(id, resp::array(&out));
+    }
+
+    /// CDCGROUP CREATE <group> [<offset>|$|0] | CDCGROUP DESTROY <group>.
+    fn handle_cdc_group(&mut self, id: u64, tokens: &[Vec<u8>]) {
+        if tokens.len() < 3 {
+            return self.send(
+                id,
+                resp::error("ERR wrong number of arguments for 'cdcgroup' command"),
+            );
+        }
+        let group = tokens[2].clone();
+        match tokens[1].to_ascii_uppercase().as_slice() {
+            b"CREATE" => {
+                if self.cdc_maxlen == 0 {
+                    return self.send(
+                        id,
+                        resp::error("ERR changefeed retention disabled (set LOCUS_CDC_MAXLEN)"),
+                    );
+                }
+                if self.cdc_groups.contains_key(&group) {
+                    return self.send(id, resp::error("BUSYGROUP changefeed group already exists"));
+                }
+                // Start offset: default / "$" = only new changes; "0" = all retained.
+                let hwm = self.cdc_next_offset.saturating_sub(1);
+                let start = match tokens.get(3) {
+                    None => hwm,
+                    Some(o) if o.as_slice() == b"$" => hwm,
+                    Some(o) => match std::str::from_utf8(o)
+                        .ok()
+                        .and_then(|s| s.parse::<u64>().ok())
+                    {
+                        Some(n) => n,
+                        None => {
+                            return self.send(
+                                id,
+                                resp::error("ERR value is not an integer or out of range"),
+                            );
+                        }
+                    },
+                };
+                self.cdc_groups.insert(
+                    group,
+                    CdcGroup {
+                        last_delivered: start,
+                        pending: HashMap::new(),
+                    },
+                );
+                self.send(id, resp::simple_string("OK"));
+            }
+            b"DESTROY" => {
+                let removed = self.cdc_groups.remove(&group).is_some();
+                self.send(id, resp::integer(removed as i64));
+            }
+            _ => self.send(id, resp::error("ERR syntax error")),
+        }
+    }
+
+    /// CDCREADGROUP <group> <consumer> [COUNT n] — deliver the next un-delivered
+    /// records to this consumer (load-balanced across the group) and track them
+    /// as pending until acked.
+    fn handle_cdc_readgroup(&mut self, id: u64, tokens: &[Vec<u8>]) {
+        if tokens.len() < 3 {
+            return self.send(
+                id,
+                resp::error("ERR wrong number of arguments for 'cdcreadgroup' command"),
+            );
+        }
+        let mut count: Option<usize> = None;
+        if tokens.len() >= 5 && tokens[3].eq_ignore_ascii_case(b"COUNT") {
+            count = match std::str::from_utf8(&tokens[4])
+                .ok()
+                .and_then(|s| s.parse().ok())
+            {
+                Some(c) => Some(c),
+                None => {
+                    return self.send(
+                        id,
+                        resp::error("ERR value is not an integer or out of range"),
+                    );
+                }
+            };
+        }
+        let consumer = tokens[2].clone();
+        let last = match self.cdc_groups.get(&tokens[1]) {
+            Some(g) => g.last_delivered,
+            None => return self.send(id, resp::error("NOGROUP No such changefeed group")),
+        };
+        // Scan the log for new records (no group borrow held during the scan).
+        let mut out: Vec<Vec<u8>> = Vec::new();
+        let mut offsets: Vec<u64> = Vec::new();
+        let mut maxoff = last;
+        for rec in &self.cdc_log {
+            if rec.offset > last {
+                let val = match &rec.value {
+                    Some(v) => resp::bulk_string(v),
+                    None => resp::null_bulk(),
+                };
+                out.push(resp::array(&[
+                    resp::integer(rec.offset as i64),
+                    resp::bulk_string(&rec.event),
+                    resp::bulk_string(&rec.key),
+                    val,
+                ]));
+                offsets.push(rec.offset);
+                maxoff = rec.offset;
+                if count.is_some_and(|c| c > 0 && out.len() >= c) {
+                    break;
+                }
+            }
+        }
+        if let Some(g) = self.cdc_groups.get_mut(&tokens[1]) {
+            g.last_delivered = maxoff;
+            for off in offsets {
+                g.pending.insert(off, consumer.clone());
+            }
+        }
+        self.send(id, resp::array(&out));
+    }
+
+    /// CDCACK <group> <offset> [offset ...] — acknowledge delivery (drop from PEL).
+    fn handle_cdc_ack(&mut self, id: u64, tokens: &[Vec<u8>]) {
+        if tokens.len() < 3 {
+            return self.send(
+                id,
+                resp::error("ERR wrong number of arguments for 'cdcack' command"),
+            );
+        }
+        let g = match self.cdc_groups.get_mut(&tokens[1]) {
+            Some(g) => g,
+            None => return self.send(id, resp::error("NOGROUP No such changefeed group")),
+        };
+        let mut acked = 0i64;
+        for off in &tokens[2..] {
+            if let Some(n) = std::str::from_utf8(off)
+                .ok()
+                .and_then(|s| s.parse::<u64>().ok())
+                && g.pending.remove(&n).is_some()
+            {
+                acked += 1;
+            }
+        }
+        self.send(id, resp::integer(acked));
+    }
+
+    /// CDCPENDING <group> — total pending plus a per-consumer breakdown.
+    fn handle_cdc_pending(&mut self, id: u64, tokens: &[Vec<u8>]) {
+        if tokens.len() != 2 {
+            return self.send(
+                id,
+                resp::error("ERR wrong number of arguments for 'cdcpending' command"),
+            );
+        }
+        let g = match self.cdc_groups.get(&tokens[1]) {
+            Some(g) => g,
+            None => return self.send(id, resp::error("NOGROUP No such changefeed group")),
+        };
+        let mut counts: HashMap<&Vec<u8>, usize> = HashMap::new();
+        for c in g.pending.values() {
+            *counts.entry(c).or_insert(0) += 1;
+        }
+        let per: Vec<Vec<u8>> = counts
+            .iter()
+            .map(|(c, n)| resp::array(&[resp::bulk_string(c), resp::integer(*n as i64)]))
+            .collect();
+        self.send(
+            id,
+            resp::array(&[resp::integer(g.pending.len() as i64), resp::array(&per)]),
+        );
     }
 
     /// Emit changefeed events for the keys a write touched (called from exec_one
