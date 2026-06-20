@@ -14,6 +14,7 @@
 mod aof;
 mod commands;
 mod db;
+mod log;
 mod pubsub;
 mod rdb;
 mod resp;
@@ -82,6 +83,7 @@ fn install_signal_handlers() {
 }
 
 fn main() -> io::Result<()> {
+    log::init();
     let (tx, rx) = mpsc::channel::<Msg>();
     let hub_tx = tx.clone();
     thread::spawn(move || run_hub(rx, hub_tx));
@@ -113,7 +115,9 @@ fn main() -> io::Result<()> {
                 if conns.fetch_add(1, Ordering::Relaxed) >= max_clients {
                     conns.fetch_sub(1, Ordering::Relaxed);
                     let _ = conn.write_all(b"-ERR max number of clients reached\r\n");
-                    eprintln!("rejected connection: max clients ({max_clients}) reached");
+                    log::warn(&format!(
+                        "rejected connection: max clients ({max_clients}) reached"
+                    ));
                     continue;
                 }
                 let id = next_id;
@@ -123,11 +127,11 @@ fn main() -> io::Result<()> {
                 thread::spawn(move || {
                     let _guard = guard;
                     if let Err(e) = handle_conn(conn, id, tx) {
-                        eprintln!("connection error: {e}");
+                        log::warn(&format!("connection error: {e}"));
                     }
                 });
             }
-            Err(e) => eprintln!("accept error: {e}"),
+            Err(e) => log::warn(&format!("accept error: {e}")),
         }
     }
     Ok(())
@@ -248,18 +252,18 @@ impl Hub {
         let (db, aof) = match &aof_path {
             Some(path) => {
                 let db = aof::load(path).unwrap_or_else(|e| {
-                    eprintln!("AOF load failed: {e} — starting empty");
+                    log::warn(&format!("AOF load failed: {e} — starting empty"));
                     Db::new()
                 });
                 let aof = aof::Aof::open(path)
-                    .map_err(|e| eprintln!("AOF open failed: {e}"))
+                    .map_err(|e| log::warn(&format!("AOF open failed: {e}")))
                     .ok();
                 (db, aof)
             }
             None => {
                 let p = rdb::configured_path();
                 let db = rdb::load(&p).unwrap_or_else(|e| {
-                    eprintln!("RDB load failed: {e} — starting empty");
+                    log::warn(&format!("RDB load failed: {e} — starting empty"));
                     Db::new()
                 });
                 (db, None)
@@ -327,9 +331,9 @@ impl Hub {
             a.fsync();
         }
         if save && let Err(e) = rdb::save(&self.db, &rdb::configured_path()) {
-            eprintln!("shutdown: final save failed: {e}");
+            log::error(&format!("shutdown: final save failed: {e}"));
         }
-        println!("Locus shutting down");
+        log::info("shutting down");
         std::process::exit(0);
     }
 
@@ -585,10 +589,10 @@ impl Hub {
                 bulk.extend_from_slice(&snap);
                 self.send(id, bulk);
                 self.replicas.insert(id);
-                println!(
+                log::info(&format!(
                     "replication: replica {id} attached ({} byte snapshot)",
                     snap.len()
-                );
+                ));
             }
             b"REPLICAOF" | b"SLAVEOF" => self.handle_replicaof(id, &tokens),
             b"INFO" => {
@@ -1605,7 +1609,7 @@ impl Hub {
         }
         if tokens[1].eq_ignore_ascii_case(b"NO") && tokens[2].eq_ignore_ascii_case(b"ONE") {
             self.master = None;
-            println!("replication: promoted to master");
+            log::info("replication: promoted to master");
             return self.send(id, resp::simple_string("OK"));
         }
         let host = String::from_utf8_lossy(&tokens[1]).to_string();
@@ -1617,7 +1621,7 @@ impl Hub {
         let txc = self.tx.clone();
         let masterauth = self.masterauth.clone();
         thread::spawn(move || replica_sync(addr, masterauth, txc, stop));
-        println!("replication: now replicating from {host}:{port}");
+        log::info(&format!("replication: now replicating from {host}:{port}"));
         self.send(id, resp::simple_string("OK"));
     }
 
@@ -1838,7 +1842,7 @@ fn replica_sync(
 ) {
     while !stop.load(Ordering::Relaxed) {
         if let Err(e) = try_sync(&addr, masterauth.as_deref(), &hub_tx, &stop) {
-            eprintln!("replication: link to {addr} dropped: {e}");
+            log::warn(&format!("replication: link to {addr} dropped: {e}"));
         }
         // Reconnect after a short delay (a real impl would PSYNC partial-resync).
         for _ in 0..10 {
@@ -1893,7 +1897,7 @@ fn try_sync(
     if hub_tx.send(Msg::ReplaceDb(Box::new(db))).is_err() {
         return Ok(());
     }
-    println!("replication: full sync complete ({len} bytes)");
+    log::info(&format!("replication: full sync complete ({len} bytes)"));
 
     // Stream and apply the master's writes. The read timeout lets us notice a
     // stop request even when the master is idle.
@@ -1984,7 +1988,7 @@ fn handle_conn(conn: TcpStream, id: u64, tx: mpsc::Sender<Msg>) -> io::Result<()
     if let Some(t) = idle_timeout() {
         let _ = conn.set_read_timeout(Some(t));
     }
-    println!("client connected: {peer}");
+    log::debug(&format!("client connected: {peer}"));
 
     let mut write_half = conn.try_clone()?;
     let (out_tx, out_rx) = mpsc::channel::<Vec<u8>>();
@@ -2042,7 +2046,7 @@ fn handle_conn(conn: TcpStream, id: u64, tx: mpsc::Sender<Msg>) -> io::Result<()
     let _ = tx.send(Msg::Disconnect { id });
     drop(out_tx);
     let _ = writer.join();
-    println!("client disconnected: {peer}");
+    log::debug(&format!("client disconnected: {peer}"));
     Ok(())
 }
 
