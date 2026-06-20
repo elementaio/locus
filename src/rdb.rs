@@ -10,7 +10,7 @@
 
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::fs::{self, File};
-use std::io::{self, BufReader, BufWriter, Read, Write};
+use std::io::{self, BufWriter, Read, Write};
 
 use crate::db::{Db, Stream, Value};
 
@@ -23,12 +23,6 @@ pub fn configured_path() -> String {
 }
 
 // --- save -------------------------------------------------------------------
-
-pub fn save(db: &Db, path: &str) -> io::Result<()> {
-    // Serialize at the call site (a consistent point-in-time), then write
-    // crash-safely. `serialize` produces exactly this file's bytes.
-    write_snapshot(&serialize(db), path)
-}
 
 /// Crash-safe write of a pre-serialized snapshot: temp file -> fsync -> atomic
 /// rename -> directory fsync. Splitting this out lets BGSAVE serialize on the
@@ -152,33 +146,49 @@ fn write_value<W: Write>(w: &mut W, key: &[u8], v: &Value) -> io::Result<()> {
 
 // --- load -------------------------------------------------------------------
 
-/// Load a snapshot. A missing file yields an empty Db (first run).
-pub fn load(path: &str) -> io::Result<Db> {
-    let file = match File::open(path) {
-        Ok(f) => f,
-        Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(Db::new()),
+/// Load a snapshot plus any trailing CDC / secondary-index state. The trailer is
+/// optional: a snapshot written by `save` (or an older version) yields empty
+/// extras. A missing file yields an empty Db (first run).
+pub fn load_with_extras(path: &str) -> io::Result<(Db, Extras)> {
+    let bytes = match fs::read(path) {
+        Ok(b) => b,
+        Err(e) if e.kind() == io::ErrorKind::NotFound => {
+            return Ok((Db::new(), Extras::default()));
+        }
         Err(e) => return Err(e),
     };
-    let mut r = BufReader::new(file);
+    deserialize_with_extras(&bytes)
+}
+
+/// Shared keyspace reader: magic + count + entries.
+fn read_db<R: Read>(r: &mut R) -> io::Result<Db> {
     let mut magic = [0u8; 9];
     r.read_exact(&mut magic)?;
     if &magic != MAGIC {
         return Err(io::Error::new(io::ErrorKind::InvalidData, "bad RDB magic"));
     }
-    let count = read_u64(&mut r)?;
+    let count = read_u64(r)?;
     let mut db = Db::new();
     for _ in 0..count {
-        let expire = if read_u8(&mut r)? == 1 {
-            Some(read_u64(&mut r)?)
+        let expire = if read_u8(r)? == 1 {
+            Some(read_u64(r)?)
         } else {
             None
         };
-        let tag = read_u8(&mut r)?;
-        let key = read_bytes(&mut r)?;
-        let value = read_value(&mut r, tag)?;
+        let tag = read_u8(r)?;
+        let key = read_bytes(r)?;
+        let value = read_value(r, tag)?;
         db.insert_with_expire(key, value, expire);
     }
     Ok(db)
+}
+
+/// Parse a snapshot's keyspace and any optional trailing extras from a buffer.
+pub fn deserialize_with_extras(bytes: &[u8]) -> io::Result<(Db, Extras)> {
+    let mut r: &[u8] = bytes;
+    let db = read_db(&mut r)?;
+    let extras = read_extras(&mut r)?;
+    Ok((db, extras))
 }
 
 /// Serialize the whole dataset to an in-memory buffer (for replication sync).
@@ -221,6 +231,143 @@ pub fn deserialize(bytes: &[u8]) -> io::Result<Db> {
         db.insert_with_expire(key, value, expire);
     }
     Ok(db)
+}
+
+// --- CDC / secondary-index trailer (optional, appended after the keyspace) ---
+
+/// State that lives in the hub (not the Db) but must survive a restart: the
+/// changefeed offset counter, the retained change-log, consumer-group cursors,
+/// and secondary-index definitions (index contents are rebuilt from the keyspace
+/// on load, so only the name+field are stored).
+#[derive(Default)]
+pub struct Extras {
+    pub cdc_next_offset: u64,
+    pub cdc_log: Vec<CdcRec>,
+    pub cdc_groups: Vec<CdcGrp>,
+    pub index_defs: Vec<(Vec<u8>, Vec<u8>)>, // (index name, hash field)
+}
+
+pub struct CdcRec {
+    pub offset: u64,
+    pub event: Vec<u8>,
+    pub key: Vec<u8>,
+    pub value: Option<Vec<u8>>,
+}
+
+pub struct CdcGrp {
+    pub name: Vec<u8>,
+    pub last_delivered: u64,
+    pub pending: Vec<(u64, Vec<u8>)>, // (offset, consumer)
+}
+
+const TRAILER_MAGIC: &[u8; 4] = b"LXT1";
+
+fn put_bytes(buf: &mut Vec<u8>, b: &[u8]) {
+    buf.extend_from_slice(&(b.len() as u32).to_le_bytes());
+    buf.extend_from_slice(b);
+}
+
+/// Append the trailer onto an already-serialized keyspace buffer.
+pub fn append_extras(buf: &mut Vec<u8>, x: &Extras) {
+    buf.extend_from_slice(TRAILER_MAGIC);
+    buf.extend_from_slice(&x.cdc_next_offset.to_le_bytes());
+    buf.extend_from_slice(&(x.cdc_log.len() as u32).to_le_bytes());
+    for r in &x.cdc_log {
+        buf.extend_from_slice(&r.offset.to_le_bytes());
+        put_bytes(buf, &r.event);
+        put_bytes(buf, &r.key);
+        match &r.value {
+            Some(v) => {
+                buf.push(1);
+                put_bytes(buf, v);
+            }
+            None => buf.push(0),
+        }
+    }
+    buf.extend_from_slice(&(x.cdc_groups.len() as u32).to_le_bytes());
+    for g in &x.cdc_groups {
+        put_bytes(buf, &g.name);
+        buf.extend_from_slice(&g.last_delivered.to_le_bytes());
+        buf.extend_from_slice(&(g.pending.len() as u32).to_le_bytes());
+        for (off, consumer) in &g.pending {
+            buf.extend_from_slice(&off.to_le_bytes());
+            put_bytes(buf, consumer);
+        }
+    }
+    buf.extend_from_slice(&(x.index_defs.len() as u32).to_le_bytes());
+    for (name, field) in &x.index_defs {
+        put_bytes(buf, name);
+        put_bytes(buf, field);
+    }
+}
+
+/// Read the optional trailer. EOF at the marker (an older snapshot) yields empty
+/// extras.
+fn read_extras<R: Read>(r: &mut R) -> io::Result<Extras> {
+    let mut marker = [0u8; 4];
+    match r.read_exact(&mut marker) {
+        Ok(()) => {}
+        Err(e) if e.kind() == io::ErrorKind::UnexpectedEof => return Ok(Extras::default()),
+        Err(e) => return Err(e),
+    }
+    if &marker != TRAILER_MAGIC {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "bad RDB trailer magic",
+        ));
+    }
+    let cdc_next_offset = read_u64(r)?;
+    let mut cdc_log = Vec::new();
+    for _ in 0..read_u32(r)? {
+        let offset = read_u64(r)?;
+        let event = read_bytes(r)?;
+        let key = read_bytes(r)?;
+        let value = if read_u8(r)? == 1 {
+            Some(read_bytes(r)?)
+        } else {
+            None
+        };
+        cdc_log.push(CdcRec {
+            offset,
+            event,
+            key,
+            value,
+        });
+    }
+    let mut cdc_groups = Vec::new();
+    for _ in 0..read_u32(r)? {
+        let name = read_bytes(r)?;
+        let last_delivered = read_u64(r)?;
+        let mut pending = Vec::new();
+        for _ in 0..read_u32(r)? {
+            let off = read_u64(r)?;
+            pending.push((off, read_bytes(r)?));
+        }
+        cdc_groups.push(CdcGrp {
+            name,
+            last_delivered,
+            pending,
+        });
+    }
+    let mut index_defs = Vec::new();
+    for _ in 0..read_u32(r)? {
+        let name = read_bytes(r)?;
+        let field = read_bytes(r)?;
+        index_defs.push((name, field));
+    }
+    Ok(Extras {
+        cdc_next_offset,
+        cdc_log,
+        cdc_groups,
+        index_defs,
+    })
+}
+
+/// Serialize the keyspace + extras and write it crash-safely.
+pub fn save_with_extras(db: &Db, extras: &Extras, path: &str) -> io::Result<()> {
+    let mut bytes = serialize(db);
+    append_extras(&mut bytes, extras);
+    write_snapshot(&bytes, path)
 }
 
 fn read_value<R: Read>(r: &mut R, tag: u8) -> io::Result<Value> {
@@ -369,8 +516,8 @@ mod tests {
         run(&mut db, &[b"TOPKADD", b"tk", b"a", b"a", b"b"]);
         run(&mut db, &[b"TDADD", b"td", b"10", b"20", b"30"]);
 
-        save(&db, path).unwrap();
-        let mut loaded = load(path).unwrap();
+        save_with_extras(&db, &Extras::default(), path).unwrap();
+        let mut loaded = load_with_extras(path).unwrap().0;
 
         assert_eq!(
             execute(&to(&[b"GET", b"s"]), &mut loaded),
@@ -427,5 +574,46 @@ mod tests {
 
     fn to(parts: &[&[u8]]) -> Vec<Vec<u8>> {
         parts.iter().map(|p| p.to_vec()).collect()
+    }
+
+    #[test]
+    fn extras_trailer_roundtrips() {
+        let extras = Extras {
+            cdc_next_offset: 42,
+            cdc_log: vec![CdcRec {
+                offset: 7,
+                event: b"write".to_vec(),
+                key: b"k".to_vec(),
+                value: Some(b"v".to_vec()),
+            }],
+            cdc_groups: vec![CdcGrp {
+                name: b"g".to_vec(),
+                last_delivered: 5,
+                pending: vec![(3, b"c1".to_vec())],
+            }],
+            index_defs: vec![(b"by_city".to_vec(), b"city".to_vec())],
+        };
+        let mut bytes = serialize(&Db::new());
+        append_extras(&mut bytes, &extras);
+        let (_, got) = deserialize_with_extras(&bytes).unwrap();
+        assert_eq!(got.cdc_next_offset, 42);
+        assert_eq!(got.cdc_log.len(), 1);
+        assert_eq!(got.cdc_log[0].offset, 7);
+        assert_eq!(got.cdc_log[0].value.as_deref(), Some(&b"v"[..]));
+        assert_eq!(got.cdc_groups[0].pending, vec![(3u64, b"c1".to_vec())]);
+        assert_eq!(
+            got.index_defs,
+            vec![(b"by_city".to_vec(), b"city".to_vec())]
+        );
+    }
+
+    #[test]
+    fn snapshot_without_trailer_yields_empty_extras() {
+        // A plain serialized keyspace (the older format) has no trailer.
+        let bytes = serialize(&Db::new());
+        let (_, extras) = deserialize_with_extras(&bytes).unwrap();
+        assert_eq!(extras.cdc_next_offset, 0);
+        assert!(extras.index_defs.is_empty());
+        assert!(extras.cdc_log.is_empty());
     }
 }

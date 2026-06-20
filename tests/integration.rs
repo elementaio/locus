@@ -35,6 +35,16 @@ impl Server {
             SEQ.fetch_add(1, Ordering::Relaxed),
         );
         let _ = std::fs::remove_file(&rdb);
+        Server::spawn_at(rdb, extra_env)
+    }
+
+    /// Spawn against a caller-chosen RDB path WITHOUT clearing it first, so a
+    /// second server can read what a first one persisted (restart tests).
+    fn start_with_rdb(rdb: &str) -> Server {
+        Server::spawn_at(rdb.to_string(), &[])
+    }
+
+    fn spawn_at(rdb: String, extra_env: &[(&str, &str)]) -> Server {
         // LOCUS_PORT=0 -> the OS picks a free port; we read the real one back
         // from the server's stdout. No bind-then-drop race between tests.
         let mut cmd = Command::new(env!("CARGO_BIN_EXE_locus"));
@@ -900,6 +910,41 @@ fn bgsave_is_async_and_writes_the_snapshot() {
         assert!(Instant::now() < deadline, "BGSAVE never wrote the snapshot");
         sleep(Duration::from_millis(20));
     }
+}
+
+#[test]
+fn secondary_index_survives_restart() {
+    let rdb = format!(
+        "{}/locus-idx-restart-{}.rdb",
+        std::env::temp_dir().display(),
+        std::process::id()
+    );
+    let _ = std::fs::remove_file(&rdb);
+    // Round 1: hashes + an index, then SAVE (and a graceful SHUTDOWN, which also
+    // persists), so the index definition lands in the snapshot trailer.
+    {
+        let mut s = Server::start_with_rdb(&rdb);
+        let mut c = s.connect();
+        c.cmd(&["HSET", "user:1", "city", "doha"]);
+        c.cmd(&["HSET", "user:2", "city", "doha"]);
+        c.cmd(&["IDXCREATE", "by_city", "city"]);
+        assert_eq!(c.cmd(&["SAVE"]), "OK");
+        c.send(&["SHUTDOWN"]);
+        assert!(s.wait_exit().success());
+        std::mem::forget(s); // keep the RDB on disk for round 2
+    }
+    // Round 2: a fresh server on the same RDB rebuilt the index from its stored
+    // definition — IDXGET works without re-running IDXCREATE.
+    {
+        let s = Server::start_with_rdb(&rdb);
+        let mut c = s.connect();
+        let r = c.cmd(&["IDXGET", "by_city", "doha"]);
+        assert!(
+            r.contains("user:1") && r.contains("user:2"),
+            "index not restored across restart: {r}"
+        );
+    }
+    let _ = std::fs::remove_file(&rdb);
 }
 
 #[test]
