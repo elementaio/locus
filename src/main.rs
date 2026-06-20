@@ -182,6 +182,8 @@ struct Hub {
     // protected mode: refuse non-loopback clients while no password is set.
     protected_mode: bool,
     loopback: HashSet<u64>, // client ids whose peer is a loopback address
+    // password this node presents to its master (replica side); None = none.
+    masterauth: Option<Vec<u8>>,
 }
 
 /// A secondary index over one hash field: a sorted field-value → keys map, plus
@@ -304,6 +306,10 @@ impl Hub {
                 })
                 .unwrap_or(true),
             loopback: HashSet::new(),
+            masterauth: std::env::var("LOCUS_MASTERAUTH")
+                .ok()
+                .map(String::into_bytes)
+                .filter(|p| !p.is_empty()),
         }
     }
 
@@ -1562,7 +1568,8 @@ impl Hub {
         self.replica_stop = Some(stop.clone());
         let addr = format!("{host}:{port}");
         let txc = self.tx.clone();
-        thread::spawn(move || replica_sync(addr, txc, stop));
+        let masterauth = self.masterauth.clone();
+        thread::spawn(move || replica_sync(addr, masterauth, txc, stop));
         println!("replication: now replicating from {host}:{port}");
         self.send(id, resp::simple_string("OK"));
     }
@@ -1776,9 +1783,14 @@ fn run_hub(rx: mpsc::Receiver<Msg>, tx: mpsc::Sender<Msg>) {
 
 // === replica side: connect to a master and apply its stream =================
 
-fn replica_sync(addr: String, hub_tx: mpsc::Sender<Msg>, stop: Arc<AtomicBool>) {
+fn replica_sync(
+    addr: String,
+    masterauth: Option<Vec<u8>>,
+    hub_tx: mpsc::Sender<Msg>,
+    stop: Arc<AtomicBool>,
+) {
     while !stop.load(Ordering::Relaxed) {
-        if let Err(e) = try_sync(&addr, &hub_tx, &stop) {
+        if let Err(e) = try_sync(&addr, masterauth.as_deref(), &hub_tx, &stop) {
             eprintln!("replication: link to {addr} dropped: {e}");
         }
         // Reconnect after a short delay (a real impl would PSYNC partial-resync).
@@ -1791,13 +1803,30 @@ fn replica_sync(addr: String, hub_tx: mpsc::Sender<Msg>, stop: Arc<AtomicBool>) 
     }
 }
 
-fn try_sync(addr: &str, hub_tx: &mpsc::Sender<Msg>, stop: &Arc<AtomicBool>) -> io::Result<()> {
+fn try_sync(
+    addr: &str,
+    masterauth: Option<&[u8]>,
+    hub_tx: &mpsc::Sender<Msg>,
+    stop: &Arc<AtomicBool>,
+) -> io::Result<()> {
     let mut stream = TcpStream::connect(addr)?;
     // Bound the handshake + snapshot reads so a master that accepts the TCP
     // connection but never replies can't hang this thread forever (a stuck read
     // errors out, replica_sync retries, and REPLICAOF NO ONE can take effect).
     stream.set_read_timeout(Some(Duration::from_secs(5)))?;
-    // Handshake: PING -> REPLCONF -> PSYNC.
+    // Handshake: AUTH (if the master needs a password) -> PING -> REPLCONF ->
+    // PSYNC. AUTH must come first: a password-protected master rejects every
+    // other command from an unauthenticated link.
+    if let Some(pass) = masterauth {
+        send_cmd(&mut stream, &[b"AUTH", pass])?;
+        let reply = read_line(&mut stream)?;
+        if reply.first() == Some(&b'-') {
+            return Err(io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                format!("master rejected AUTH: {}", String::from_utf8_lossy(&reply)),
+            ));
+        }
+    }
     send_cmd(&mut stream, &[b"PING"])?;
     read_line(&mut stream)?;
     let myport = std::env::var("LOCUS_PORT").unwrap_or_else(|_| "6379".into());

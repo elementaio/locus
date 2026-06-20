@@ -860,3 +860,47 @@ fn shutdown_command_persists_and_exits_cleanly() {
         "graceful shutdown should exit with status 0"
     );
 }
+
+#[test]
+fn replica_authenticates_to_a_password_protected_master() {
+    let master = Server::start_inner(&[("LOCUS_REQUIREPASS", "mpw")]);
+    let replica = Server::start_inner(&[("LOCUS_MASTERAUTH", "mpw")]);
+    let (mut m, mut r) = (master.connect(), replica.connect());
+    // Our admin connection must AUTH to the master before it can write.
+    assert_eq!(m.cmd(&["AUTH", "mpw"]), "OK");
+    assert_eq!(
+        r.cmd(&["REPLICAOF", "127.0.0.1", &master.port.to_string()]),
+        "OK"
+    );
+    sleep(Duration::from_millis(400));
+    m.cmd(&["SET", "foo", "bar"]);
+    // The replica AUTHed with the right masterauth, so the write streams through.
+    let deadline = Instant::now() + Duration::from_secs(3);
+    loop {
+        if r.cmd(&["GET", "foo"]) == "bar" {
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "write never replicated with masterauth"
+        );
+        sleep(Duration::from_millis(50));
+    }
+}
+
+#[test]
+fn replica_with_wrong_masterauth_never_syncs() {
+    let master = Server::start_inner(&[("LOCUS_REQUIREPASS", "mpw")]);
+    let replica = Server::start_inner(&[("LOCUS_MASTERAUTH", "wrong")]);
+    let (mut m, mut r) = (master.connect(), replica.connect());
+    assert_eq!(m.cmd(&["AUTH", "mpw"]), "OK");
+    assert_eq!(
+        r.cmd(&["REPLICAOF", "127.0.0.1", &master.port.to_string()]),
+        "OK"
+    );
+    m.cmd(&["SET", "foo", "bar"]);
+    // Wrong masterauth: the master rejects AUTH, so no snapshot or stream is ever
+    // shipped — the dataset is not siphoned and the value never appears.
+    sleep(Duration::from_millis(700));
+    assert_eq!(r.cmd(&["GET", "foo"]), "(nil)");
+}
