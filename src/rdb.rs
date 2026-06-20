@@ -25,22 +25,20 @@ pub fn configured_path() -> String {
 // --- save -------------------------------------------------------------------
 
 pub fn save(db: &Db, path: &str) -> io::Result<()> {
+    // Serialize at the call site (a consistent point-in-time), then write
+    // crash-safely. `serialize` produces exactly this file's bytes.
+    write_snapshot(&serialize(db), path)
+}
+
+/// Crash-safe write of a pre-serialized snapshot: temp file -> fsync -> atomic
+/// rename -> directory fsync. Splitting this out lets BGSAVE serialize on the
+/// hub (consistent) and hand the bytes to a background thread for the slow I/O.
+pub fn write_snapshot(bytes: &[u8], path: &str) -> io::Result<()> {
     let tmp = format!("{path}.tmp");
     {
         let file = File::create(&tmp)?;
         let mut w = BufWriter::new(file);
-        w.write_all(MAGIC)?;
-        w.write_all(&(db.entries().count() as u64).to_le_bytes())?;
-        for (key, value) in db.entries() {
-            match db.raw_expire(key) {
-                Some(deadline) => {
-                    w.write_all(&[1])?;
-                    w.write_all(&deadline.to_le_bytes())?;
-                }
-                None => w.write_all(&[0])?,
-            }
-            write_value(&mut w, key, value)?;
-        }
+        w.write_all(bytes)?;
         w.flush()?;
         w.get_ref().sync_all()?; // fsync the data before we rename
     }

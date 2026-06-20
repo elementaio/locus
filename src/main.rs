@@ -188,6 +188,8 @@ struct Hub {
     loopback: HashSet<u64>, // client ids whose peer is a loopback address
     // password this node presents to its master (replica side); None = none.
     masterauth: Option<Vec<u8>>,
+    // true while a background save's write+fsync is running off the hub thread.
+    bgsave_in_progress: Arc<AtomicBool>,
 }
 
 /// A secondary index over one hash field: a sorted field-value → keys map, plus
@@ -314,6 +316,7 @@ impl Hub {
                 .ok()
                 .map(String::into_bytes)
                 .filter(|p| !p.is_empty()),
+            bgsave_in_progress: Arc::new(AtomicBool::new(false)),
         }
     }
 
@@ -628,6 +631,27 @@ impl Hub {
                     _ => resp::error("ERR AOF is not enabled"),
                 };
                 self.send(id, reply);
+            }
+            b"BGSAVE" => {
+                if self.bgsave_in_progress.load(Ordering::Relaxed) {
+                    self.send(id, resp::error("ERR Background save already in progress"));
+                } else {
+                    // Serialize on the hub (a consistent point-in-time snapshot),
+                    // then write + fsync off-thread so the disk I/O doesn't stall
+                    // the command loop. This makes the "started" reply truthful.
+                    let bytes = rdb::serialize(&self.db);
+                    let path = rdb::configured_path();
+                    let flag = self.bgsave_in_progress.clone();
+                    flag.store(true, Ordering::Relaxed);
+                    thread::spawn(move || {
+                        match rdb::write_snapshot(&bytes, &path) {
+                            Ok(()) => log::info("background save complete"),
+                            Err(e) => log::error(&format!("background save failed: {e}")),
+                        }
+                        flag.store(false, Ordering::Relaxed);
+                    });
+                    self.send(id, resp::simple_string("Background saving started"));
+                }
             }
             b"SHUTDOWN" => {
                 let nosave = tokens

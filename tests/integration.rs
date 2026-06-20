@@ -881,6 +881,28 @@ fn shutdown_command_persists_and_exits_cleanly() {
 }
 
 #[test]
+fn bgsave_is_async_and_writes_the_snapshot() {
+    let s = Server::start();
+    let mut c = s.connect();
+    assert_eq!(c.cmd(&["SET", "persisted", "yes"]), "OK");
+    assert_eq!(c.cmd(&["BGSAVE"]), "Background saving started");
+    // The hub stays responsive (the write+fsync ran off-thread, not inline)...
+    assert_eq!(c.cmd(&["PING"]), "PONG");
+    // ...and the snapshot lands on disk shortly after.
+    let deadline = Instant::now() + Duration::from_secs(3);
+    loop {
+        if std::fs::metadata(&s.rdb)
+            .map(|m| m.len() > 0)
+            .unwrap_or(false)
+        {
+            break;
+        }
+        assert!(Instant::now() < deadline, "BGSAVE never wrote the snapshot");
+        sleep(Duration::from_millis(20));
+    }
+}
+
+#[test]
 fn replica_authenticates_to_a_password_protected_master() {
     let master = Server::start_inner(&[("LOCUS_REQUIREPASS", "mpw")]);
     let replica = Server::start_inner(&[("LOCUS_MASTERAUTH", "mpw")]);

@@ -245,10 +245,7 @@ pub fn execute(tokens: &[Vec<u8>], db: &mut Db) -> Vec<u8> {
             Ok(()) => simple_string("OK"),
             Err(e) => error(&format!("ERR {e}")),
         },
-        b"BGSAVE" => match rdb::save(db, &rdb::configured_path()) {
-            Ok(()) => simple_string("Background saving started"),
-            Err(e) => error(&format!("ERR {e}")),
-        },
+        // BGSAVE is handled by the hub (async background write).
         // stubs
         b"COMMAND" => b"*0\r\n".to_vec(),
         b"CONFIG" => match tokens.get(1).map(|t| t.to_ascii_uppercase()).as_deref() {
