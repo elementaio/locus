@@ -1382,6 +1382,53 @@ impl Hub {
                 _ => return self.send(id, resp::error("NOPROTO unsupported protocol version")),
             }
         }
+        // Optional `AUTH <user> <pass>` (and accepted-but-ignored `SETNAME
+        // <name>`) clauses, so clients can authenticate and select the protocol
+        // in one round-trip (redis-cli / ioredis do this on connect).
+        let mut i = 2;
+        while i < tokens.len() {
+            if tokens[i].eq_ignore_ascii_case(b"AUTH") && i + 2 < tokens.len() {
+                let ok = match &self.requirepass {
+                    None => {
+                        return self.send(
+                            id,
+                            resp::error(
+                                "ERR Client sent AUTH, but no password is set. Did you mean AUTH <username> <password>?",
+                            ),
+                        );
+                    }
+                    Some(secret) => {
+                        tokens[i + 1].eq_ignore_ascii_case(b"default")
+                            && ct_eq(secret, &tokens[i + 2])
+                    }
+                };
+                if ok {
+                    self.authed.insert(id);
+                } else {
+                    return self.send(
+                        id,
+                        resp::error(
+                            "WRONGPASS invalid username-password pair or user is disabled.",
+                        ),
+                    );
+                }
+                i += 3;
+            } else if tokens[i].eq_ignore_ascii_case(b"SETNAME") && i + 1 < tokens.len() {
+                i += 2; // client name accepted and ignored (CLIENT SETNAME is later)
+            } else {
+                return self.send(id, resp::error("ERR Syntax error in HELLO"));
+            }
+        }
+        // If a password is required and the client hasn't authenticated (here or
+        // via a prior AUTH), refuse the upgrade — Redis HELLO semantics.
+        if self.requirepass.is_some() && !self.authed.contains(&id) {
+            return self.send(
+                id,
+                resp::error(
+                    "NOAUTH HELLO must be called with the client already authenticated, otherwise the HELLO <proto> AUTH <user> <pass> option can be used to authenticate the client and select the RESP protocol version at the same time",
+                ),
+            );
+        }
         self.protos.insert(id, proto);
         let role = if self.master.is_some() {
             "replica"

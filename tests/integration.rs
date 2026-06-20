@@ -839,6 +839,25 @@ fn auth_required_blocks_until_authenticated() {
 }
 
 #[test]
+fn hello_auth_authenticates_on_connect() {
+    let s = Server::start_inner(&[("LOCUS_REQUIREPASS", "pw")]);
+    let mut c = s.connect();
+    // A bare HELLO while unauthenticated is refused (no server-info leak).
+    assert!(c.cmd(&["HELLO", "3"]).starts_with("-NOAUTH"));
+    // HELLO with an AUTH clause authenticates and returns the server map.
+    let reply = c.cmd(&["HELLO", "3", "AUTH", "default", "pw"]);
+    assert!(reply.contains("proto"), "expected HELLO map, got {reply}");
+    // ...and the connection is now usable.
+    assert_eq!(c.cmd(&["SET", "k", "v"]), "OK");
+    // A wrong password in HELLO is rejected and does not upgrade the connection.
+    let mut c2 = s.connect();
+    assert!(
+        c2.cmd(&["HELLO", "3", "AUTH", "default", "nope"])
+            .starts_with("-WRONGPASS")
+    );
+}
+
+#[test]
 fn auth_with_no_password_set_is_an_error() {
     let s = Server::start();
     let mut c = s.connect();
