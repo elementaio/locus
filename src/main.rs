@@ -23,7 +23,7 @@ mod streams;
 use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 use std::io::{self, Read, Write};
 use std::net::{TcpListener, TcpStream};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, mpsc};
 use std::thread;
 use std::time::Duration;
@@ -36,10 +36,15 @@ use resp::{Parsed, parse_command};
 /// Reserved client id for commands replicated from a master.
 const MASTER_ID: u64 = 0;
 
+/// Returned to a non-loopback client when protected mode is active (no password
+/// set). Mirrors Redis's protected-mode guidance.
+const PROTECTED_MODE_MSG: &str = "DENIED Locus is running in protected mode because protected mode is enabled and no password is set. To use Locus from a non-loopback address, set a password (LOCUS_REQUIREPASS / requirepass), or disable protected mode with LOCUS_PROTECTED_MODE=no — only on a trusted network or behind TLS.";
+
 enum Msg {
     Connect {
         id: u64,
         out: mpsc::Sender<Vec<u8>>,
+        loopback: bool,
     },
     Command {
         id: u64,
@@ -52,10 +57,35 @@ enum Msg {
     ReplaceDb(Box<Db>),
 }
 
+/// Set by the SIGTERM/SIGINT handler so the hub can persist and exit cleanly.
+static SHUTDOWN: AtomicBool = AtomicBool::new(false);
+
+// std has no signal API, so bind the platform libc's signal(2) via FFI. This
+// adds NO third-party crate — it's the C runtime the binary already links.
+unsafe extern "C" {
+    fn signal(signum: i32, handler: extern "C" fn(i32)) -> usize;
+}
+
+extern "C" fn on_signal(_sig: i32) {
+    // Async-signal-safe: just flip an atomic; the hub does the real work.
+    SHUTDOWN.store(true, Ordering::SeqCst);
+}
+
+/// Install SIGINT (2) and SIGTERM (15) handlers for graceful shutdown.
+fn install_signal_handlers() {
+    // SAFETY: the handler only performs an atomic store (async-signal-safe);
+    // registering it has no other effects.
+    unsafe {
+        signal(2, on_signal);
+        signal(15, on_signal);
+    }
+}
+
 fn main() -> io::Result<()> {
     let (tx, rx) = mpsc::channel::<Msg>();
     let hub_tx = tx.clone();
     thread::spawn(move || run_hub(rx, hub_tx));
+    install_signal_handlers();
 
     let port = std::env::var("LOCUS_PORT").unwrap_or_else(|_| "6379".to_string());
     // Bind to loopback by default (Locus has no AUTH/TLS — don't expose it by
@@ -66,14 +96,32 @@ fn main() -> io::Result<()> {
     // Print the ACTUAL bound address (port may be OS-assigned when LOCUS_PORT=0).
     println!("Locus listening on {}", listener.local_addr()?);
 
+    // Cap concurrent connections (Redis-style maxclients) so a connection flood
+    // can't exhaust threads/memory. A per-connection RAII guard decrements the
+    // live count when each connection's thread ends.
+    let max_clients: usize = std::env::var("LOCUS_MAXCLIENTS")
+        .ok()
+        .and_then(|s| s.trim().parse().ok())
+        .filter(|&n| n > 0)
+        .unwrap_or(10_000);
+    let conns = Arc::new(AtomicUsize::new(0));
+
     let mut next_id: u64 = 1; // 0 is reserved for the master
     for stream in listener.incoming() {
         match stream {
-            Ok(conn) => {
+            Ok(mut conn) => {
+                if conns.fetch_add(1, Ordering::Relaxed) >= max_clients {
+                    conns.fetch_sub(1, Ordering::Relaxed);
+                    let _ = conn.write_all(b"-ERR max number of clients reached\r\n");
+                    eprintln!("rejected connection: max clients ({max_clients}) reached");
+                    continue;
+                }
                 let id = next_id;
                 next_id += 1;
                 let tx = tx.clone();
+                let guard = ConnGuard(conns.clone());
                 thread::spawn(move || {
+                    let _guard = guard;
                     if let Err(e) = handle_conn(conn, id, tx) {
                         eprintln!("connection error: {e}");
                     }
@@ -83,6 +131,15 @@ fn main() -> io::Result<()> {
         }
     }
     Ok(())
+}
+
+/// Decrements the live-connection counter when a connection's thread ends, so the
+/// maxclients cap reflects real disconnects (including early returns / panics).
+struct ConnGuard(Arc<AtomicUsize>);
+impl Drop for ConnGuard {
+    fn drop(&mut self) {
+        self.0.fetch_sub(1, Ordering::Relaxed);
+    }
 }
 
 // === the hub ================================================================
@@ -117,6 +174,14 @@ struct Hub {
     cdc_groups: HashMap<Vec<u8>, CdcGroup>,
     // secondary indexes over a hash field, by index name (in-memory)
     indexes: HashMap<Vec<u8>, SecondaryIndex>,
+    // authentication: the active shared secret (None = open) and the set of
+    // client ids that have authenticated. Checked in the single-threaded hub, so
+    // there is no locking and no auth-state race.
+    requirepass: Option<Vec<u8>>,
+    authed: HashSet<u64>,
+    // protected mode: refuse non-loopback clients while no password is set.
+    protected_mode: bool,
+    loopback: HashSet<u64>, // client ids whose peer is a loopback address
 }
 
 /// A secondary index over one hash field: a sorted field-value → keys map, plus
@@ -225,6 +290,20 @@ impl Hub {
                 .unwrap_or(0),
             cdc_groups: HashMap::new(),
             indexes: HashMap::new(),
+            requirepass: std::env::var("LOCUS_REQUIREPASS")
+                .ok()
+                .map(String::into_bytes)
+                .filter(|p| !p.is_empty()),
+            authed: HashSet::new(),
+            protected_mode: std::env::var("LOCUS_PROTECTED_MODE")
+                .map(|v| {
+                    !matches!(
+                        v.trim().to_ascii_lowercase().as_str(),
+                        "no" | "false" | "0" | "off"
+                    )
+                })
+                .unwrap_or(true),
+            loopback: HashSet::new(),
         }
     }
 
@@ -234,11 +313,49 @@ impl Hub {
         }
     }
 
+    /// Flush the AOF and (unless NOSAVE) write a final snapshot, then exit 0.
+    /// Used by SIGTERM/SIGINT and the SHUTDOWN command so a restart loses nothing
+    /// beyond the configured fsync window.
+    fn persist_and_exit(&mut self, save: bool) -> ! {
+        if let Some(a) = self.aof.as_mut() {
+            a.fsync();
+        }
+        if save && let Err(e) = rdb::save(&self.db, &rdb::configured_path()) {
+            eprintln!("shutdown: final save failed: {e}");
+        }
+        println!("Locus shutting down");
+        std::process::exit(0);
+    }
+
     fn handle_command(&mut self, id: u64, tokens: Vec<Vec<u8>>) {
         if tokens.is_empty() {
             return;
         }
         let cmd = tokens[0].to_ascii_uppercase();
+
+        // Protected mode: if no password is set, refuse non-loopback clients so an
+        // accidentally-exposed instance (e.g. the 0.0.0.0 Docker image) isn't wide
+        // open. Setting a password — or LOCUS_PROTECTED_MODE=no — lifts this. QUIT
+        // is allowed so a remote client can disconnect cleanly.
+        if self.protected_mode
+            && self.requirepass.is_none()
+            && id != MASTER_ID
+            && !self.loopback.contains(&id)
+            && cmd.as_slice() != b"QUIT"
+        {
+            return self.send(id, resp::error(PROTECTED_MODE_MSG));
+        }
+
+        // Authentication gate: when a password is set, a connection must AUTH
+        // before running anything but the connection-setup commands. The master
+        // replication stream (id 0) is internally trusted.
+        if self.requirepass.is_some()
+            && id != MASTER_ID
+            && !self.authed.contains(&id)
+            && !is_no_auth(&cmd)
+        {
+            return self.send(id, resp::error("NOAUTH Authentication required."));
+        }
 
         // A connection in pub/sub or changefeed "push mode" may only run the
         // push-control commands (plus PING/QUIT/RESET) — replies must not
@@ -448,6 +565,7 @@ impl Hub {
             b"CDCPENDING" => self.handle_cdc_pending(id, &tokens),
             b"XREAD" => self.handle_xread(id, &tokens),
             b"HELLO" => self.handle_hello(id, &tokens),
+            b"AUTH" => self.handle_auth(id, &tokens),
 
             // --- replication ---
             b"REPLCONF" => self.send(id, resp::simple_string("OK")),
@@ -500,6 +618,12 @@ impl Hub {
                     _ => resp::error("ERR AOF is not enabled"),
                 };
                 self.send(id, reply);
+            }
+            b"SHUTDOWN" => {
+                let nosave = tokens
+                    .get(1)
+                    .is_some_and(|a| a.eq_ignore_ascii_case(b"NOSAVE"));
+                self.persist_and_exit(!nosave);
             }
 
             // --- everything else (data commands) ---
@@ -1203,6 +1327,43 @@ impl Hub {
     /// RESP3 map (proto 3) or RESP2 flat array (proto 2). Most reply types are
     /// identical across RESP2/RESP3, so we track the version but keep the
     /// existing encoders (full RESP3 typing of every reply is a later extension).
+    fn handle_auth(&mut self, id: u64, tokens: &[Vec<u8>]) {
+        // AUTH <password>  or  AUTH <username> <password>. Only the implicit
+        // "default" user exists today, so any other username is rejected.
+        let pass = match tokens.len() {
+            2 => &tokens[1],
+            3 if tokens[1].eq_ignore_ascii_case(b"default") => &tokens[2],
+            3 => {
+                return self.send(
+                    id,
+                    resp::error("WRONGPASS invalid username-password pair or user is disabled."),
+                );
+            }
+            _ => {
+                return self.send(
+                    id,
+                    resp::error("ERR wrong number of arguments for 'auth' command"),
+                );
+            }
+        };
+        match &self.requirepass {
+            None => self.send(
+                id,
+                resp::error(
+                    "ERR Client sent AUTH, but no password is set. Did you mean AUTH <username> <password>?",
+                ),
+            ),
+            Some(secret) if ct_eq(secret, pass) => {
+                self.authed.insert(id);
+                self.send(id, resp::simple_string("OK"));
+            }
+            Some(_) => self.send(
+                id,
+                resp::error("WRONGPASS invalid username-password pair or user is disabled."),
+            ),
+        }
+    }
+
     fn handle_hello(&mut self, id: u64, tokens: &[Vec<u8>]) {
         let mut proto = 2u8;
         if let Some(v) = tokens.get(1) {
@@ -1456,6 +1617,36 @@ fn is_tx_control(cmd: &[u8]) -> bool {
     )
 }
 
+/// Commands a not-yet-authenticated connection may run when a password is set:
+/// the connection-setup verbs needed to perform (or precede) AUTH.
+fn is_no_auth(cmd: &[u8]) -> bool {
+    matches!(cmd, b"AUTH" | b"HELLO" | b"QUIT" | b"RESET")
+}
+
+/// Constant-time equality: folds the whole comparison (including a length
+/// mismatch) into one accumulator and always scans the longer slice, so AUTH
+/// latency doesn't reveal how much of the secret matched.
+fn ct_eq(a: &[u8], b: &[u8]) -> bool {
+    let mut diff: u8 = if a.len() == b.len() { 0 } else { 1 };
+    let n = a.len().max(b.len());
+    for i in 0..n {
+        let x = a.get(i).copied().unwrap_or(0);
+        let y = b.get(i).copied().unwrap_or(0);
+        diff |= x ^ y;
+    }
+    diff == 0
+}
+
+/// Idle read timeout (LOCUS_TIMEOUT seconds); 0/unset means no timeout, matching
+/// the Redis default. Drops connections that go silent (basic slow-loris guard).
+fn idle_timeout() -> Option<Duration> {
+    std::env::var("LOCUS_TIMEOUT")
+        .ok()
+        .and_then(|s| s.trim().parse::<u64>().ok())
+        .filter(|&s| s > 0)
+        .map(Duration::from_secs)
+}
+
 /// Keys a write command modifies (for WATCH dirtying + memory resync). Most
 /// commands touch a single key at position 1; the multi-key writes are spelled
 /// out. FLUSHDB/FLUSHALL touch every key — handled separately via the keyspace's
@@ -1535,8 +1726,11 @@ fn run_hub(rx: mpsc::Receiver<Msg>, tx: mpsc::Sender<Msg>) {
     let mut hub = Hub::new(tx);
     loop {
         match rx.recv_timeout(Duration::from_millis(100)) {
-            Ok(Msg::Connect { id, out }) => {
+            Ok(Msg::Connect { id, out, loopback }) => {
                 hub.clients.insert(id, out);
+                if loopback {
+                    hub.loopback.insert(id);
+                }
             }
             Ok(Msg::Disconnect { id }) => {
                 hub.clients.remove(&id);
@@ -1548,6 +1742,8 @@ fn run_hub(rx: mpsc::Receiver<Msg>, tx: mpsc::Sender<Msg>) {
                 hub.blocked.retain(|r| r.id != id);
                 hub.protos.remove(&id);
                 hub.changefeeds.remove(&id);
+                hub.authed.remove(&id);
+                hub.loopback.remove(&id);
             }
             Ok(Msg::Command { id, tokens }) => hub.handle_command(id, tokens),
             Ok(Msg::ReplaceDb(db)) => {
@@ -1557,6 +1753,15 @@ fn run_hub(rx: mpsc::Receiver<Msg>, tx: mpsc::Sender<Msg>) {
                 hub.serve_blocked();
             }
             Err(mpsc::RecvTimeoutError::Timeout) => {
+                if SHUTDOWN.load(Ordering::Relaxed) {
+                    // Drain anything already queued, then persist and exit.
+                    while let Ok(msg) = rx.try_recv() {
+                        if let Msg::Command { id, tokens } = msg {
+                            hub.handle_command(id, tokens);
+                        }
+                    }
+                    hub.persist_and_exit(true);
+                }
                 if let Some(a) = hub.aof.as_mut() {
                     a.maybe_fsync();
                 }
@@ -1696,6 +1901,13 @@ fn read_bulk_header(s: &mut TcpStream) -> io::Result<usize> {
 
 fn handle_conn(conn: TcpStream, id: u64, tx: mpsc::Sender<Msg>) -> io::Result<()> {
     let peer = conn.peer_addr()?;
+    let is_loopback = peer.ip().is_loopback();
+    // Commands/replies are small — disable Nagle for latency. An optional idle
+    // read timeout (LOCUS_TIMEOUT) drops silent / slow-loris connections.
+    let _ = conn.set_nodelay(true);
+    if let Some(t) = idle_timeout() {
+        let _ = conn.set_read_timeout(Some(t));
+    }
     println!("client connected: {peer}");
 
     let mut write_half = conn.try_clone()?;
@@ -1712,6 +1924,7 @@ fn handle_conn(conn: TcpStream, id: u64, tx: mpsc::Sender<Msg>) -> io::Result<()
         .send(Msg::Connect {
             id,
             out: out_tx.clone(),
+            loopback: is_loopback,
         })
         .is_err()
     {
@@ -1767,7 +1980,18 @@ mod tests {
         assert_eq!(commands::min_arity(b"SET"), Some(3));
         assert_eq!(commands::min_arity(b"XADD"), Some(5));
         assert_eq!(commands::min_arity(b"PING"), Some(1));
+        assert_eq!(commands::min_arity(b"AUTH"), Some(2));
         assert_eq!(commands::min_arity(b"NOTACOMMAND"), None);
+    }
+
+    #[test]
+    fn ct_eq_matches_only_equal_slices() {
+        assert!(ct_eq(b"secret", b"secret"));
+        assert!(ct_eq(b"", b""));
+        assert!(!ct_eq(b"secret", b"secrxt")); // same length, one byte differs
+        assert!(!ct_eq(b"secret", b"secre")); // shorter
+        assert!(!ct_eq(b"secret", b"secrets")); // longer
+        assert!(!ct_eq(b"", b"x"));
     }
 
     #[test]

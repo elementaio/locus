@@ -82,6 +82,19 @@ impl Server {
             stream,
         }
     }
+
+    /// Wait (with a timeout) for the server to exit on its own — e.g. after a
+    /// SHUTDOWN command or a signal — and return its exit status.
+    fn wait_exit(&mut self) -> std::process::ExitStatus {
+        let deadline = Instant::now() + Duration::from_secs(5);
+        loop {
+            if let Some(status) = self.child.try_wait().expect("try_wait") {
+                return status;
+            }
+            assert!(Instant::now() < deadline, "server did not exit in time");
+            sleep(Duration::from_millis(20));
+        }
+    }
 }
 
 impl Drop for Server {
@@ -801,4 +814,49 @@ fn replica_receives_writes_from_master() {
     }
     // Replicas reject writes.
     assert!(r.cmd(&["SET", "x", "y"]).starts_with("-READONLY"));
+}
+
+// === auth + graceful shutdown ===============================================
+
+#[test]
+fn auth_required_blocks_until_authenticated() {
+    let s = Server::start_inner(&[("LOCUS_REQUIREPASS", "s3cret")]);
+    let mut c = s.connect();
+    // Unauthenticated: every data command is refused with NOAUTH.
+    assert!(c.cmd(&["GET", "k"]).starts_with("-NOAUTH"));
+    assert!(c.cmd(&["SET", "k", "v"]).starts_with("-NOAUTH"));
+    // A wrong password is rejected and does NOT authenticate the connection.
+    assert!(c.cmd(&["AUTH", "wrong"]).starts_with("-WRONGPASS"));
+    assert!(c.cmd(&["GET", "k"]).starts_with("-NOAUTH"));
+    // The right password unlocks the connection.
+    assert_eq!(c.cmd(&["AUTH", "s3cret"]), "OK");
+    assert_eq!(c.cmd(&["SET", "k", "v"]), "OK");
+    assert_eq!(c.cmd(&["GET", "k"]), "v");
+    // The `AUTH default <pass>` form works too, on a fresh connection.
+    let mut c2 = s.connect();
+    assert_eq!(c2.cmd(&["AUTH", "default", "s3cret"]), "OK");
+    assert_eq!(c2.cmd(&["GET", "k"]), "v");
+}
+
+#[test]
+fn auth_with_no_password_set_is_an_error() {
+    let s = Server::start();
+    let mut c = s.connect();
+    // No requirepass configured: AUTH has nothing to check against.
+    assert!(c.cmd(&["AUTH", "whatever"]).starts_with("-ERR"));
+    // ...and commands work without any AUTH (loopback, no protected-mode block).
+    assert_eq!(c.cmd(&["SET", "k", "v"]), "OK");
+}
+
+#[test]
+fn shutdown_command_persists_and_exits_cleanly() {
+    let mut s = Server::start();
+    let mut c = s.connect();
+    assert_eq!(c.cmd(&["SET", "k", "v"]), "OK");
+    // SHUTDOWN drains, fsyncs, writes a final snapshot, and exits 0.
+    c.send(&["SHUTDOWN"]);
+    assert!(
+        s.wait_exit().success(),
+        "graceful shutdown should exit with status 0"
+    );
 }
