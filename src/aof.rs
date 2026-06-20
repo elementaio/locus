@@ -66,14 +66,21 @@ impl Aof {
     /// fsync at most once per second (the "everysec" policy).
     pub fn maybe_fsync(&mut self) {
         if now_ms().saturating_sub(self.last_fsync) >= 1000 {
-            let _ = self.file.sync_data();
-            self.last_fsync = now_ms();
+            self.do_fsync();
         }
     }
 
     /// Force an fsync now, regardless of the everysec timer (graceful shutdown).
     pub fn fsync(&mut self) {
-        let _ = self.file.sync_data();
+        self.do_fsync();
+    }
+
+    /// fsync the AOF, surfacing (not swallowing) a failure — a silently-dropped
+    /// fsync error means "everysec" durability is quietly broken.
+    fn do_fsync(&mut self) {
+        if let Err(e) = self.file.sync_data() {
+            crate::log::error(&format!("AOF fsync failed: {e}"));
+        }
         self.last_fsync = now_ms();
     }
 }
@@ -251,6 +258,7 @@ pub fn rewrite(db: &Db, path: &str) -> io::Result<()> {
         w.sync_all()?;
     }
     fs::rename(&tmp, path)?;
+    crate::rdb::fsync_parent_dir(path); // make the rename durable
     Ok(())
 }
 

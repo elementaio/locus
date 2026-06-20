@@ -45,7 +45,28 @@ pub fn save(db: &Db, path: &str) -> io::Result<()> {
         w.get_ref().sync_all()?; // fsync the data before we rename
     }
     fs::rename(&tmp, path)?; // atomic replace
+    fsync_parent_dir(path); // make the rename itself durable
     Ok(())
+}
+
+/// Best-effort fsync of the directory holding `path`, so a rename's metadata
+/// survives a power loss too (the data file is already fsynced before the
+/// rename). Logged, not fatal — some filesystems don't permit directory fsync.
+/// Shared with the AOF rewrite path.
+pub(crate) fn fsync_parent_dir(path: &str) {
+    let parent = std::path::Path::new(path).parent();
+    let dir = match parent {
+        Some(p) if !p.as_os_str().is_empty() => p,
+        _ => std::path::Path::new("."),
+    };
+    match File::open(dir) {
+        Ok(d) => {
+            if let Err(e) = d.sync_all() {
+                crate::log::warn(&format!("fsync of dir {} failed: {e}", dir.display()));
+            }
+        }
+        Err(e) => crate::log::warn(&format!("open dir {} for fsync failed: {e}", dir.display())),
+    }
 }
 
 fn write_bytes<W: Write>(w: &mut W, b: &[u8]) -> io::Result<()> {
