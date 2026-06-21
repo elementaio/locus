@@ -1106,3 +1106,25 @@ fn info_has_standard_sections() {
         assert!(info.contains(needle), "INFO missing {needle:?}:\n{info}");
     }
 }
+
+#[test]
+fn getex_object_and_client_verbs() {
+    let s = Server::start();
+    let mut c = s.connect();
+    c.cmd(&["SET", "k", "v"]);
+    // GETEX returns the value and can set then clear the TTL.
+    assert_eq!(c.cmd(&["GETEX", "k"]), "v");
+    assert_eq!(c.cmd(&["GETEX", "k", "EX", "1000"]), "v");
+    assert!(c.cmd(&["TTL", "k"]).parse::<i64>().unwrap() > 0);
+    assert_eq!(c.cmd(&["GETEX", "k", "PERSIST"]), "v");
+    assert_eq!(c.cmd(&["TTL", "k"]), "-1");
+    // OBJECT ENCODING reports a plausible per-type encoding.
+    assert_eq!(c.cmd(&["OBJECT", "ENCODING", "k"]), "raw");
+    c.cmd(&["RPUSH", "l", "a"]);
+    assert_eq!(c.cmd(&["OBJECT", "ENCODING", "l"]), "listpack");
+    // CLIENT ID / SETNAME / GETNAME / SETINFO.
+    assert!(c.cmd(&["CLIENT", "ID"]).parse::<i64>().is_ok());
+    assert_eq!(c.cmd(&["CLIENT", "SETNAME", "app1"]), "OK");
+    assert_eq!(c.cmd(&["CLIENT", "GETNAME"]), "app1");
+    assert_eq!(c.cmd(&["CLIENT", "SETINFO", "lib-name", "ioredis"]), "OK");
+}

@@ -194,6 +194,8 @@ struct Hub {
     // observability: process start (uptime) + a cheap command counter for INFO.
     start: Instant,
     commands_processed: u64,
+    // per-client name set via CLIENT SETNAME (for CLIENT GETNAME / LIST).
+    client_names: HashMap<u64, Vec<u8>>,
 }
 
 /// A secondary index over one hash field: a sorted field-value → keys map, plus
@@ -328,6 +330,7 @@ impl Hub {
             bgsave_in_progress: Arc::new(AtomicBool::new(false)),
             start: Instant::now(),
             commands_processed: 0,
+            client_names: HashMap::new(),
         };
         hub.apply_extras(extras);
         hub
@@ -531,6 +534,39 @@ impl Hub {
             _ => self.send(
                 id,
                 resp::error("ERR Unknown CONFIG subcommand or wrong number of arguments"),
+            ),
+        }
+    }
+
+    fn handle_client(&mut self, id: u64, tokens: &[Vec<u8>]) {
+        match tokens.get(1).map(|t| t.to_ascii_uppercase()).as_deref() {
+            Some(b"ID") => self.send(id, resp::integer(id as i64)),
+            Some(b"SETNAME") if tokens.len() == 3 => {
+                self.client_names.insert(id, tokens[2].clone());
+                self.send(id, resp::simple_string("OK"));
+            }
+            Some(b"GETNAME") => {
+                let name = self.client_names.get(&id).cloned().unwrap_or_default();
+                self.send(id, resp::bulk_string(&name));
+            }
+            // Drivers send CLIENT SETINFO lib-name/lib-ver on connect; accept it.
+            Some(b"SETINFO") => self.send(id, resp::simple_string("OK")),
+            Some(b"NO-EVICT") | Some(b"NO-TOUCH") => self.send(id, resp::simple_string("OK")),
+            Some(b"LIST") => {
+                let mut s = String::new();
+                for &cid in self.clients.keys() {
+                    let name = self
+                        .client_names
+                        .get(&cid)
+                        .map(|n| String::from_utf8_lossy(n).into_owned())
+                        .unwrap_or_default();
+                    s.push_str(&format!("id={cid} name={name} db=0\n"));
+                }
+                self.send(id, resp::bulk_string(s.as_bytes()));
+            }
+            _ => self.send(
+                id,
+                resp::error("ERR Unknown CLIENT subcommand or wrong number of arguments"),
             ),
         }
     }
@@ -878,6 +914,7 @@ impl Hub {
             b"REPLICAOF" | b"SLAVEOF" => self.handle_replicaof(id, &tokens),
             b"INFO" => self.send(id, self.render_info()),
             b"CONFIG" => self.handle_config(id, &tokens),
+            b"CLIENT" => self.handle_client(id, &tokens),
 
             // --- persistence (owner-side) ---
             b"BGREWRITEAOF" => {
@@ -2082,6 +2119,7 @@ fn run_hub(rx: mpsc::Receiver<Msg>, tx: mpsc::Sender<Msg>) {
                 hub.changefeeds.remove(&id);
                 hub.authed.remove(&id);
                 hub.loopback.remove(&id);
+                hub.client_names.remove(&id);
             }
             Ok(Msg::Command { id, tokens }) => hub.handle_command(id, tokens),
             Ok(Msg::ReplaceDb(db, extras)) => {

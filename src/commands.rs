@@ -124,6 +124,8 @@ pub fn execute(tokens: &[Vec<u8>], db: &mut Db) -> Vec<u8> {
         // strings
         b"SET" => set_cmd(db, tokens),
         b"GET" => get_cmd(db, tokens),
+        b"GETEX" => getex_cmd(db, tokens),
+        b"OBJECT" => object_cmd(db, tokens),
         b"GETDEL" => getdel_cmd(db, tokens),
         b"GETSET" => getset_cmd(db, tokens),
         b"SETNX" => setnx_cmd(db, tokens),
@@ -289,10 +291,10 @@ pub fn command_meta(cmd: &[u8]) -> Option<CmdMeta> {
         | b"EXISTS" | b"TOUCH" | b"KEYS" | b"MGET" | b"SINTER" | b"SUNION" | b"SDIFF"
         | b"WATCH" | b"SUBSCRIBE" | b"PSUBSCRIBE" | b"PUBSUB" | b"BITCOUNT" | b"SRANDMEMBER"
         | b"SELECT" | b"CDCREAD" | b"CDCPENDING" | b"GEOPOS" | b"TOPKLIST" | b"IDXDROP"
-        | b"AUTH" | b"SCAN" => (2, false),
+        | b"AUTH" | b"SCAN" | b"OBJECT" | b"CLIENT" => (2, false),
         // arity 2 writes
         b"PERSIST" | b"INCR" | b"DECR" | b"GETDEL" | b"LPOP" | b"RPOP" | b"SPOP" | b"ZPOPMIN"
-        | b"ZPOPMAX" | b"DEL" | b"UNLINK" => (2, true),
+        | b"ZPOPMAX" | b"DEL" | b"UNLINK" | b"GETEX" => (2, true),
         // arity 3 reads
         b"LINDEX" | b"HGET" | b"HEXISTS" | b"HMGET" | b"SISMEMBER" | b"SMISMEMBER" | b"ZSCORE"
         | b"ZMSCORE" | b"ZRANK" | b"ZREVRANK" | b"PUBLISH" | b"REPLICAOF" | b"SLAVEOF"
@@ -625,6 +627,88 @@ fn zscan_cmd(db: &mut Db, tokens: &[Vec<u8>]) -> Vec<u8> {
         out.push(fmt_score(s));
     }
     scan_reply(next, &out)
+}
+
+fn getex_cmd(db: &mut Db, tokens: &[Vec<u8>]) -> Vec<u8> {
+    if tokens.len() < 2 {
+        return wrong_args("getex");
+    }
+    let key = &tokens[1];
+    let val = match db.get(key) {
+        None => return null_bulk(),
+        Some(Value::Str(s)) => s.clone(),
+        Some(_) => return wrongtype(),
+    };
+    if tokens.len() > 2 {
+        let opt = tokens[2].to_ascii_uppercase();
+        match opt.as_slice() {
+            b"PERSIST" if tokens.len() == 3 => {
+                db.clear_expire(key);
+            }
+            b"EX" | b"PX" | b"EXAT" | b"PXAT" if tokens.len() == 4 => {
+                let unit = if matches!(opt.as_slice(), b"EX" | b"EXAT") {
+                    1000
+                } else {
+                    1
+                };
+                let absolute = matches!(opt.as_slice(), b"EXAT" | b"PXAT");
+                let n = match parse_int(&tokens[3]) {
+                    Some(n) => n,
+                    None => return not_integer(),
+                };
+                let at = if absolute {
+                    n.checked_mul(unit)
+                } else {
+                    n.checked_mul(unit)
+                        .and_then(|ms| (now_ms() as i64).checked_add(ms))
+                };
+                match at {
+                    Some(t) if t > 0 => db.set_expire(key, t as u64),
+                    _ => return error("ERR invalid expire time in 'getex' command"),
+                }
+            }
+            _ => return error("ERR syntax error"),
+        }
+    }
+    bulk_string(&val)
+}
+
+fn object_cmd(db: &mut Db, tokens: &[Vec<u8>]) -> Vec<u8> {
+    if tokens.len() < 2 {
+        return wrong_args("object");
+    }
+    match tokens[1].to_ascii_uppercase().as_slice() {
+        b"ENCODING" if tokens.len() == 3 => match db.type_name(&tokens[2]) {
+            None => error("ERR no such key"),
+            // Plausible encodings; Locus uses one representation per type.
+            Some(t) => {
+                let enc = match t {
+                    "string" => "raw",
+                    "list" => "listpack",
+                    "hash" | "set" => "hashtable",
+                    "zset" => "skiplist",
+                    other => other,
+                };
+                bulk_string(enc.as_bytes())
+            }
+        },
+        b"REFCOUNT" if tokens.len() == 3 => {
+            if db.contains(&tokens[2]) {
+                integer(1)
+            } else {
+                error("ERR no such key")
+            }
+        }
+        b"IDLETIME" | b"FREQ" if tokens.len() == 3 => {
+            if db.contains(&tokens[2]) {
+                integer(0)
+            } else {
+                error("ERR no such key")
+            }
+        }
+        b"HELP" => simple_string("OBJECT <ENCODING|REFCOUNT|IDLETIME|FREQ> <key>"),
+        _ => error("ERR Unknown OBJECT subcommand or wrong number of arguments"),
+    }
 }
 
 fn dbsize_cmd(db: &mut Db, tokens: &[Vec<u8>]) -> Vec<u8> {
