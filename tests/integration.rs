@@ -948,6 +948,48 @@ fn secondary_index_survives_restart() {
 }
 
 #[test]
+fn aof_recovers_all_acked_writes_after_kill9() {
+    let rdb = format!(
+        "{}/locus-crash-{}.rdb",
+        std::env::temp_dir().display(),
+        std::process::id()
+    );
+    let aof = format!(
+        "{}/locus-crash-{}.aof",
+        std::env::temp_dir().display(),
+        std::process::id()
+    );
+    let _ = std::fs::remove_file(&rdb);
+    let _ = std::fs::remove_file(&aof);
+    // Round 1: AOF on; write 50 keys, then SIGKILL with no graceful shutdown.
+    // Each acked SET was write_all'd to the AOF (into the kernel), so a process
+    // kill (not a power loss) must lose none of them.
+    {
+        let mut s = Server::spawn_at(rdb.clone(), &[("LOCUS_AOF", aof.as_str())]);
+        let mut c = s.connect();
+        for i in 0..50 {
+            assert_eq!(c.cmd(&["SET", &format!("k{i}"), &format!("v{i}")]), "OK");
+        }
+        s.child.kill().unwrap(); // SIGKILL
+        let _ = s.child.wait();
+    }
+    // Round 2: restart on the same AOF — every write replays, uncorrupted, with
+    // no extra or missing keys.
+    {
+        let mut s = Server::spawn_at(rdb.clone(), &[("LOCUS_AOF", aof.as_str())]);
+        let mut c = s.connect();
+        for i in 0..50 {
+            assert_eq!(c.cmd(&["GET", &format!("k{i}")]), format!("v{i}"));
+        }
+        assert_eq!(c.cmd(&["DBSIZE"]), "50");
+        let _ = s.child.kill();
+        let _ = s.child.wait();
+    }
+    let _ = std::fs::remove_file(&rdb);
+    let _ = std::fs::remove_file(&aof);
+}
+
+#[test]
 fn replica_authenticates_to_a_password_protected_master() {
     let master = Server::start_inner(&[("LOCUS_REQUIREPASS", "mpw")]);
     let replica = Server::start_inner(&[("LOCUS_MASTERAUTH", "mpw")]);
