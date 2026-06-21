@@ -196,6 +196,19 @@ struct Hub {
     commands_processed: u64,
     // per-client name set via CLIENT SETNAME (for CLIENT GETNAME / LIST).
     client_names: HashMap<u64, Vec<u8>>,
+    // SLOWLOG: a bounded ring of commands slower than the threshold (newest first).
+    slowlog: VecDeque<SlowEntry>,
+    slowlog_next_id: u64,
+    slowlog_threshold_us: i64, // < 0 disables logging
+    slowlog_max_len: usize,
+}
+
+/// One slow-log entry.
+struct SlowEntry {
+    id: u64,
+    time_secs: u64,
+    micros: u64,
+    args: Vec<Vec<u8>>,
 }
 
 /// A secondary index over one hash field: a sorted field-value → keys map, plus
@@ -331,6 +344,16 @@ impl Hub {
             start: Instant::now(),
             commands_processed: 0,
             client_names: HashMap::new(),
+            slowlog: VecDeque::new(),
+            slowlog_next_id: 0,
+            slowlog_threshold_us: std::env::var("LOCUS_SLOWLOG_US")
+                .ok()
+                .and_then(|s| s.trim().parse().ok())
+                .unwrap_or(10_000),
+            slowlog_max_len: std::env::var("LOCUS_SLOWLOG_MAXLEN")
+                .ok()
+                .and_then(|s| s.trim().parse().ok())
+                .unwrap_or(128),
         };
         hub.apply_extras(extras);
         hub
@@ -567,6 +590,60 @@ impl Hub {
             _ => self.send(
                 id,
                 resp::error("ERR Unknown CLIENT subcommand or wrong number of arguments"),
+            ),
+        }
+    }
+
+    fn push_slowlog(&mut self, micros: u64, args: Vec<Vec<u8>>) {
+        let entry = SlowEntry {
+            id: self.slowlog_next_id,
+            time_secs: now_ms() / 1000,
+            micros,
+            args,
+        };
+        self.slowlog_next_id += 1;
+        self.slowlog.push_front(entry);
+        while self.slowlog.len() > self.slowlog_max_len {
+            self.slowlog.pop_back();
+        }
+    }
+
+    fn handle_slowlog(&mut self, id: u64, tokens: &[Vec<u8>]) {
+        match tokens.get(1).map(|t| t.to_ascii_uppercase()).as_deref() {
+            Some(b"GET") => {
+                let n = tokens
+                    .get(2)
+                    .and_then(|t| std::str::from_utf8(t).ok())
+                    .and_then(|s| s.parse::<i64>().ok());
+                let take = match n {
+                    Some(x) if x >= 0 => (x as usize).min(self.slowlog.len()),
+                    _ => self.slowlog.len(),
+                };
+                let mut reply = format!("*{take}\r\n").into_bytes();
+                for e in self.slowlog.iter().take(take) {
+                    // [id, timestamp, exec_micros, [args], client_addr, client_name]
+                    reply.extend_from_slice(b"*6\r\n");
+                    reply.extend_from_slice(&resp::integer(e.id as i64));
+                    reply.extend_from_slice(&resp::integer(e.time_secs as i64));
+                    reply.extend_from_slice(&resp::integer(e.micros as i64));
+                    reply.extend_from_slice(&resp::bulk_array(&e.args));
+                    reply.extend_from_slice(&resp::bulk_string(b""));
+                    reply.extend_from_slice(&resp::bulk_string(b""));
+                }
+                self.send(id, reply);
+            }
+            Some(b"LEN") => self.send(id, resp::integer(self.slowlog.len() as i64)),
+            Some(b"RESET") => {
+                self.slowlog.clear();
+                self.send(id, resp::simple_string("OK"));
+            }
+            Some(b"HELP") => self.send(
+                id,
+                resp::simple_string("SLOWLOG GET [count] | LEN | RESET | HELP"),
+            ),
+            _ => self.send(
+                id,
+                resp::error("ERR Unknown SLOWLOG subcommand or wrong number of arguments"),
             ),
         }
     }
@@ -915,6 +992,7 @@ impl Hub {
             b"INFO" => self.send(id, self.render_info()),
             b"CONFIG" => self.handle_config(id, &tokens),
             b"CLIENT" => self.handle_client(id, &tokens),
+            b"SLOWLOG" => self.handle_slowlog(id, &tokens),
 
             // --- persistence (owner-side) ---
             b"BGREWRITEAOF" => {
@@ -2097,6 +2175,24 @@ fn parse_mem(s: &str) -> Option<usize> {
     num.trim().parse::<usize>().ok().map(|n| n * mult)
 }
 
+/// A bounded copy of a command's args for the slow log (Redis caps at 32 args,
+/// 128 bytes each, to keep the ring small).
+fn slowlog_snapshot(tokens: &[Vec<u8>]) -> Vec<Vec<u8>> {
+    tokens
+        .iter()
+        .take(32)
+        .map(|t| {
+            if t.len() > 128 {
+                let mut s = t[..125].to_vec();
+                s.extend_from_slice(b"...");
+                s
+            } else {
+                t.clone()
+            }
+        })
+        .collect()
+}
+
 fn run_hub(rx: mpsc::Receiver<Msg>, tx: mpsc::Sender<Msg>) {
     let mut hub = Hub::new(tx);
     loop {
@@ -2121,7 +2217,19 @@ fn run_hub(rx: mpsc::Receiver<Msg>, tx: mpsc::Sender<Msg>) {
                 hub.loopback.remove(&id);
                 hub.client_names.remove(&id);
             }
-            Ok(Msg::Command { id, tokens }) => hub.handle_command(id, tokens),
+            Ok(Msg::Command { id, tokens }) => {
+                if hub.slowlog_threshold_us >= 0 {
+                    let snap = slowlog_snapshot(&tokens);
+                    let t0 = Instant::now();
+                    hub.handle_command(id, tokens);
+                    let us = t0.elapsed().as_micros() as i64;
+                    if us >= hub.slowlog_threshold_us {
+                        hub.push_slowlog(us as u64, snap);
+                    }
+                } else {
+                    hub.handle_command(id, tokens);
+                }
+            }
             Ok(Msg::ReplaceDb(db, extras)) => {
                 hub.db = *db;
                 hub.apply_extras(*extras); // CDC offsets/log/groups + rebuilt indexes

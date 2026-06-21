@@ -1128,3 +1128,20 @@ fn getex_object_and_client_verbs() {
     assert_eq!(c.cmd(&["CLIENT", "GETNAME"]), "app1");
     assert_eq!(c.cmd(&["CLIENT", "SETINFO", "lib-name", "ioredis"]), "OK");
 }
+
+#[test]
+fn slowlog_records_and_resets() {
+    // Threshold 0 -> every command is logged, so the test is deterministic.
+    let s = Server::start_inner(&[("LOCUS_SLOWLOG_US", "0")]);
+    let mut c = s.connect();
+    c.cmd(&["SET", "k", "v"]);
+    c.cmd(&["GET", "k"]);
+    let len: i64 = c.cmd(&["SLOWLOG", "LEN"]).parse().unwrap();
+    assert!(len >= 2, "slowlog len {len}");
+    let got = c.cmd(&["SLOWLOG", "GET", "1"]);
+    assert!(got.starts_with("[["), "slowlog get: {got}"); // array of entry-arrays
+    assert_eq!(c.cmd(&["SLOWLOG", "RESET"]), "OK");
+    // Only commands issued after RESET remain.
+    let after: i64 = c.cmd(&["SLOWLOG", "LEN"]).parse().unwrap();
+    assert!(after <= 1, "slowlog len after reset: {after}");
+}
