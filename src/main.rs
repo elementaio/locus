@@ -54,8 +54,9 @@ enum Msg {
     Disconnect {
         id: u64,
     },
-    /// Replica received a full-sync snapshot; replace the whole dataset.
-    ReplaceDb(Box<Db>),
+    /// Replica received a full-sync snapshot; replace the whole dataset plus the
+    /// CDC / secondary-index state carried in the snapshot trailer.
+    ReplaceDb(Box<Db>, Box<rdb::Extras>),
 }
 
 /// Set by the SIGTERM/SIGINT handler so the hub can persist and exit cleanly.
@@ -679,7 +680,8 @@ impl Hub {
                     id,
                     b"+FULLRESYNC 0000000000000000000000000000000000000000 0\r\n".to_vec(),
                 );
-                let snap = rdb::serialize(&self.db);
+                let mut snap = rdb::serialize(&self.db);
+                rdb::append_extras(&mut snap, &self.build_extras());
                 let mut bulk = format!("${}\r\n", snap.len()).into_bytes();
                 bulk.extend_from_slice(&snap);
                 self.send(id, bulk);
@@ -1915,8 +1917,9 @@ fn run_hub(rx: mpsc::Receiver<Msg>, tx: mpsc::Sender<Msg>) {
                 hub.loopback.remove(&id);
             }
             Ok(Msg::Command { id, tokens }) => hub.handle_command(id, tokens),
-            Ok(Msg::ReplaceDb(db)) => {
+            Ok(Msg::ReplaceDb(db, extras)) => {
                 hub.db = *db;
+                hub.apply_extras(*extras); // CDC offsets/log/groups + rebuilt indexes
                 // A replica that just loaded a full-sync snapshot may now be able
                 // to satisfy readers parked on a blocking XREAD.
                 hub.serve_blocked();
@@ -2004,8 +2007,11 @@ fn try_sync(
     let len = read_bulk_header(&mut stream)?;
     let mut snap = vec![0u8; len];
     stream.read_exact(&mut snap)?;
-    let db = rdb::deserialize(&snap)?;
-    if hub_tx.send(Msg::ReplaceDb(Box::new(db))).is_err() {
+    let (db, extras) = rdb::deserialize_with_extras(&snap)?;
+    if hub_tx
+        .send(Msg::ReplaceDb(Box::new(db), Box::new(extras)))
+        .is_err()
+    {
         return Ok(());
     }
     log::info(&format!("replication: full sync complete ({len} bytes)"));

@@ -1032,3 +1032,30 @@ fn replica_with_wrong_masterauth_never_syncs() {
     sleep(Duration::from_millis(700));
     assert_eq!(r.cmd(&["GET", "foo"]), "(nil)");
 }
+
+#[test]
+fn replica_gets_secondary_index_from_full_sync() {
+    let master = Server::start();
+    let replica = Server::start();
+    let mut m = master.connect();
+    m.cmd(&["HSET", "u:1", "city", "doha"]);
+    m.cmd(&["IDXCREATE", "by_city", "city"]);
+    let mut r = replica.connect();
+    assert_eq!(
+        r.cmd(&["REPLICAOF", "127.0.0.1", &master.port.to_string()]),
+        "OK"
+    );
+    // The snapshot trailer carries the index definition; the replica rebuilds it
+    // from the replicated keyspace, so IDXGET works without re-running IDXCREATE.
+    let deadline = Instant::now() + Duration::from_secs(3);
+    loop {
+        if r.cmd(&["IDXGET", "by_city", "doha"]).contains("u:1") {
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "index not replicated via full-sync"
+        );
+        sleep(Duration::from_millis(50));
+    }
+}

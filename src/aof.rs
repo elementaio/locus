@@ -41,9 +41,33 @@ pub fn is_write(cmd: &[u8]) -> bool {
     crate::commands::is_write(cmd)
 }
 
+/// When to fsync the AOF: `always` = after every write (safest, slowest),
+/// `everysec` = at most once a second (Redis's default), `no` = never (let the
+/// OS flush). Set via LOCUS_APPENDFSYNC.
+#[derive(Clone, Copy, PartialEq)]
+pub enum FsyncPolicy {
+    Always,
+    Everysec,
+    No,
+}
+
+fn policy_from_env() -> FsyncPolicy {
+    match std::env::var("LOCUS_APPENDFSYNC")
+        .unwrap_or_default()
+        .trim()
+        .to_ascii_lowercase()
+        .as_str()
+    {
+        "always" => FsyncPolicy::Always,
+        "no" => FsyncPolicy::No,
+        _ => FsyncPolicy::Everysec, // default, matches Redis
+    }
+}
+
 pub struct Aof {
     file: File,
     last_fsync: u64,
+    policy: FsyncPolicy,
 }
 
 impl Aof {
@@ -52,6 +76,7 @@ impl Aof {
         Ok(Aof {
             file,
             last_fsync: now_ms(),
+            policy: policy_from_env(),
         })
     }
 
@@ -60,12 +85,18 @@ impl Aof {
         for c in commands {
             encode_command(&mut buf, c);
         }
-        self.file.write_all(&buf)
+        self.file.write_all(&buf)?;
+        if self.policy == FsyncPolicy::Always {
+            self.do_fsync();
+        }
+        Ok(())
     }
 
-    /// fsync at most once per second (the "everysec" policy).
+    /// Under the `everysec` policy, fsync at most once per second. (`always` syncs
+    /// inline in append; `no` never syncs here.)
     pub fn maybe_fsync(&mut self) {
-        if now_ms().saturating_sub(self.last_fsync) >= 1000 {
+        if self.policy == FsyncPolicy::Everysec && now_ms().saturating_sub(self.last_fsync) >= 1000
+        {
             self.do_fsync();
         }
     }
@@ -100,17 +131,23 @@ pub fn entries_for(tokens: &[Vec<u8>], reply: &[u8], db: &mut Db) -> Vec<Vec<Vec
     match tokens[0].to_ascii_uppercase().as_slice() {
         b"SET" => {
             let key = &tokens[1];
-            // Log the RESULTING state (handles NX/XX no-ops) + absolute TTL.
-            match db.get(key) {
-                Some(Value::Str(v)) => {
-                    let v = v.clone();
-                    let mut out = vec![vec![b"SET".to_vec(), key.clone(), v]];
-                    if let Some(t) = db.expire_at(key) {
-                        out.push(pexpireat(key, t));
+            // Log the RESULTING state (handles NX/XX no-ops) + absolute TTL. Read
+            // the deadline RAW (no passive expiry): if it's already in the past,
+            // log a DEL so replay removes any prior value instead of resurrecting
+            // it; otherwise log SET (+ PEXPIREAT).
+            match db.raw_expire(key) {
+                Some(t) if t <= now_ms() => vec![vec![b"DEL".to_vec(), key.clone()]],
+                deadline => match db.get(key) {
+                    Some(Value::Str(v)) => {
+                        let v = v.clone();
+                        let mut out = vec![vec![b"SET".to_vec(), key.clone(), v]];
+                        if let Some(t) = deadline {
+                            out.push(pexpireat(key, t));
+                        }
+                        out
                     }
-                    out
-                }
-                _ => vec![],
+                    _ => vec![],
+                },
             }
         }
         b"EXPIRE" | b"PEXPIRE" | b"EXPIREAT" | b"PEXPIREAT" => {
@@ -349,6 +386,22 @@ mod tests {
     fn run(db: &mut Db, parts: &[&[u8]]) -> Vec<u8> {
         let t: Vec<Vec<u8>> = parts.iter().map(|p| p.to_vec()).collect();
         execute(&t, db)
+    }
+
+    #[test]
+    fn set_with_already_past_ttl_logs_del_not_a_stale_value() {
+        let mut db = Db::new();
+        // A prior value, then a SET that leaves an already-past deadline: replay
+        // must DEL the key, not keep the stale value.
+        db.insert_with_expire(b"k".to_vec(), Value::Str(b"v".to_vec()), Some(1));
+        let toks: Vec<Vec<u8>> = [&b"SET"[..], b"k", b"v", b"PXAT", b"1"]
+            .iter()
+            .map(|s| s.to_vec())
+            .collect();
+        assert_eq!(
+            entries_for(&toks, b"+OK\r\n", &mut db),
+            vec![vec![b"DEL".to_vec(), b"k".to_vec()]]
+        );
     }
 
     #[test]

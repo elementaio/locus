@@ -213,30 +213,6 @@ pub fn serialize(db: &Db) -> Vec<u8> {
     buf
 }
 
-/// Rebuild a dataset from a serialized buffer (the replica side of sync).
-pub fn deserialize(bytes: &[u8]) -> io::Result<Db> {
-    let mut r: &[u8] = bytes;
-    let mut magic = [0u8; 9];
-    r.read_exact(&mut magic)?;
-    if &magic != MAGIC {
-        return Err(io::Error::new(io::ErrorKind::InvalidData, "bad RDB magic"));
-    }
-    let count = read_u64(&mut r)?;
-    let mut db = Db::new();
-    for _ in 0..count {
-        let expire = if read_u8(&mut r)? == 1 {
-            Some(read_u64(&mut r)?)
-        } else {
-            None
-        };
-        let tag = read_u8(&mut r)?;
-        let key = read_bytes(&mut r)?;
-        let value = read_value(&mut r, tag)?;
-        db.insert_with_expire(key, value, expire);
-    }
-    Ok(db)
-}
-
 // --- CDC / secondary-index trailer (optional, appended after the keyspace) ---
 
 /// State that lives in the hub (not the Db) but must survive a restart: the
