@@ -91,6 +91,10 @@ pub fn execute(tokens: &[Vec<u8>], db: &mut Db) -> Vec<u8> {
         b"EXISTS" => exists_cmd(db, tokens),
         b"TOUCH" => exists_cmd(db, tokens), // no LRU, so equivalent to EXISTS
         b"KEYS" => keys_cmd(db, tokens),
+        b"SCAN" => scan_cmd(db, tokens),
+        b"HSCAN" => hscan_cmd(db, tokens),
+        b"SSCAN" => sscan_cmd(db, tokens),
+        b"ZSCAN" => zscan_cmd(db, tokens),
         b"DBSIZE" => dbsize_cmd(db, tokens),
         b"RANDOMKEY" => randomkey_cmd(db, tokens),
         b"RENAME" => rename_cmd(db, tokens, false),
@@ -288,7 +292,7 @@ pub fn command_meta(cmd: &[u8]) -> Option<CmdMeta> {
         | b"EXISTS" | b"TOUCH" | b"KEYS" | b"MGET" | b"SINTER" | b"SUNION" | b"SDIFF"
         | b"WATCH" | b"SUBSCRIBE" | b"PSUBSCRIBE" | b"PUBSUB" | b"BITCOUNT" | b"SRANDMEMBER"
         | b"SELECT" | b"CDCREAD" | b"CDCPENDING" | b"GEOPOS" | b"TOPKLIST" | b"IDXDROP"
-        | b"AUTH" => (2, false),
+        | b"AUTH" | b"SCAN" => (2, false),
         // arity 2 writes
         b"PERSIST" | b"INCR" | b"DECR" | b"GETDEL" | b"LPOP" | b"RPOP" | b"SPOP" | b"ZPOPMIN"
         | b"ZPOPMAX" | b"DEL" | b"UNLINK" => (2, true),
@@ -297,7 +301,7 @@ pub fn command_meta(cmd: &[u8]) -> Option<CmdMeta> {
         | b"ZMSCORE" | b"ZRANK" | b"ZREVRANK" | b"PUBLISH" | b"REPLICAOF" | b"SLAVEOF"
         | b"LPOS" | b"SINTERCARD" | b"GETBIT" | b"BITPOS" | b"CDCGROUP" | b"CDCREADGROUP"
         | b"CDCACK" | b"GEODIST" | b"BFEXISTS" | b"CMSQUERY" | b"TOPKCOUNT" | b"TDQUANTILE"
-        | b"IDXCREATE" | b"IDXGET" => (3, false),
+        | b"IDXCREATE" | b"IDXGET" | b"HSCAN" | b"SSCAN" | b"ZSCAN" => (3, false),
         // arity 3 writes
         b"INCRBY" | b"DECRBY" | b"APPEND" | b"HDEL" | b"SADD" | b"SREM" | b"ZREM" | b"EXPIRE"
         | b"PEXPIRE" | b"EXPIREAT" | b"PEXPIREAT" | b"LPUSH" | b"RPUSH" | b"LPUSHX" | b"RPUSHX"
@@ -382,6 +386,248 @@ fn keys_cmd(db: &mut Db, tokens: &[Vec<u8>]) -> Vec<u8> {
         .filter(|k| crate::pubsub::glob_match(&tokens[1], k))
         .collect();
     bulk_array(&matched)
+}
+
+// --- SCAN family ------------------------------------------------------------
+//
+// std's HashMap exposes no stable bucket cursor, so we give each element a
+// stable FNV-1a hash and use a hash value as the (stateless, integer) cursor:
+// each call returns elements with hash >= cursor, advancing past the last hash
+// group. This preserves Redis's guarantee — every element present for the whole
+// scan is returned at least once — at O(n) work per call (COUNT is a hint).
+
+/// (field, value) for HSCAN; (member, score) for ZSCAN — named so the
+/// scan_select item types stay readable (and clippy's type-complexity lint quiet).
+type FieldVal = (Vec<u8>, Vec<u8>);
+type MemberScore = (Vec<u8>, f64);
+
+fn scan_hash(data: &[u8]) -> u64 {
+    let mut h: u64 = 0xcbf2_9ce4_8422_2325;
+    for &b in data {
+        h ^= b as u64;
+        h = h.wrapping_mul(0x0000_0100_0000_01b3);
+    }
+    h
+}
+
+fn parse_u64(arg: &[u8]) -> Option<u64> {
+    std::str::from_utf8(arg)
+        .ok()
+        .and_then(|s| s.parse::<u64>().ok())
+}
+
+struct ScanOpts {
+    pattern: Option<Vec<u8>>,
+    count: usize,
+    typ: Option<Vec<u8>>,
+}
+
+/// Parse the trailing `[MATCH p] [COUNT n] [TYPE t] [NOVALUES]` options; returns
+/// the options and whether NOVALUES was given.
+fn parse_scan_opts(
+    tokens: &[Vec<u8>],
+    start: usize,
+    allow_type: bool,
+    allow_novalues: bool,
+) -> Result<(ScanOpts, bool), Vec<u8>> {
+    let mut o = ScanOpts {
+        pattern: None,
+        count: 10,
+        typ: None,
+    };
+    let mut novalues = false;
+    let mut i = start;
+    while i < tokens.len() {
+        match tokens[i].to_ascii_uppercase().as_slice() {
+            b"MATCH" if i + 1 < tokens.len() => {
+                o.pattern = Some(tokens[i + 1].clone());
+                i += 2;
+            }
+            b"COUNT" if i + 1 < tokens.len() => {
+                match parse_int(&tokens[i + 1]) {
+                    Some(n) if n > 0 => o.count = n as usize,
+                    _ => return Err(not_integer()),
+                }
+                i += 2;
+            }
+            b"TYPE" if allow_type && i + 1 < tokens.len() => {
+                o.typ = Some(tokens[i + 1].to_ascii_lowercase());
+                i += 2;
+            }
+            b"NOVALUES" if allow_novalues => {
+                novalues = true;
+                i += 1;
+            }
+            _ => return Err(error("ERR syntax error")),
+        }
+    }
+    Ok((o, novalues))
+}
+
+/// Take the next batch from `(hash, element)` pairs: all with hash >= cursor,
+/// sorted, ~count of them (never splitting a hash group), plus the next cursor
+/// (0 when complete).
+fn scan_select<T>(mut items: Vec<(u64, T)>, cursor: u64, count: usize) -> (u64, Vec<T>) {
+    items.retain(|(h, _)| *h >= cursor);
+    items.sort_by(|a, b| a.0.cmp(&b.0));
+    let mut taken = items.len().min(count.max(1));
+    if taken < items.len() {
+        let last = items[taken - 1].0;
+        while taken < items.len() && items[taken].0 == last {
+            taken += 1;
+        }
+    }
+    let next = if taken >= items.len() {
+        0
+    } else {
+        items[taken - 1].0 + 1
+    };
+    (
+        next,
+        items.into_iter().take(taken).map(|(_, t)| t).collect(),
+    )
+}
+
+fn scan_reply(cursor: u64, flat: &[Vec<u8>]) -> Vec<u8> {
+    let mut out = b"*2\r\n".to_vec();
+    out.extend_from_slice(&bulk_string(cursor.to_string().as_bytes()));
+    out.extend_from_slice(&bulk_array(flat));
+    out
+}
+
+fn scan_cmd(db: &mut Db, tokens: &[Vec<u8>]) -> Vec<u8> {
+    if tokens.len() < 2 {
+        return wrong_args("scan");
+    }
+    let cursor = match parse_u64(&tokens[1]) {
+        Some(c) => c,
+        None => return error("ERR invalid cursor"),
+    };
+    let (opts, _) = match parse_scan_opts(tokens, 2, true, false) {
+        Ok(v) => v,
+        Err(e) => return e,
+    };
+    let items: Vec<(u64, Vec<u8>)> = db
+        .live_keys()
+        .into_iter()
+        .map(|k| (scan_hash(&k), k))
+        .collect();
+    let (next, batch) = scan_select(items, cursor, opts.count);
+    let mut out = Vec::new();
+    for k in batch {
+        if let Some(p) = &opts.pattern
+            && !crate::pubsub::glob_match(p, &k)
+        {
+            continue;
+        }
+        if let Some(t) = &opts.typ
+            && db.type_name(&k).map(|s| s.as_bytes()) != Some(t.as_slice())
+        {
+            continue;
+        }
+        out.push(k);
+    }
+    scan_reply(next, &out)
+}
+
+fn hscan_cmd(db: &mut Db, tokens: &[Vec<u8>]) -> Vec<u8> {
+    if tokens.len() < 3 {
+        return wrong_args("hscan");
+    }
+    let cursor = match parse_u64(&tokens[2]) {
+        Some(c) => c,
+        None => return error("ERR invalid cursor"),
+    };
+    let (opts, novalues) = match parse_scan_opts(tokens, 3, false, true) {
+        Ok(v) => v,
+        Err(e) => return e,
+    };
+    let items: Vec<(u64, FieldVal)> = match db.get(&tokens[1]) {
+        None => return scan_reply(0, &[]),
+        Some(Value::Hash(h)) => h
+            .iter()
+            .map(|(f, v)| (scan_hash(f), (f.clone(), v.clone())))
+            .collect(),
+        Some(_) => return wrongtype(),
+    };
+    let (next, batch) = scan_select(items, cursor, opts.count);
+    let mut out = Vec::new();
+    for (f, v) in batch {
+        if let Some(p) = &opts.pattern
+            && !crate::pubsub::glob_match(p, &f)
+        {
+            continue;
+        }
+        out.push(f);
+        if !novalues {
+            out.push(v);
+        }
+    }
+    scan_reply(next, &out)
+}
+
+fn sscan_cmd(db: &mut Db, tokens: &[Vec<u8>]) -> Vec<u8> {
+    if tokens.len() < 3 {
+        return wrong_args("sscan");
+    }
+    let cursor = match parse_u64(&tokens[2]) {
+        Some(c) => c,
+        None => return error("ERR invalid cursor"),
+    };
+    let (opts, _) = match parse_scan_opts(tokens, 3, false, false) {
+        Ok(v) => v,
+        Err(e) => return e,
+    };
+    let items: Vec<(u64, Vec<u8>)> = match db.get(&tokens[1]) {
+        None => return scan_reply(0, &[]),
+        Some(Value::Set(s)) => s.iter().map(|m| (scan_hash(m), m.clone())).collect(),
+        Some(_) => return wrongtype(),
+    };
+    let (next, batch) = scan_select(items, cursor, opts.count);
+    let mut out = Vec::new();
+    for m in batch {
+        if let Some(p) = &opts.pattern
+            && !crate::pubsub::glob_match(p, &m)
+        {
+            continue;
+        }
+        out.push(m);
+    }
+    scan_reply(next, &out)
+}
+
+fn zscan_cmd(db: &mut Db, tokens: &[Vec<u8>]) -> Vec<u8> {
+    if tokens.len() < 3 {
+        return wrong_args("zscan");
+    }
+    let cursor = match parse_u64(&tokens[2]) {
+        Some(c) => c,
+        None => return error("ERR invalid cursor"),
+    };
+    let (opts, _) = match parse_scan_opts(tokens, 3, false, false) {
+        Ok(v) => v,
+        Err(e) => return e,
+    };
+    let items: Vec<(u64, MemberScore)> = match db.get(&tokens[1]) {
+        None => return scan_reply(0, &[]),
+        Some(Value::ZSet(z)) => z
+            .iter()
+            .map(|(m, s)| (scan_hash(m), (m.clone(), *s)))
+            .collect(),
+        Some(_) => return wrongtype(),
+    };
+    let (next, batch) = scan_select(items, cursor, opts.count);
+    let mut out = Vec::new();
+    for (m, s) in batch {
+        if let Some(p) = &opts.pattern
+            && !crate::pubsub::glob_match(p, &m)
+        {
+            continue;
+        }
+        out.push(m);
+        out.push(fmt_score(s));
+    }
+    scan_reply(next, &out)
 }
 
 fn dbsize_cmd(db: &mut Db, tokens: &[Vec<u8>]) -> Vec<u8> {
@@ -3247,6 +3493,54 @@ mod tests {
     fn cmd(db: &mut Db, parts: &[&[u8]]) -> Vec<u8> {
         let tokens: Vec<Vec<u8>> = parts.iter().map(|p| p.to_vec()).collect();
         execute(&tokens, db)
+    }
+
+    #[test]
+    fn scan_select_covers_every_element_once() {
+        let items: Vec<(u64, u32)> = (0..1000u32)
+            .map(|i| (scan_hash(&i.to_le_bytes()), i))
+            .collect();
+        let mut cursor = 0u64;
+        let mut seen = std::collections::HashSet::new();
+        let mut rounds = 0;
+        loop {
+            rounds += 1;
+            assert!(rounds < 100_000, "scan did not terminate");
+            let (next, batch) = scan_select(items.clone(), cursor, 10);
+            for x in batch {
+                assert!(seen.insert(x), "element {x} returned twice");
+            }
+            if next == 0 {
+                break;
+            }
+            cursor = next;
+        }
+        assert_eq!(seen.len(), 1000, "scan missed elements");
+    }
+
+    #[test]
+    fn scan_keyspace_with_match() {
+        let mut db = Db::new();
+        for i in 0..50 {
+            cmd(&mut db, &[b"SET", format!("user:{i}").as_bytes(), b"v"]);
+            cmd(&mut db, &[b"SET", format!("other:{i}").as_bytes(), b"v"]);
+        }
+        // COUNT covers everything in one call -> cursor returns "0" (complete);
+        // MATCH filters to the 50 user keys.
+        let reply = cmd(
+            &mut db,
+            &[b"SCAN", b"0", b"MATCH", b"user:*", b"COUNT", b"1000"],
+        );
+        let s = String::from_utf8_lossy(&reply);
+        assert!(
+            s.starts_with("*2\r\n$1\r\n0\r\n"),
+            "expected complete scan: {s:?}"
+        );
+        assert_eq!(
+            s.matches("user:").count(),
+            50,
+            "expected 50 user keys: {s:?}"
+        );
     }
 
     #[test]
