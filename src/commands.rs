@@ -248,7 +248,7 @@ pub fn execute(tokens: &[Vec<u8>], db: &mut Db) -> Vec<u8> {
         // persistence: SAVE / BGSAVE are handled by the hub — they need its CDC /
         // secondary-index state (and BGSAVE a background thread).
         // stubs
-        b"COMMAND" => b"*0\r\n".to_vec(),
+        b"COMMAND" => command_cmd(tokens),
         // CONFIG is handled by the hub (it needs live server / runtime config).
         other => error(&format!(
             "ERR unknown command '{}'",
@@ -333,6 +333,241 @@ pub fn min_arity(cmd: &[u8]) -> Option<usize> {
 /// Whether `cmd` (case-insensitive) mutates the keyspace. See [`command_meta`].
 pub fn is_write(cmd: &[u8]) -> bool {
     command_meta(&cmd.to_ascii_uppercase()).is_some_and(|m| m.write)
+}
+
+/// Every command name (upper-case), for COMMAND/COMMAND COUNT introspection.
+/// A regression test pins this against `command_meta` so they can't drift.
+static COMMAND_NAMES: &[&[u8]] = &[
+    b"APPEND",
+    b"AUTH",
+    b"BFADD",
+    b"BFEXISTS",
+    b"BFLOAD",
+    b"BGREWRITEAOF",
+    b"BGSAVE",
+    b"BITCOUNT",
+    b"BITOP",
+    b"BITPOS",
+    b"CADEL",
+    b"CAS",
+    b"CDCACK",
+    b"CDCGROUP",
+    b"CDCPENDING",
+    b"CDCREAD",
+    b"CDCREADGROUP",
+    b"CDCSUBSCRIBE",
+    b"CDCUNSUBSCRIBE",
+    b"CLIENT",
+    b"CMSINCRBY",
+    b"CMSLOAD",
+    b"CMSQUERY",
+    b"COMMAND",
+    b"CONFIG",
+    b"DBSIZE",
+    b"DECR",
+    b"DECRBY",
+    b"DEL",
+    b"DISCARD",
+    b"ECHO",
+    b"EXEC",
+    b"EXISTS",
+    b"EXPIRE",
+    b"EXPIREAT",
+    b"FLUSHALL",
+    b"FLUSHDB",
+    b"GEODIST",
+    b"GEOPOS",
+    b"GEOSEARCH",
+    b"GEOSET",
+    b"GET",
+    b"GETBIT",
+    b"GETDEL",
+    b"GETEX",
+    b"GETRANGE",
+    b"GETSET",
+    b"HDEL",
+    b"HELLO",
+    b"HEXISTS",
+    b"HGET",
+    b"HGETALL",
+    b"HINCRBY",
+    b"HKEYS",
+    b"HLEN",
+    b"HMGET",
+    b"HSCAN",
+    b"HSET",
+    b"HSETNX",
+    b"HVALS",
+    b"IDXCREATE",
+    b"IDXDROP",
+    b"IDXGET",
+    b"IDXRANGE",
+    b"INCR",
+    b"INCRBY",
+    b"INCRBYFLOAT",
+    b"INCRCAP",
+    b"INFO",
+    b"KEYS",
+    b"LINDEX",
+    b"LINSERT",
+    b"LLEN",
+    b"LMOVE",
+    b"LPOP",
+    b"LPOS",
+    b"LPUSH",
+    b"LPUSHX",
+    b"LRANGE",
+    b"LREM",
+    b"LSET",
+    b"LTRIM",
+    b"MGET",
+    b"MSET",
+    b"MSETNX",
+    b"MULTI",
+    b"OBJECT",
+    b"PERSIST",
+    b"PEXPIRE",
+    b"PEXPIREAT",
+    b"PING",
+    b"PSETEX",
+    b"PSUBSCRIBE",
+    b"PSYNC",
+    b"PTTL",
+    b"PUBLISH",
+    b"PUBSUB",
+    b"PUNSUBSCRIBE",
+    b"QUIT",
+    b"RANDOMKEY",
+    b"RENAME",
+    b"RENAMENX",
+    b"REPLCONF",
+    b"REPLICAOF",
+    b"RESET",
+    b"RPOP",
+    b"RPOPLPUSH",
+    b"RPUSH",
+    b"RPUSHX",
+    b"SADD",
+    b"SAVE",
+    b"SCAN",
+    b"SCARD",
+    b"SDIFF",
+    b"SDIFFSTORE",
+    b"SELECT",
+    b"SET",
+    b"SETBIT",
+    b"SETEX",
+    b"SETMAX",
+    b"SETNX",
+    b"SETRANGE",
+    b"SHUTDOWN",
+    b"SINTER",
+    b"SINTERCARD",
+    b"SINTERSTORE",
+    b"SISMEMBER",
+    b"SLAVEOF",
+    b"SMEMBERS",
+    b"SMISMEMBER",
+    b"SMOVE",
+    b"SPOP",
+    b"SRANDMEMBER",
+    b"SREM",
+    b"SSCAN",
+    b"STRLEN",
+    b"SUBSCRIBE",
+    b"SUNION",
+    b"SUNIONSTORE",
+    b"SYNC",
+    b"TDADD",
+    b"TDLOAD",
+    b"TDQUANTILE",
+    b"TOPKADD",
+    b"TOPKCOUNT",
+    b"TOPKLIST",
+    b"TOPKLOAD",
+    b"TOPKRESERVE",
+    b"TOUCH",
+    b"TTL",
+    b"TYPE",
+    b"UNLINK",
+    b"UNSUBSCRIBE",
+    b"UNWATCH",
+    b"WATCH",
+    b"XADD",
+    b"XLEN",
+    b"XRANGE",
+    b"XREAD",
+    b"XREVRANGE",
+    b"ZADD",
+    b"ZCARD",
+    b"ZCOUNT",
+    b"ZINCRBY",
+    b"ZINTERSTORE",
+    b"ZMSCORE",
+    b"ZPOPMAX",
+    b"ZPOPMIN",
+    b"ZRANGE",
+    b"ZRANGEBYSCORE",
+    b"ZRANK",
+    b"ZREM",
+    b"ZREMRANGEBYRANK",
+    b"ZREMRANGEBYSCORE",
+    b"ZREVRANGE",
+    b"ZREVRANGEBYSCORE",
+    b"ZREVRANK",
+    b"ZSCAN",
+    b"ZSCORE",
+    b"ZUNIONSTORE",
+];
+
+/// One COMMAND entry: [name(lower), arity, [flag], first_key, last_key, step].
+/// Key positions are a heuristic (1,1,1 for keyed commands) — good enough for
+/// non-cluster clients, which is the only mode Locus runs.
+fn command_info_entry(name: &[u8]) -> Vec<u8> {
+    let meta = command_meta(name);
+    let arity = meta.as_ref().map(|m| m.min_arity as i64).unwrap_or(-1);
+    let write = meta.as_ref().map(|m| m.write).unwrap_or(false);
+    let (first, last, step) = if arity >= 2 { (1, 1, 1) } else { (0, 0, 0) };
+    let mut e = b"*6\r\n".to_vec();
+    e.extend_from_slice(&bulk_string(&name.to_ascii_lowercase()));
+    e.extend_from_slice(&integer(arity));
+    e.extend_from_slice(b"*1\r\n");
+    e.extend_from_slice(&simple_string(if write { "write" } else { "readonly" }));
+    e.extend_from_slice(&integer(first));
+    e.extend_from_slice(&integer(last));
+    e.extend_from_slice(&integer(step));
+    e
+}
+
+fn command_cmd(tokens: &[Vec<u8>]) -> Vec<u8> {
+    match tokens.get(1).map(|t| t.to_ascii_uppercase()).as_deref() {
+        Some(b"COUNT") => integer(COMMAND_NAMES.len() as i64),
+        Some(b"DOCS") => b"*0\r\n".to_vec(), // empty docs map; clients tolerate it
+        Some(b"INFO") => {
+            let names: Vec<Vec<u8>> = if tokens.len() > 2 {
+                tokens[2..].iter().map(|t| t.to_ascii_uppercase()).collect()
+            } else {
+                COMMAND_NAMES.iter().map(|n| n.to_vec()).collect()
+            };
+            let mut reply = format!("*{}\r\n", names.len()).into_bytes();
+            for n in &names {
+                if command_meta(n).is_some() {
+                    reply.extend_from_slice(&command_info_entry(n));
+                } else {
+                    reply.extend_from_slice(&null_array());
+                }
+            }
+            reply
+        }
+        None => {
+            let mut reply = format!("*{}\r\n", COMMAND_NAMES.len()).into_bytes();
+            for &n in COMMAND_NAMES {
+                reply.extend_from_slice(&command_info_entry(n));
+            }
+            reply
+        }
+        _ => simple_string("OK"),
+    }
 }
 
 // === generic ================================================================
@@ -3574,6 +3809,30 @@ mod tests {
     fn cmd(db: &mut Db, parts: &[&[u8]]) -> Vec<u8> {
         let tokens: Vec<Vec<u8>> = parts.iter().map(|p| p.to_vec()).collect();
         execute(&tokens, db)
+    }
+
+    #[test]
+    fn command_catalog_matches_command_meta() {
+        for name in COMMAND_NAMES {
+            assert!(
+                command_meta(name).is_some(),
+                "{} is in COMMAND_NAMES but not command_meta",
+                String::from_utf8_lossy(name)
+            );
+        }
+        assert!(COMMAND_NAMES.len() > 100);
+    }
+
+    #[test]
+    fn command_count_and_info() {
+        let mut db = Db::new();
+        assert_eq!(
+            cmd(&mut db, &[b"COMMAND", b"COUNT"]),
+            integer(COMMAND_NAMES.len() as i64)
+        );
+        let info = cmd(&mut db, &[b"COMMAND", b"INFO", b"GET"]);
+        let s = String::from_utf8_lossy(&info);
+        assert!(s.contains("get") && s.contains("readonly"), "{s}");
     }
 
     #[test]
