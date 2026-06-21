@@ -16,6 +16,10 @@ use crate::db::{Db, Stream, Value};
 
 pub const DEFAULT_PATH: &str = "locus.rdb";
 const MAGIC: &[u8; 9] = b"LOCUSRDB1";
+/// Cap eager pre-allocation while loading so a hostile length/count prefix can't
+/// force a huge up-front allocation (mirrors the RESP parser's ALLOC_CAP). The
+/// collection still grows as elements are actually read.
+const READ_ALLOC_CAP: usize = 1024;
 
 /// Where to persist — overridable with the LOCUS_RDB env var (handy for tests).
 pub fn configured_path() -> String {
@@ -375,7 +379,7 @@ fn read_value<R: Read>(r: &mut R, tag: u8) -> io::Result<Value> {
         0 => Value::Str(read_bytes(r)?),
         1 => {
             let n = read_u32(r)?;
-            let mut l = VecDeque::with_capacity(n);
+            let mut l = VecDeque::with_capacity(n.min(READ_ALLOC_CAP));
             for _ in 0..n {
                 l.push_back(read_bytes(r)?);
             }
@@ -383,7 +387,7 @@ fn read_value<R: Read>(r: &mut R, tag: u8) -> io::Result<Value> {
         }
         2 => {
             let n = read_u32(r)?;
-            let mut h = HashMap::with_capacity(n);
+            let mut h = HashMap::with_capacity(n.min(READ_ALLOC_CAP));
             for _ in 0..n {
                 let f = read_bytes(r)?;
                 let v = read_bytes(r)?;
@@ -393,7 +397,7 @@ fn read_value<R: Read>(r: &mut R, tag: u8) -> io::Result<Value> {
         }
         3 => {
             let n = read_u32(r)?;
-            let mut s = HashSet::with_capacity(n);
+            let mut s = HashSet::with_capacity(n.min(READ_ALLOC_CAP));
             for _ in 0..n {
                 s.insert(read_bytes(r)?);
             }
@@ -401,7 +405,7 @@ fn read_value<R: Read>(r: &mut R, tag: u8) -> io::Result<Value> {
         }
         4 => {
             let n = read_u32(r)?;
-            let mut z = HashMap::with_capacity(n);
+            let mut z = HashMap::with_capacity(n.min(READ_ALLOC_CAP));
             for _ in 0..n {
                 let m = read_bytes(r)?;
                 let score = read_f64(r)?;
@@ -412,11 +416,11 @@ fn read_value<R: Read>(r: &mut R, tag: u8) -> io::Result<Value> {
         5 => {
             let n = read_u32(r)?;
             let last_id = (read_u64(r)?, read_u64(r)?);
-            let mut entries = Vec::with_capacity(n);
+            let mut entries = Vec::with_capacity(n.min(READ_ALLOC_CAP));
             for _ in 0..n {
                 let id = (read_u64(r)?, read_u64(r)?);
                 let fc = read_u32(r)?;
-                let mut fields = Vec::with_capacity(fc);
+                let mut fields = Vec::with_capacity(fc.min(READ_ALLOC_CAP));
                 for _ in 0..fc {
                     let f = read_bytes(r)?;
                     let v = read_bytes(r)?;
@@ -484,8 +488,17 @@ fn read_f64<R: Read>(r: &mut R) -> io::Result<f64> {
 }
 fn read_bytes<R: Read>(r: &mut R) -> io::Result<Vec<u8>> {
     let n = read_u32(r)?;
-    let mut b = vec![0u8; n];
-    r.read_exact(&mut b)?;
+    // Read in bounded chunks rather than pre-allocating `n` (up to 4 GiB): a
+    // truncated or hostile length then errors at EOF instead of OOM-aborting.
+    let mut b = Vec::with_capacity(n.min(READ_ALLOC_CAP));
+    let mut remaining = n;
+    let mut chunk = [0u8; 8192];
+    while remaining > 0 {
+        let want = remaining.min(chunk.len());
+        r.read_exact(&mut chunk[..want])?;
+        b.extend_from_slice(&chunk[..want]);
+        remaining -= want;
+    }
     Ok(b)
 }
 
@@ -615,5 +628,41 @@ mod tests {
         assert_eq!(extras.cdc_next_offset, 0);
         assert!(extras.index_defs.is_empty());
         assert!(extras.cdc_log.is_empty());
+    }
+
+    #[test]
+    fn hostile_bulk_length_errors_not_aborts() {
+        // count=1, no-expire, tag=0 (Str), key "k", value length = u32::MAX with
+        // no data following: must error at EOF, never pre-allocate 4 GiB + abort.
+        let mut b = Vec::new();
+        b.extend_from_slice(MAGIC);
+        b.extend_from_slice(&1u64.to_le_bytes());
+        b.push(0); // no expire
+        b.push(0); // tag = Str
+        put_bytes(&mut b, b"k");
+        b.extend_from_slice(&u32::MAX.to_le_bytes()); // value length
+        assert!(deserialize_with_extras(&b).is_err());
+    }
+
+    #[test]
+    fn hostile_collection_count_errors_not_aborts() {
+        // A list declaring u32::MAX elements with none present.
+        let mut b = Vec::new();
+        b.extend_from_slice(MAGIC);
+        b.extend_from_slice(&1u64.to_le_bytes());
+        b.push(0);
+        b.push(1); // tag = List
+        put_bytes(&mut b, b"l");
+        b.extend_from_slice(&u32::MAX.to_le_bytes()); // element count
+        assert!(deserialize_with_extras(&b).is_err());
+    }
+
+    #[test]
+    fn truncated_and_bad_magic_error() {
+        let mut t = Vec::new();
+        t.extend_from_slice(MAGIC);
+        t.extend_from_slice(&5u64.to_le_bytes()); // claims 5 entries, none follow
+        assert!(deserialize_with_extras(&t).is_err());
+        assert!(deserialize_with_extras(b"NOTLOCUS-MAGIC").is_err());
     }
 }
