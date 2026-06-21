@@ -247,10 +247,7 @@ pub fn execute(tokens: &[Vec<u8>], db: &mut Db) -> Vec<u8> {
         // secondary-index state (and BGSAVE a background thread).
         // stubs
         b"COMMAND" => b"*0\r\n".to_vec(),
-        b"CONFIG" => match tokens.get(1).map(|t| t.to_ascii_uppercase()).as_deref() {
-            Some(b"GET") => b"*0\r\n".to_vec(),
-            _ => simple_string("OK"),
-        },
+        // CONFIG is handled by the hub (it needs live server / runtime config).
         other => error(&format!(
             "ERR unknown command '{}'",
             String::from_utf8_lossy(other)

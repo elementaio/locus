@@ -27,7 +27,7 @@ use std::net::{TcpListener, TcpStream};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, mpsc};
 use std::thread;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use commands::execute;
 use db::{Db, Value, now_ms};
@@ -191,6 +191,9 @@ struct Hub {
     masterauth: Option<Vec<u8>>,
     // true while a background save's write+fsync is running off the hub thread.
     bgsave_in_progress: Arc<AtomicBool>,
+    // observability: process start (uptime) + a cheap command counter for INFO.
+    start: Instant,
+    commands_processed: u64,
 }
 
 /// A secondary index over one hash field: a sorted field-value → keys map, plus
@@ -323,6 +326,8 @@ impl Hub {
                 .map(String::into_bytes)
                 .filter(|p| !p.is_empty()),
             bgsave_in_progress: Arc::new(AtomicBool::new(false)),
+            start: Instant::now(),
+            commands_processed: 0,
         };
         hub.apply_extras(extras);
         hub
@@ -433,11 +438,190 @@ impl Hub {
         std::process::exit(0);
     }
 
+    /// Runtime config as (name, value) pairs, sourced from live hub state and the
+    /// env knobs. Read by CONFIG GET and INFO.
+    fn config_params(&self) -> Vec<(&'static str, String)> {
+        let policy = if self.maxmemory.is_some() {
+            "allkeys-random" // Locus evicts arbitrary keys
+        } else {
+            "noeviction"
+        };
+        let appendfsync = std::env::var("LOCUS_APPENDFSYNC")
+            .ok()
+            .map(|s| s.trim().to_ascii_lowercase())
+            .filter(|s| matches!(s.as_str(), "always" | "no" | "everysec"))
+            .unwrap_or_else(|| "everysec".into());
+        vec![
+            ("maxmemory", self.maxmemory.unwrap_or(0).to_string()),
+            ("maxmemory-policy", policy.to_string()),
+            (
+                "appendonly",
+                if self.aof.is_some() { "yes" } else { "no" }.to_string(),
+            ),
+            ("appendfsync", appendfsync),
+            ("save", String::new()),
+            (
+                "maxclients",
+                std::env::var("LOCUS_MAXCLIENTS").unwrap_or_else(|_| "10000".into()),
+            ),
+            (
+                "timeout",
+                std::env::var("LOCUS_TIMEOUT").unwrap_or_else(|_| "0".into()),
+            ),
+            (
+                "requirepass",
+                self.requirepass
+                    .as_ref()
+                    .map(|p| String::from_utf8_lossy(p).into_owned())
+                    .unwrap_or_default(),
+            ),
+            (
+                "bind",
+                std::env::var("LOCUS_BIND").unwrap_or_else(|_| "127.0.0.1".into()),
+            ),
+            (
+                "port",
+                std::env::var("LOCUS_PORT").unwrap_or_else(|_| "6379".into()),
+            ),
+        ]
+    }
+
+    fn handle_config(&mut self, id: u64, tokens: &[Vec<u8>]) {
+        match tokens.get(1).map(|t| t.to_ascii_uppercase()).as_deref() {
+            Some(b"GET") if tokens.len() >= 3 => {
+                let params = self.config_params();
+                let mut out: Vec<Vec<u8>> = Vec::new();
+                for (name, val) in &params {
+                    if tokens[2..]
+                        .iter()
+                        .any(|pat| pubsub::glob_match(pat, name.as_bytes()))
+                    {
+                        out.push(name.as_bytes().to_vec());
+                        out.push(val.clone().into_bytes());
+                    }
+                }
+                self.send(id, resp::bulk_array(&out));
+            }
+            Some(b"SET") if tokens.len() >= 4 => {
+                let param = tokens[2].to_ascii_lowercase();
+                match param.as_slice() {
+                    b"maxmemory" => {
+                        self.maxmemory =
+                            parse_mem(&String::from_utf8_lossy(&tokens[3])).filter(|&m| m > 0);
+                    }
+                    b"requirepass" => {
+                        // Rotation: new auth attempts use the new secret; existing
+                        // authenticated sessions keep their access (Redis semantics).
+                        self.requirepass = if tokens[3].is_empty() {
+                            None
+                        } else {
+                            Some(tokens[3].clone())
+                        };
+                    }
+                    // Accept (and no-op) other known params so clients don't error.
+                    _ => {}
+                }
+                self.send(id, resp::simple_string("OK"));
+            }
+            Some(b"RESETSTAT") => {
+                self.commands_processed = 0;
+                self.send(id, resp::simple_string("OK"));
+            }
+            Some(b"REWRITE") => self.send(id, resp::simple_string("OK")),
+            _ => self.send(
+                id,
+                resp::error("ERR Unknown CONFIG subcommand or wrong number of arguments"),
+            ),
+        }
+    }
+
+    /// Build the INFO report (the sections redis_exporter and clients expect).
+    fn render_info(&self) -> Vec<u8> {
+        let used = self.db.mem_used();
+        let role = if self.master.is_some() {
+            "slave"
+        } else {
+            "master"
+        };
+        let ver = env!("CARGO_PKG_VERSION");
+        let mut s = String::new();
+        s.push_str("# Server\r\n");
+        s.push_str(&format!("redis_version:{ver}\r\n"));
+        s.push_str("redis_mode:standalone\r\n");
+        s.push_str(&format!("locus_version:{ver}\r\n"));
+        s.push_str(&format!(
+            "os:{} {}\r\n",
+            std::env::consts::OS,
+            std::env::consts::ARCH
+        ));
+        s.push_str(&format!("process_id:{}\r\n", std::process::id()));
+        s.push_str(&format!(
+            "tcp_port:{}\r\n",
+            std::env::var("LOCUS_PORT").unwrap_or_else(|_| "6379".into())
+        ));
+        s.push_str(&format!(
+            "uptime_in_seconds:{}\r\n",
+            self.start.elapsed().as_secs()
+        ));
+        s.push_str("# Clients\r\n");
+        s.push_str(&format!("connected_clients:{}\r\n", self.clients.len()));
+        s.push_str(&format!("blocked_clients:{}\r\n", self.blocked.len()));
+        s.push_str("# Memory\r\n");
+        s.push_str(&format!("used_memory:{used}\r\n"));
+        s.push_str(&format!(
+            "used_memory_human:{:.2}M\r\n",
+            used as f64 / (1024.0 * 1024.0)
+        ));
+        s.push_str(&format!("maxmemory:{}\r\n", self.maxmemory.unwrap_or(0)));
+        s.push_str(&format!(
+            "maxmemory_policy:{}\r\n",
+            if self.maxmemory.is_some() {
+                "allkeys-random"
+            } else {
+                "noeviction"
+            }
+        ));
+        s.push_str("mem_fragmentation_ratio:1.00\r\n");
+        s.push_str("# Persistence\r\n");
+        s.push_str("loading:0\r\n");
+        s.push_str(&format!(
+            "aof_enabled:{}\r\n",
+            if self.aof.is_some() { 1 } else { 0 }
+        ));
+        s.push_str(&format!(
+            "rdb_bgsave_in_progress:{}\r\n",
+            self.bgsave_in_progress.load(Ordering::Relaxed) as u8
+        ));
+        s.push_str("aof_last_write_status:ok\r\n");
+        s.push_str("rdb_last_bgsave_status:ok\r\n");
+        s.push_str("# Stats\r\n");
+        s.push_str(&format!(
+            "total_commands_processed:{}\r\n",
+            self.commands_processed
+        ));
+        s.push_str("# Replication\r\n");
+        s.push_str(&format!("role:{role}\r\n"));
+        s.push_str(&format!("connected_slaves:{}\r\n", self.replicas.len()));
+        s.push_str("master_repl_offset:0\r\n");
+        if let Some((h, p)) = &self.master {
+            s.push_str(&format!(
+                "master_host:{h}\r\nmaster_port:{p}\r\nmaster_link_status:up\r\n"
+            ));
+        }
+        s.push_str("# Keyspace\r\n");
+        let keys = self.db.dbsize();
+        if keys > 0 {
+            s.push_str(&format!("db0:keys={keys},expires=0,avg_ttl=0\r\n"));
+        }
+        resp::bulk_string(s.as_bytes())
+    }
+
     fn handle_command(&mut self, id: u64, tokens: Vec<Vec<u8>>) {
         if tokens.is_empty() {
             return;
         }
         let cmd = tokens[0].to_ascii_uppercase();
+        self.commands_processed = self.commands_processed.wrapping_add(1);
 
         // Protected mode: if no password is set, refuse non-loopback clients so an
         // accidentally-exposed instance (e.g. the 0.0.0.0 Docker image) isn't wide
@@ -692,25 +876,8 @@ impl Hub {
                 ));
             }
             b"REPLICAOF" | b"SLAVEOF" => self.handle_replicaof(id, &tokens),
-            b"INFO" => {
-                let role = if self.master.is_some() {
-                    "slave"
-                } else {
-                    "master"
-                };
-                let mut s = format!(
-                    "# Memory\r\nused_memory:{}\r\nmaxmemory:{}\r\n# Replication\r\nrole:{role}\r\nconnected_slaves:{}\r\n",
-                    self.db.mem_used(),
-                    self.maxmemory.unwrap_or(0),
-                    self.replicas.len()
-                );
-                if let Some((h, p)) = &self.master {
-                    s.push_str(&format!(
-                        "master_host:{h}\r\nmaster_port:{p}\r\nmaster_link_status:up\r\n"
-                    ));
-                }
-                self.send(id, resp::bulk_string(s.as_bytes()));
-            }
+            b"INFO" => self.send(id, self.render_info()),
+            b"CONFIG" => self.handle_config(id, &tokens),
 
             // --- persistence (owner-side) ---
             b"BGREWRITEAOF" => {

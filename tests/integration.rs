@@ -1059,3 +1059,50 @@ fn replica_gets_secondary_index_from_full_sync() {
         sleep(Duration::from_millis(50));
     }
 }
+
+// === CONFIG / INFO ==========================================================
+
+#[test]
+fn config_get_returns_live_values_and_set_applies() {
+    let s = Server::start();
+    let mut c = s.connect();
+    assert_eq!(c.cmd(&["CONFIG", "GET", "appendonly"]), "[appendonly, no]");
+    assert_eq!(c.cmd(&["CONFIG", "GET", "maxmemory"]), "[maxmemory, 0]");
+    // Glob matches multiple params.
+    let g = c.cmd(&["CONFIG", "GET", "maxmemory*"]);
+    assert!(
+        g.contains("maxmemory") && g.contains("maxmemory-policy"),
+        "glob CONFIG GET: {g}"
+    );
+    // CONFIG SET applies live and reads back.
+    assert_eq!(c.cmd(&["CONFIG", "SET", "maxmemory", "100mb"]), "OK");
+    assert_eq!(
+        c.cmd(&["CONFIG", "GET", "maxmemory"]),
+        format!("[maxmemory, {}]", 100 * 1024 * 1024)
+    );
+}
+
+#[test]
+fn info_has_standard_sections() {
+    let s = Server::start();
+    let mut c = s.connect();
+    c.cmd(&["SET", "k", "v"]);
+    let info = c.cmd(&["INFO"]);
+    for needle in [
+        "# Server",
+        "redis_version:",
+        "# Clients",
+        "connected_clients:",
+        "# Memory",
+        "used_memory:",
+        "# Persistence",
+        "# Stats",
+        "total_commands_processed:",
+        "# Replication",
+        "role:master",
+        "# Keyspace",
+        "db0:keys=1",
+    ] {
+        assert!(info.contains(needle), "INFO missing {needle:?}:\n{info}");
+    }
+}
