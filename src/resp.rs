@@ -247,4 +247,81 @@ mod tests {
         assert!(matches!(parse_command(b"*1000000\r\n"), Parsed::Incomplete));
         assert!(matches!(parse_command(b"*1048577\r\n"), Parsed::Error(_)));
     }
+
+    #[test]
+    fn fuzz_parse_command_never_panics_and_makes_progress() {
+        // Deterministic xorshift64 PRNG — no external crate.
+        let mut state: u64 = 0x9e37_79b9_7f4a_7c15;
+        let mut rng = || {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            state
+        };
+        for _ in 0..100_000 {
+            let len = (rng() % 80) as usize;
+            let buf: Vec<u8> = (0..len)
+                .map(|_| match rng() % 9 {
+                    // Bias toward protocol-significant bytes so framing paths get hit.
+                    0 => b'*',
+                    1 => b'$',
+                    2 => b'\r',
+                    3 => b'\n',
+                    4 => b'-',
+                    5 => 0u8,
+                    6 | 7 => b"0123456789"[(rng() % 10) as usize],
+                    _ => (rng() % 256) as u8,
+                })
+                .collect();
+            // Invariant 1: never panics. Invariant 2: a Complete consumes a
+            // positive, in-bounds count (so a pipelined drain loop terminates).
+            if let Parsed::Complete(_, consumed) = parse_command(&buf) {
+                assert!(
+                    consumed > 0 && consumed <= buf.len(),
+                    "consumed {consumed} out of bounds for {buf:?}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn fuzz_pipeline_drain_always_terminates() {
+        // The reader loop parses, drains `consumed`, and reparses the tail. On any
+        // adversarial buffer this must make progress and terminate.
+        let mut state: u64 = 0xdead_beef_cafe_f00d;
+        let mut rng = || {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            state
+        };
+        for _ in 0..20_000 {
+            let len = (rng() % 96) as usize;
+            let mut buf: Vec<u8> = (0..len)
+                .map(|_| match rng() % 6 {
+                    0 => b'*',
+                    1 => b'$',
+                    2 => b'\r',
+                    3 => b'\n',
+                    4 => b"0123456789"[(rng() % 10) as usize],
+                    _ => (rng() % 256) as u8,
+                })
+                .collect();
+            let mut guard = 0;
+            loop {
+                guard += 1;
+                assert!(guard < 10_000, "drain did not terminate");
+                match parse_command(&buf) {
+                    Parsed::Complete(_, n) => {
+                        assert!(n > 0 && n <= buf.len());
+                        buf.drain(0..n);
+                        if buf.is_empty() {
+                            break;
+                        }
+                    }
+                    Parsed::Incomplete | Parsed::Error(_) => break,
+                }
+            }
+        }
+    }
 }
