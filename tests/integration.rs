@@ -160,7 +160,7 @@ impl Conn {
                 self.reader.read_exact(&mut buf).unwrap();
                 String::from_utf8_lossy(&buf[..n as usize]).to_string()
             }
-            b'*' | b'%' => {
+            b'*' | b'%' | b'~' | b'>' => {
                 let n: i64 = rest.parse().unwrap();
                 if n < 0 {
                     return "(nil)".to_string();
@@ -169,6 +169,9 @@ impl Conn {
                 let items: Vec<String> = (0..count).map(|_| self.read_reply()).collect();
                 format!("[{}]", items.join(", "))
             }
+            b',' => rest,                // RESP3 double
+            b'_' => "(nil)".to_string(), // RESP3 null
+            b'#' => rest,                // RESP3 boolean (t / f)
             other => panic!("unexpected reply tag {other:?} in {line:?}"),
         }
     }
@@ -1144,4 +1147,19 @@ fn slowlog_records_and_resets() {
     // Only commands issued after RESET remain.
     let after: i64 = c.cmd(&["SLOWLOG", "LEN"]).parse().unwrap();
     assert!(after <= 1, "slowlog len after reset: {after}");
+}
+
+#[test]
+fn resp3_typed_replies() {
+    let s = Server::start();
+    let mut c = s.connect();
+    assert!(c.cmd(&["HELLO", "3"]).contains("proto")); // negotiate RESP3
+    c.cmd(&["HSET", "h", "f", "v"]);
+    c.cmd(&["SADD", "st", "a"]);
+    c.cmd(&["ZADD", "z", "1.5", "m"]);
+    assert_eq!(c.cmd(&["HGETALL", "h"]), "[f, v]"); // map (%)
+    assert_eq!(c.cmd(&["SMEMBERS", "st"]), "[a]"); // set (~)
+    assert_eq!(c.cmd(&["ZSCORE", "z", "m"]), "1.5"); // double (,)
+    // CONFIG GET is a map in RESP3 too.
+    assert_eq!(c.cmd(&["CONFIG", "GET", "appendonly"]), "[appendonly, no]");
 }

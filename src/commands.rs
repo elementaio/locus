@@ -71,6 +71,12 @@ fn parse_int(arg: &[u8]) -> Option<i64> {
 }
 
 pub fn execute(tokens: &[Vec<u8>], db: &mut Db) -> Vec<u8> {
+    execute_proto(tokens, db, 2)
+}
+
+/// Like `execute`, but `proto` (2 or 3) selects RESP2 vs RESP3 typed replies for
+/// the shape-sensitive commands (maps / sets / doubles).
+pub fn execute_proto(tokens: &[Vec<u8>], db: &mut Db, proto: u8) -> Vec<u8> {
     if tokens.is_empty() {
         return Vec::new();
     }
@@ -191,7 +197,7 @@ pub fn execute(tokens: &[Vec<u8>], db: &mut Db) -> Vec<u8> {
         b"HSETNX" => hsetnx_cmd(db, tokens),
         b"HGET" => hget_cmd(db, tokens),
         b"HMGET" => hmget_cmd(db, tokens),
-        b"HGETALL" => hgetall_cmd(db, tokens),
+        b"HGETALL" => hgetall_cmd(db, tokens, proto),
         b"HDEL" => hdel_cmd(db, tokens),
         b"HEXISTS" => hexists_cmd(db, tokens),
         b"HLEN" => hlen_cmd(db, tokens),
@@ -201,7 +207,7 @@ pub fn execute(tokens: &[Vec<u8>], db: &mut Db) -> Vec<u8> {
         // sets
         b"SADD" => sadd_cmd(db, tokens),
         b"SREM" => srem_cmd(db, tokens),
-        b"SMEMBERS" => smembers_cmd(db, tokens),
+        b"SMEMBERS" => smembers_cmd(db, tokens, proto),
         b"SISMEMBER" => sismember_cmd(db, tokens),
         b"SMISMEMBER" => smismember_cmd(db, tokens),
         b"SCARD" => scard_cmd(db, tokens),
@@ -217,7 +223,7 @@ pub fn execute(tokens: &[Vec<u8>], db: &mut Db) -> Vec<u8> {
         b"SMOVE" => smove_cmd(db, tokens),
         // sorted sets
         b"ZADD" => zadd_cmd(db, tokens),
-        b"ZSCORE" => zscore_cmd(db, tokens),
+        b"ZSCORE" => zscore_cmd(db, tokens, proto),
         b"ZMSCORE" => zmscore_cmd(db, tokens),
         b"ZCARD" => zcard_cmd(db, tokens),
         b"ZREM" => zrem_cmd(db, tokens),
@@ -2522,20 +2528,20 @@ fn hmget_cmd(db: &mut Db, tokens: &[Vec<u8>]) -> Vec<u8> {
     }
 }
 
-fn hgetall_cmd(db: &mut Db, tokens: &[Vec<u8>]) -> Vec<u8> {
+fn hgetall_cmd(db: &mut Db, tokens: &[Vec<u8>], proto: u8) -> Vec<u8> {
     if tokens.len() != 2 {
         return wrong_args("hgetall");
     }
     match with_hash(db, &tokens[1]) {
         Err(()) => wrongtype(),
-        Ok(None) => bulk_array(&[]),
+        Ok(None) => crate::resp::map(&[], proto),
         Ok(Some(h)) => {
             let mut flat = Vec::with_capacity(h.len() * 2);
             for (f, v) in h {
                 flat.push(f.clone());
                 flat.push(v.clone());
             }
-            bulk_array(&flat)
+            crate::resp::map(&flat, proto)
         }
     }
 }
@@ -2657,13 +2663,13 @@ fn srem_cmd(db: &mut Db, tokens: &[Vec<u8>]) -> Vec<u8> {
     integer(removed)
 }
 
-fn smembers_cmd(db: &mut Db, tokens: &[Vec<u8>]) -> Vec<u8> {
+fn smembers_cmd(db: &mut Db, tokens: &[Vec<u8>], proto: u8) -> Vec<u8> {
     if tokens.len() != 2 {
         return wrong_args("smembers");
     }
     match db.get(&tokens[1]) {
-        None => bulk_array(&[]),
-        Some(Value::Set(s)) => bulk_array(&s.iter().cloned().collect::<Vec<_>>()),
+        None => crate::resp::set(&[], proto),
+        Some(Value::Set(s)) => crate::resp::set(&s.iter().cloned().collect::<Vec<_>>(), proto),
         Some(_) => wrongtype(),
     }
 }
@@ -3078,7 +3084,7 @@ fn zadd_cmd(db: &mut Db, tokens: &[Vec<u8>]) -> Vec<u8> {
     integer(if ch { changed } else { added })
 }
 
-fn zscore_cmd(db: &mut Db, tokens: &[Vec<u8>]) -> Vec<u8> {
+fn zscore_cmd(db: &mut Db, tokens: &[Vec<u8>], proto: u8) -> Vec<u8> {
     if tokens.len() != 3 {
         return wrong_args("zscore");
     }
@@ -3087,7 +3093,7 @@ fn zscore_cmd(db: &mut Db, tokens: &[Vec<u8>]) -> Vec<u8> {
         Ok(None) => null_bulk(),
         Ok(Some(z)) => z
             .get(&tokens[2])
-            .map(|s| bulk_string(&fmt_score(*s)))
+            .map(|s| crate::resp::double(&fmt_score(*s), proto))
             .unwrap_or_else(null_bulk),
     }
 }

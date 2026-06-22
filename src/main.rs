@@ -29,7 +29,7 @@ use std::sync::{Arc, mpsc};
 use std::thread;
 use std::time::{Duration, Instant};
 
-use commands::execute;
+use commands::execute_proto;
 use db::{Db, Value, now_ms};
 use pubsub::PubSub;
 use resp::{Parsed, parse_command};
@@ -526,7 +526,8 @@ impl Hub {
                         out.push(val.clone().into_bytes());
                     }
                 }
-                self.send(id, resp::bulk_array(&out));
+                let proto = self.protos.get(&id).copied().unwrap_or(2);
+                self.send(id, resp::map(&out, proto));
             }
             Some(b"SET") if tokens.len() >= 4 => {
                 let param = tokens[2].to_ascii_lowercase();
@@ -1874,7 +1875,8 @@ impl Hub {
         if is_write && self.master.is_none() && !self.evict_if_needed() {
             return resp::error("OOM command not allowed when used memory > 'maxmemory'.");
         }
-        let reply = execute(&tokens, &mut self.db);
+        let proto = self.protos.get(&id).copied().unwrap_or(2);
+        let reply = execute_proto(&tokens, &mut self.db, proto);
         let errored = reply.first() == Some(&b'-');
         if !errored && is_write {
             // Keep the memory estimate in sync with whatever the command changed
