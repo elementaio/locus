@@ -54,8 +54,9 @@ enum Msg {
     Disconnect {
         id: u64,
     },
-    /// Replica received a full-sync snapshot; replace the whole dataset.
-    ReplaceDb(Box<Db>),
+    /// Replica received a full-sync snapshot; replace the whole dataset plus the
+    /// CDC / secondary-index state carried in the snapshot trailer.
+    ReplaceDb(Box<Db>, Box<rdb::Extras>),
 }
 
 /// Set by the SIGTERM/SIGINT handler so the hub can persist and exit cleanly.
@@ -188,6 +189,8 @@ struct Hub {
     loopback: HashSet<u64>, // client ids whose peer is a loopback address
     // password this node presents to its master (replica side); None = none.
     masterauth: Option<Vec<u8>>,
+    // true while a background save's write+fsync is running off the hub thread.
+    bgsave_in_progress: Arc<AtomicBool>,
 }
 
 /// A secondary index over one hash field: a sorted field-value → keys map, plus
@@ -249,7 +252,7 @@ struct TxState {
 impl Hub {
     fn new(tx: mpsc::Sender<Msg>) -> Hub {
         let aof_path = aof::configured_path();
-        let (db, aof) = match &aof_path {
+        let (db, aof, extras) = match &aof_path {
             Some(path) => {
                 let db = aof::load(path).unwrap_or_else(|e| {
                     log::warn(&format!("AOF load failed: {e} — starting empty"));
@@ -258,18 +261,23 @@ impl Hub {
                 let aof = aof::Aof::open(path)
                     .map_err(|e| log::warn(&format!("AOF open failed: {e}")))
                     .ok();
-                (db, aof)
+                // CDC/index state lives in the RDB trailer even in AOF mode
+                // (SAVE/BGSAVE write it); the keyspace itself comes from the AOF.
+                let extras = rdb::load_with_extras(&rdb::configured_path())
+                    .map(|(_, x)| x)
+                    .unwrap_or_default();
+                (db, aof, extras)
             }
             None => {
                 let p = rdb::configured_path();
-                let db = rdb::load(&p).unwrap_or_else(|e| {
+                let (db, extras) = rdb::load_with_extras(&p).unwrap_or_else(|e| {
                     log::warn(&format!("RDB load failed: {e} — starting empty"));
-                    Db::new()
+                    (Db::new(), rdb::Extras::default())
                 });
-                (db, None)
+                (db, None, extras)
             }
         };
-        Hub {
+        let mut hub = Hub {
             db,
             aof,
             aof_path,
@@ -314,7 +322,92 @@ impl Hub {
                 .ok()
                 .map(String::into_bytes)
                 .filter(|p| !p.is_empty()),
+            bgsave_in_progress: Arc::new(AtomicBool::new(false)),
+        };
+        hub.apply_extras(extras);
+        hub
+    }
+
+    /// Restore CDC + secondary-index state loaded from a snapshot trailer.
+    fn apply_extras(&mut self, x: rdb::Extras) {
+        self.cdc_next_offset = x.cdc_next_offset.max(self.cdc_next_offset);
+        self.cdc_log = x
+            .cdc_log
+            .into_iter()
+            .map(|r| ChangeRecord {
+                offset: r.offset,
+                event: r.event,
+                key: r.key,
+                value: r.value,
+            })
+            .collect();
+        self.cdc_groups = x
+            .cdc_groups
+            .into_iter()
+            .map(|g| {
+                (
+                    g.name,
+                    CdcGroup {
+                        last_delivered: g.last_delivered,
+                        pending: g.pending.into_iter().collect(),
+                    },
+                )
+            })
+            .collect();
+        for (name, field) in x.index_defs {
+            self.add_index(name, field);
         }
+    }
+
+    /// Snapshot the CDC + secondary-index state for persistence.
+    fn build_extras(&self) -> rdb::Extras {
+        rdb::Extras {
+            cdc_next_offset: self.cdc_next_offset,
+            cdc_log: self
+                .cdc_log
+                .iter()
+                .map(|r| rdb::CdcRec {
+                    offset: r.offset,
+                    event: r.event.clone(),
+                    key: r.key.clone(),
+                    value: r.value.clone(),
+                })
+                .collect(),
+            cdc_groups: self
+                .cdc_groups
+                .iter()
+                .map(|(name, g)| rdb::CdcGrp {
+                    name: name.clone(),
+                    last_delivered: g.last_delivered,
+                    pending: g.pending.iter().map(|(o, c)| (*o, c.clone())).collect(),
+                })
+                .collect(),
+            index_defs: self
+                .indexes
+                .iter()
+                .map(|(name, ix)| (name.clone(), ix.field.clone()))
+                .collect(),
+        }
+    }
+
+    /// Create a secondary index over `field`, populated from the current
+    /// keyspace. Used by IDXCREATE and by snapshot restore.
+    fn add_index(&mut self, name: Vec<u8>, field: Vec<u8>) {
+        let mut ix = SecondaryIndex {
+            field: field.clone(),
+            forward: BTreeMap::new(),
+            reverse: HashMap::new(),
+        };
+        for k in self.db.live_keys() {
+            if let Some(Value::Hash(h)) = self.db.get(&k)
+                && let Some(v) = h.get(&field)
+            {
+                let v = v.clone();
+                ix.forward.entry(v.clone()).or_default().insert(k.clone());
+                ix.reverse.insert(k, v);
+            }
+        }
+        self.indexes.insert(name, ix);
     }
 
     fn send(&self, id: u64, bytes: Vec<u8>) {
@@ -330,8 +423,11 @@ impl Hub {
         if let Some(a) = self.aof.as_mut() {
             a.fsync();
         }
-        if save && let Err(e) = rdb::save(&self.db, &rdb::configured_path()) {
-            log::error(&format!("shutdown: final save failed: {e}"));
+        if save {
+            let extras = self.build_extras();
+            if let Err(e) = rdb::save_with_extras(&self.db, &extras, &rdb::configured_path()) {
+                log::error(&format!("shutdown: final save failed: {e}"));
+            }
         }
         log::info("shutting down");
         std::process::exit(0);
@@ -584,7 +680,8 @@ impl Hub {
                     id,
                     b"+FULLRESYNC 0000000000000000000000000000000000000000 0\r\n".to_vec(),
                 );
-                let snap = rdb::serialize(&self.db);
+                let mut snap = rdb::serialize(&self.db);
+                rdb::append_extras(&mut snap, &self.build_extras());
                 let mut bulk = format!("${}\r\n", snap.len()).into_bytes();
                 bulk.extend_from_slice(&snap);
                 self.send(id, bulk);
@@ -628,6 +725,37 @@ impl Hub {
                     _ => resp::error("ERR AOF is not enabled"),
                 };
                 self.send(id, reply);
+            }
+            b"SAVE" => {
+                let extras = self.build_extras();
+                let reply = match rdb::save_with_extras(&self.db, &extras, &rdb::configured_path())
+                {
+                    Ok(()) => resp::simple_string("OK"),
+                    Err(e) => resp::error(&format!("ERR {e}")),
+                };
+                self.send(id, reply);
+            }
+            b"BGSAVE" => {
+                if self.bgsave_in_progress.load(Ordering::Relaxed) {
+                    self.send(id, resp::error("ERR Background save already in progress"));
+                } else {
+                    // Serialize on the hub (a consistent point-in-time snapshot),
+                    // then write + fsync off-thread so the disk I/O doesn't stall
+                    // the command loop. This makes the "started" reply truthful.
+                    let mut bytes = rdb::serialize(&self.db);
+                    rdb::append_extras(&mut bytes, &self.build_extras());
+                    let path = rdb::configured_path();
+                    let flag = self.bgsave_in_progress.clone();
+                    flag.store(true, Ordering::Relaxed);
+                    thread::spawn(move || {
+                        match rdb::write_snapshot(&bytes, &path) {
+                            Ok(()) => log::info("background save complete"),
+                            Err(e) => log::error(&format!("background save failed: {e}")),
+                        }
+                        flag.store(false, Ordering::Relaxed);
+                    });
+                    self.send(id, resp::simple_string("Background saving started"));
+                }
             }
             b"SHUTDOWN" => {
                 let nosave = tokens
@@ -964,22 +1092,7 @@ impl Hub {
             return self.send(id, resp::error("ERR index already exists"));
         }
         // Build the index from the current keyspace (then writes keep it in sync).
-        let field = tokens[2].clone();
-        let mut ix = SecondaryIndex {
-            field: field.clone(),
-            forward: BTreeMap::new(),
-            reverse: HashMap::new(),
-        };
-        for k in self.db.live_keys() {
-            if let Some(Value::Hash(h)) = self.db.get(&k)
-                && let Some(v) = h.get(&field)
-            {
-                let v = v.clone();
-                ix.forward.entry(v.clone()).or_default().insert(k.clone());
-                ix.reverse.insert(k, v);
-            }
-        }
-        self.indexes.insert(tokens[1].clone(), ix);
+        self.add_index(tokens[1].clone(), tokens[2].clone());
         self.send(id, resp::simple_string("OK"));
     }
 
@@ -1804,8 +1917,9 @@ fn run_hub(rx: mpsc::Receiver<Msg>, tx: mpsc::Sender<Msg>) {
                 hub.loopback.remove(&id);
             }
             Ok(Msg::Command { id, tokens }) => hub.handle_command(id, tokens),
-            Ok(Msg::ReplaceDb(db)) => {
+            Ok(Msg::ReplaceDb(db, extras)) => {
                 hub.db = *db;
+                hub.apply_extras(*extras); // CDC offsets/log/groups + rebuilt indexes
                 // A replica that just loaded a full-sync snapshot may now be able
                 // to satisfy readers parked on a blocking XREAD.
                 hub.serve_blocked();
@@ -1893,8 +2007,11 @@ fn try_sync(
     let len = read_bulk_header(&mut stream)?;
     let mut snap = vec![0u8; len];
     stream.read_exact(&mut snap)?;
-    let db = rdb::deserialize(&snap)?;
-    if hub_tx.send(Msg::ReplaceDb(Box::new(db))).is_err() {
+    let (db, extras) = rdb::deserialize_with_extras(&snap)?;
+    if hub_tx
+        .send(Msg::ReplaceDb(Box::new(db), Box::new(extras)))
+        .is_err()
+    {
         return Ok(());
     }
     log::info(&format!("replication: full sync complete ({len} bytes)"));

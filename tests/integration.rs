@@ -35,6 +35,16 @@ impl Server {
             SEQ.fetch_add(1, Ordering::Relaxed),
         );
         let _ = std::fs::remove_file(&rdb);
+        Server::spawn_at(rdb, extra_env)
+    }
+
+    /// Spawn against a caller-chosen RDB path WITHOUT clearing it first, so a
+    /// second server can read what a first one persisted (restart tests).
+    fn start_with_rdb(rdb: &str) -> Server {
+        Server::spawn_at(rdb.to_string(), &[])
+    }
+
+    fn spawn_at(rdb: String, extra_env: &[(&str, &str)]) -> Server {
         // LOCUS_PORT=0 -> the OS picks a free port; we read the real one back
         // from the server's stdout. No bind-then-drop race between tests.
         let mut cmd = Command::new(env!("CARGO_BIN_EXE_locus"));
@@ -881,6 +891,105 @@ fn shutdown_command_persists_and_exits_cleanly() {
 }
 
 #[test]
+fn bgsave_is_async_and_writes_the_snapshot() {
+    let s = Server::start();
+    let mut c = s.connect();
+    assert_eq!(c.cmd(&["SET", "persisted", "yes"]), "OK");
+    assert_eq!(c.cmd(&["BGSAVE"]), "Background saving started");
+    // The hub stays responsive (the write+fsync ran off-thread, not inline)...
+    assert_eq!(c.cmd(&["PING"]), "PONG");
+    // ...and the snapshot lands on disk shortly after.
+    let deadline = Instant::now() + Duration::from_secs(3);
+    loop {
+        if std::fs::metadata(&s.rdb)
+            .map(|m| m.len() > 0)
+            .unwrap_or(false)
+        {
+            break;
+        }
+        assert!(Instant::now() < deadline, "BGSAVE never wrote the snapshot");
+        sleep(Duration::from_millis(20));
+    }
+}
+
+#[test]
+fn secondary_index_survives_restart() {
+    let rdb = format!(
+        "{}/locus-idx-restart-{}.rdb",
+        std::env::temp_dir().display(),
+        std::process::id()
+    );
+    let _ = std::fs::remove_file(&rdb);
+    // Round 1: hashes + an index, then SAVE (and a graceful SHUTDOWN, which also
+    // persists), so the index definition lands in the snapshot trailer.
+    {
+        let mut s = Server::start_with_rdb(&rdb);
+        let mut c = s.connect();
+        c.cmd(&["HSET", "user:1", "city", "doha"]);
+        c.cmd(&["HSET", "user:2", "city", "doha"]);
+        c.cmd(&["IDXCREATE", "by_city", "city"]);
+        assert_eq!(c.cmd(&["SAVE"]), "OK");
+        c.send(&["SHUTDOWN"]);
+        assert!(s.wait_exit().success());
+        std::mem::forget(s); // keep the RDB on disk for round 2
+    }
+    // Round 2: a fresh server on the same RDB rebuilt the index from its stored
+    // definition — IDXGET works without re-running IDXCREATE.
+    {
+        let s = Server::start_with_rdb(&rdb);
+        let mut c = s.connect();
+        let r = c.cmd(&["IDXGET", "by_city", "doha"]);
+        assert!(
+            r.contains("user:1") && r.contains("user:2"),
+            "index not restored across restart: {r}"
+        );
+    }
+    let _ = std::fs::remove_file(&rdb);
+}
+
+#[test]
+fn aof_recovers_all_acked_writes_after_kill9() {
+    let rdb = format!(
+        "{}/locus-crash-{}.rdb",
+        std::env::temp_dir().display(),
+        std::process::id()
+    );
+    let aof = format!(
+        "{}/locus-crash-{}.aof",
+        std::env::temp_dir().display(),
+        std::process::id()
+    );
+    let _ = std::fs::remove_file(&rdb);
+    let _ = std::fs::remove_file(&aof);
+    // Round 1: AOF on; write 50 keys, then SIGKILL with no graceful shutdown.
+    // Each acked SET was write_all'd to the AOF (into the kernel), so a process
+    // kill (not a power loss) must lose none of them.
+    {
+        let mut s = Server::spawn_at(rdb.clone(), &[("LOCUS_AOF", aof.as_str())]);
+        let mut c = s.connect();
+        for i in 0..50 {
+            assert_eq!(c.cmd(&["SET", &format!("k{i}"), &format!("v{i}")]), "OK");
+        }
+        s.child.kill().unwrap(); // SIGKILL
+        let _ = s.child.wait();
+    }
+    // Round 2: restart on the same AOF — every write replays, uncorrupted, with
+    // no extra or missing keys.
+    {
+        let mut s = Server::spawn_at(rdb.clone(), &[("LOCUS_AOF", aof.as_str())]);
+        let mut c = s.connect();
+        for i in 0..50 {
+            assert_eq!(c.cmd(&["GET", &format!("k{i}")]), format!("v{i}"));
+        }
+        assert_eq!(c.cmd(&["DBSIZE"]), "50");
+        let _ = s.child.kill();
+        let _ = s.child.wait();
+    }
+    let _ = std::fs::remove_file(&rdb);
+    let _ = std::fs::remove_file(&aof);
+}
+
+#[test]
 fn replica_authenticates_to_a_password_protected_master() {
     let master = Server::start_inner(&[("LOCUS_REQUIREPASS", "mpw")]);
     let replica = Server::start_inner(&[("LOCUS_MASTERAUTH", "mpw")]);
@@ -922,4 +1031,31 @@ fn replica_with_wrong_masterauth_never_syncs() {
     // shipped — the dataset is not siphoned and the value never appears.
     sleep(Duration::from_millis(700));
     assert_eq!(r.cmd(&["GET", "foo"]), "(nil)");
+}
+
+#[test]
+fn replica_gets_secondary_index_from_full_sync() {
+    let master = Server::start();
+    let replica = Server::start();
+    let mut m = master.connect();
+    m.cmd(&["HSET", "u:1", "city", "doha"]);
+    m.cmd(&["IDXCREATE", "by_city", "city"]);
+    let mut r = replica.connect();
+    assert_eq!(
+        r.cmd(&["REPLICAOF", "127.0.0.1", &master.port.to_string()]),
+        "OK"
+    );
+    // The snapshot trailer carries the index definition; the replica rebuilds it
+    // from the replicated keyspace, so IDXGET works without re-running IDXCREATE.
+    let deadline = Instant::now() + Duration::from_secs(3);
+    loop {
+        if r.cmd(&["IDXGET", "by_city", "doha"]).contains("u:1") {
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "index not replicated via full-sync"
+        );
+        sleep(Duration::from_millis(50));
+    }
 }

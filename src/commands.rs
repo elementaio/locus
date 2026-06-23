@@ -8,7 +8,6 @@ use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use crate::db::{Db, Value, now_ms};
-use crate::rdb;
 use crate::resp::{
     array, bulk_array, bulk_string, error, integer, null_array, null_bulk, simple_string,
 };
@@ -240,15 +239,8 @@ pub fn execute(tokens: &[Vec<u8>], db: &mut Db) -> Vec<u8> {
         b"XLEN" => streams::xlen(db, tokens),
         b"XRANGE" => streams::xrange(db, tokens, false),
         b"XREVRANGE" => streams::xrange(db, tokens, true),
-        // persistence
-        b"SAVE" => match rdb::save(db, &rdb::configured_path()) {
-            Ok(()) => simple_string("OK"),
-            Err(e) => error(&format!("ERR {e}")),
-        },
-        b"BGSAVE" => match rdb::save(db, &rdb::configured_path()) {
-            Ok(()) => simple_string("Background saving started"),
-            Err(e) => error(&format!("ERR {e}")),
-        },
+        // persistence: SAVE / BGSAVE are handled by the hub — they need its CDC /
+        // secondary-index state (and BGSAVE a background thread).
         // stubs
         b"COMMAND" => b"*0\r\n".to_vec(),
         b"CONFIG" => match tokens.get(1).map(|t| t.to_ascii_uppercase()).as_deref() {
