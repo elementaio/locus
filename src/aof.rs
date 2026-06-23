@@ -160,6 +160,20 @@ pub fn entries_for(tokens: &[Vec<u8>], reply: &[u8], db: &mut Db) -> Vec<Vec<Vec
                 vec![]
             }
         }
+        b"GETEX" => {
+            // Only a TTL-changing GETEX is a write; log the resulting deadline
+            // (absolute), a PERSIST, or a DEL if it's already past.
+            let key = &tokens[1];
+            if tokens.len() <= 2 || !db.contains(key) {
+                vec![]
+            } else {
+                match db.raw_expire(key) {
+                    Some(t) if t <= now_ms() => vec![vec![b"DEL".to_vec(), key.clone()]],
+                    Some(t) => vec![pexpireat(key, t)],
+                    None => vec![vec![b"PERSIST".to_vec(), key.clone()]],
+                }
+            }
+        }
         b"SPOP" => {
             // Log the exact members removed (parsed from the reply), not SPOP.
             let popped = extract_bulks(reply);

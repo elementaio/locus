@@ -160,7 +160,7 @@ impl Conn {
                 self.reader.read_exact(&mut buf).unwrap();
                 String::from_utf8_lossy(&buf[..n as usize]).to_string()
             }
-            b'*' | b'%' => {
+            b'*' | b'%' | b'~' | b'>' => {
                 let n: i64 = rest.parse().unwrap();
                 if n < 0 {
                     return "(nil)".to_string();
@@ -169,6 +169,9 @@ impl Conn {
                 let items: Vec<String> = (0..count).map(|_| self.read_reply()).collect();
                 format!("[{}]", items.join(", "))
             }
+            b',' => rest,                // RESP3 double
+            b'_' => "(nil)".to_string(), // RESP3 null
+            b'#' => rest,                // RESP3 boolean (t / f)
             other => panic!("unexpected reply tag {other:?} in {line:?}"),
         }
     }
@@ -1058,4 +1061,132 @@ fn replica_gets_secondary_index_from_full_sync() {
         );
         sleep(Duration::from_millis(50));
     }
+}
+
+// === CONFIG / INFO ==========================================================
+
+#[test]
+fn config_get_returns_live_values_and_set_applies() {
+    let s = Server::start();
+    let mut c = s.connect();
+    assert_eq!(c.cmd(&["CONFIG", "GET", "appendonly"]), "[appendonly, no]");
+    assert_eq!(c.cmd(&["CONFIG", "GET", "maxmemory"]), "[maxmemory, 0]");
+    // Glob matches multiple params.
+    let g = c.cmd(&["CONFIG", "GET", "maxmemory*"]);
+    assert!(
+        g.contains("maxmemory") && g.contains("maxmemory-policy"),
+        "glob CONFIG GET: {g}"
+    );
+    // CONFIG SET applies live and reads back.
+    assert_eq!(c.cmd(&["CONFIG", "SET", "maxmemory", "100mb"]), "OK");
+    assert_eq!(
+        c.cmd(&["CONFIG", "GET", "maxmemory"]),
+        format!("[maxmemory, {}]", 100 * 1024 * 1024)
+    );
+}
+
+#[test]
+fn info_has_standard_sections() {
+    let s = Server::start();
+    let mut c = s.connect();
+    c.cmd(&["SET", "k", "v"]);
+    let info = c.cmd(&["INFO"]);
+    for needle in [
+        "# Server",
+        "redis_version:",
+        "# Clients",
+        "connected_clients:",
+        "# Memory",
+        "used_memory:",
+        "# Persistence",
+        "# Stats",
+        "total_commands_processed:",
+        "# Replication",
+        "role:master",
+        "# Keyspace",
+        "db0:keys=1",
+    ] {
+        assert!(info.contains(needle), "INFO missing {needle:?}:\n{info}");
+    }
+}
+
+#[test]
+fn getex_object_and_client_verbs() {
+    let s = Server::start();
+    let mut c = s.connect();
+    c.cmd(&["SET", "k", "v"]);
+    // GETEX returns the value and can set then clear the TTL.
+    assert_eq!(c.cmd(&["GETEX", "k"]), "v");
+    assert_eq!(c.cmd(&["GETEX", "k", "EX", "1000"]), "v");
+    assert!(c.cmd(&["TTL", "k"]).parse::<i64>().unwrap() > 0);
+    assert_eq!(c.cmd(&["GETEX", "k", "PERSIST"]), "v");
+    assert_eq!(c.cmd(&["TTL", "k"]), "-1");
+    // OBJECT ENCODING reports a plausible per-type encoding.
+    assert_eq!(c.cmd(&["OBJECT", "ENCODING", "k"]), "raw");
+    c.cmd(&["RPUSH", "l", "a"]);
+    assert_eq!(c.cmd(&["OBJECT", "ENCODING", "l"]), "listpack");
+    // CLIENT ID / SETNAME / GETNAME / SETINFO.
+    assert!(c.cmd(&["CLIENT", "ID"]).parse::<i64>().is_ok());
+    assert_eq!(c.cmd(&["CLIENT", "SETNAME", "app1"]), "OK");
+    assert_eq!(c.cmd(&["CLIENT", "GETNAME"]), "app1");
+    assert_eq!(c.cmd(&["CLIENT", "SETINFO", "lib-name", "ioredis"]), "OK");
+}
+
+#[test]
+fn slowlog_records_and_resets() {
+    // Threshold 0 -> every command is logged, so the test is deterministic.
+    let s = Server::start_inner(&[("LOCUS_SLOWLOG_US", "0")]);
+    let mut c = s.connect();
+    c.cmd(&["SET", "k", "v"]);
+    c.cmd(&["GET", "k"]);
+    let len: i64 = c.cmd(&["SLOWLOG", "LEN"]).parse().unwrap();
+    assert!(len >= 2, "slowlog len {len}");
+    let got = c.cmd(&["SLOWLOG", "GET", "1"]);
+    assert!(got.starts_with("[["), "slowlog get: {got}"); // array of entry-arrays
+    assert_eq!(c.cmd(&["SLOWLOG", "RESET"]), "OK");
+    // Only commands issued after RESET remain.
+    let after: i64 = c.cmd(&["SLOWLOG", "LEN"]).parse().unwrap();
+    assert!(after <= 1, "slowlog len after reset: {after}");
+}
+
+#[test]
+fn resp3_typed_replies() {
+    let s = Server::start();
+    let mut c = s.connect();
+    assert!(c.cmd(&["HELLO", "3"]).contains("proto")); // negotiate RESP3
+    c.cmd(&["HSET", "h", "f", "v"]);
+    c.cmd(&["SADD", "st", "a"]);
+    c.cmd(&["ZADD", "z", "1.5", "m"]);
+    assert_eq!(c.cmd(&["HGETALL", "h"]), "[f, v]"); // map (%)
+    assert_eq!(c.cmd(&["SMEMBERS", "st"]), "[a]"); // set (~)
+    assert_eq!(c.cmd(&["ZSCORE", "z", "m"]), "1.5"); // double (,)
+    // CONFIG GET is a map in RESP3 too.
+    assert_eq!(c.cmd(&["CONFIG", "GET", "appendonly"]), "[appendonly, no]");
+}
+
+#[test]
+fn acl_user_least_privilege() {
+    let s = Server::start();
+    let mut admin = s.connect(); // default user, unrestricted (open mode)
+    // A read-only user scoped to the app:* keys.
+    assert_eq!(
+        admin.cmd(&["ACL", "SETUSER", "alice", "on", ">pw", "+@read", "~app:"]),
+        "OK"
+    );
+    admin.cmd(&["SET", "app:k", "v"]);
+    admin.cmd(&["SET", "other", "v"]);
+
+    let mut a = s.connect();
+    assert_eq!(a.cmd(&["AUTH", "alice", "pw"]), "OK");
+    assert_eq!(a.cmd(&["GET", "app:k"]), "v"); // read inside the prefix: allowed
+    assert!(a.cmd(&["SET", "app:k", "x"]).starts_with("-NOPERM")); // write: no @write
+    assert!(a.cmd(&["GET", "other"]).starts_with("-NOPERM")); // key outside prefix
+
+    // Wrong password is rejected.
+    let mut b = s.connect();
+    assert!(b.cmd(&["AUTH", "alice", "wrong"]).starts_with("-WRONGPASS"));
+
+    // The default user is unrestricted; introspection works.
+    assert_eq!(admin.cmd(&["ACL", "WHOAMI"]), "default");
+    assert!(admin.cmd(&["ACL", "USERS"]).contains("alice"));
 }

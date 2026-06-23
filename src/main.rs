@@ -11,6 +11,7 @@
 //! M4 lists/hashes/sets · M5 sorted sets · M6 RDB · M7 AOF · M8 pub/sub ·
 //! M9 replication (full sync + command streaming).
 
+mod acl;
 mod aof;
 mod commands;
 mod db;
@@ -27,9 +28,9 @@ use std::net::{TcpListener, TcpStream};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, mpsc};
 use std::thread;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
-use commands::execute;
+use commands::execute_proto;
 use db::{Db, Value, now_ms};
 use pubsub::PubSub;
 use resp::{Parsed, parse_command};
@@ -191,6 +192,27 @@ struct Hub {
     masterauth: Option<Vec<u8>>,
     // true while a background save's write+fsync is running off the hub thread.
     bgsave_in_progress: Arc<AtomicBool>,
+    // observability: process start (uptime) + a cheap command counter for INFO.
+    start: Instant,
+    commands_processed: u64,
+    // per-client name set via CLIENT SETNAME (for CLIENT GETNAME / LIST).
+    client_names: HashMap<u64, Vec<u8>>,
+    // SLOWLOG: a bounded ring of commands slower than the threshold (newest first).
+    slowlog: VecDeque<SlowEntry>,
+    slowlog_next_id: u64,
+    slowlog_threshold_us: i64, // < 0 disables logging
+    slowlog_max_len: usize,
+    // ACL: named users + each connection's current user (default user is implicit).
+    users: HashMap<Vec<u8>, acl::User>,
+    current_user: HashMap<u64, Vec<u8>>,
+}
+
+/// One slow-log entry.
+struct SlowEntry {
+    id: u64,
+    time_secs: u64,
+    micros: u64,
+    args: Vec<Vec<u8>>,
 }
 
 /// A secondary index over one hash field: a sorted field-value → keys map, plus
@@ -323,6 +345,21 @@ impl Hub {
                 .map(String::into_bytes)
                 .filter(|p| !p.is_empty()),
             bgsave_in_progress: Arc::new(AtomicBool::new(false)),
+            start: Instant::now(),
+            commands_processed: 0,
+            client_names: HashMap::new(),
+            slowlog: VecDeque::new(),
+            slowlog_next_id: 0,
+            slowlog_threshold_us: std::env::var("LOCUS_SLOWLOG_US")
+                .ok()
+                .and_then(|s| s.trim().parse().ok())
+                .unwrap_or(10_000),
+            slowlog_max_len: std::env::var("LOCUS_SLOWLOG_MAXLEN")
+                .ok()
+                .and_then(|s| s.trim().parse().ok())
+                .unwrap_or(128),
+            users: HashMap::new(),
+            current_user: HashMap::new(),
         };
         hub.apply_extras(extras);
         hub
@@ -433,11 +470,351 @@ impl Hub {
         std::process::exit(0);
     }
 
+    /// Runtime config as (name, value) pairs, sourced from live hub state and the
+    /// env knobs. Read by CONFIG GET and INFO.
+    fn config_params(&self) -> Vec<(&'static str, String)> {
+        let policy = if self.maxmemory.is_some() {
+            "allkeys-random" // Locus evicts arbitrary keys
+        } else {
+            "noeviction"
+        };
+        let appendfsync = std::env::var("LOCUS_APPENDFSYNC")
+            .ok()
+            .map(|s| s.trim().to_ascii_lowercase())
+            .filter(|s| matches!(s.as_str(), "always" | "no" | "everysec"))
+            .unwrap_or_else(|| "everysec".into());
+        vec![
+            ("maxmemory", self.maxmemory.unwrap_or(0).to_string()),
+            ("maxmemory-policy", policy.to_string()),
+            (
+                "appendonly",
+                if self.aof.is_some() { "yes" } else { "no" }.to_string(),
+            ),
+            ("appendfsync", appendfsync),
+            ("save", String::new()),
+            (
+                "maxclients",
+                std::env::var("LOCUS_MAXCLIENTS").unwrap_or_else(|_| "10000".into()),
+            ),
+            (
+                "timeout",
+                std::env::var("LOCUS_TIMEOUT").unwrap_or_else(|_| "0".into()),
+            ),
+            (
+                "requirepass",
+                self.requirepass
+                    .as_ref()
+                    .map(|p| String::from_utf8_lossy(p).into_owned())
+                    .unwrap_or_default(),
+            ),
+            (
+                "bind",
+                std::env::var("LOCUS_BIND").unwrap_or_else(|_| "127.0.0.1".into()),
+            ),
+            (
+                "port",
+                std::env::var("LOCUS_PORT").unwrap_or_else(|_| "6379".into()),
+            ),
+        ]
+    }
+
+    fn handle_config(&mut self, id: u64, tokens: &[Vec<u8>]) {
+        match tokens.get(1).map(|t| t.to_ascii_uppercase()).as_deref() {
+            Some(b"GET") if tokens.len() >= 3 => {
+                let params = self.config_params();
+                let mut out: Vec<Vec<u8>> = Vec::new();
+                for (name, val) in &params {
+                    if tokens[2..]
+                        .iter()
+                        .any(|pat| pubsub::glob_match(pat, name.as_bytes()))
+                    {
+                        out.push(name.as_bytes().to_vec());
+                        out.push(val.clone().into_bytes());
+                    }
+                }
+                let proto = self.protos.get(&id).copied().unwrap_or(2);
+                self.send(id, resp::map(&out, proto));
+            }
+            Some(b"SET") if tokens.len() >= 4 => {
+                let param = tokens[2].to_ascii_lowercase();
+                match param.as_slice() {
+                    b"maxmemory" => {
+                        self.maxmemory =
+                            parse_mem(&String::from_utf8_lossy(&tokens[3])).filter(|&m| m > 0);
+                    }
+                    b"requirepass" => {
+                        // Rotation: new auth attempts use the new secret; existing
+                        // authenticated sessions keep their access (Redis semantics).
+                        self.requirepass = if tokens[3].is_empty() {
+                            None
+                        } else {
+                            Some(tokens[3].clone())
+                        };
+                    }
+                    // Accept (and no-op) other known params so clients don't error.
+                    _ => {}
+                }
+                self.send(id, resp::simple_string("OK"));
+            }
+            Some(b"RESETSTAT") => {
+                self.commands_processed = 0;
+                self.send(id, resp::simple_string("OK"));
+            }
+            Some(b"REWRITE") => self.send(id, resp::simple_string("OK")),
+            _ => self.send(
+                id,
+                resp::error("ERR Unknown CONFIG subcommand or wrong number of arguments"),
+            ),
+        }
+    }
+
+    fn handle_client(&mut self, id: u64, tokens: &[Vec<u8>]) {
+        match tokens.get(1).map(|t| t.to_ascii_uppercase()).as_deref() {
+            Some(b"ID") => self.send(id, resp::integer(id as i64)),
+            Some(b"SETNAME") if tokens.len() == 3 => {
+                self.client_names.insert(id, tokens[2].clone());
+                self.send(id, resp::simple_string("OK"));
+            }
+            Some(b"GETNAME") => {
+                let name = self.client_names.get(&id).cloned().unwrap_or_default();
+                self.send(id, resp::bulk_string(&name));
+            }
+            // Drivers send CLIENT SETINFO lib-name/lib-ver on connect; accept it.
+            Some(b"SETINFO") => self.send(id, resp::simple_string("OK")),
+            Some(b"NO-EVICT") | Some(b"NO-TOUCH") => self.send(id, resp::simple_string("OK")),
+            Some(b"LIST") => {
+                let mut s = String::new();
+                for &cid in self.clients.keys() {
+                    let name = self
+                        .client_names
+                        .get(&cid)
+                        .map(|n| String::from_utf8_lossy(n).into_owned())
+                        .unwrap_or_default();
+                    s.push_str(&format!("id={cid} name={name} db=0\n"));
+                }
+                self.send(id, resp::bulk_string(s.as_bytes()));
+            }
+            _ => self.send(
+                id,
+                resp::error("ERR Unknown CLIENT subcommand or wrong number of arguments"),
+            ),
+        }
+    }
+
+    fn push_slowlog(&mut self, micros: u64, args: Vec<Vec<u8>>) {
+        let entry = SlowEntry {
+            id: self.slowlog_next_id,
+            time_secs: now_ms() / 1000,
+            micros,
+            args,
+        };
+        self.slowlog_next_id += 1;
+        self.slowlog.push_front(entry);
+        while self.slowlog.len() > self.slowlog_max_len {
+            self.slowlog.pop_back();
+        }
+    }
+
+    fn handle_slowlog(&mut self, id: u64, tokens: &[Vec<u8>]) {
+        match tokens.get(1).map(|t| t.to_ascii_uppercase()).as_deref() {
+            Some(b"GET") => {
+                let n = tokens
+                    .get(2)
+                    .and_then(|t| std::str::from_utf8(t).ok())
+                    .and_then(|s| s.parse::<i64>().ok());
+                let take = match n {
+                    Some(x) if x >= 0 => (x as usize).min(self.slowlog.len()),
+                    _ => self.slowlog.len(),
+                };
+                let mut reply = format!("*{take}\r\n").into_bytes();
+                for e in self.slowlog.iter().take(take) {
+                    // [id, timestamp, exec_micros, [args], client_addr, client_name]
+                    reply.extend_from_slice(b"*6\r\n");
+                    reply.extend_from_slice(&resp::integer(e.id as i64));
+                    reply.extend_from_slice(&resp::integer(e.time_secs as i64));
+                    reply.extend_from_slice(&resp::integer(e.micros as i64));
+                    reply.extend_from_slice(&resp::bulk_array(&e.args));
+                    reply.extend_from_slice(&resp::bulk_string(b""));
+                    reply.extend_from_slice(&resp::bulk_string(b""));
+                }
+                self.send(id, reply);
+            }
+            Some(b"LEN") => self.send(id, resp::integer(self.slowlog.len() as i64)),
+            Some(b"RESET") => {
+                self.slowlog.clear();
+                self.send(id, resp::simple_string("OK"));
+            }
+            Some(b"HELP") => self.send(
+                id,
+                resp::simple_string("SLOWLOG GET [count] | LEN | RESET | HELP"),
+            ),
+            _ => self.send(
+                id,
+                resp::error("ERR Unknown SLOWLOG subcommand or wrong number of arguments"),
+            ),
+        }
+    }
+
+    fn handle_acl(&mut self, id: u64, tokens: &[Vec<u8>]) {
+        match tokens.get(1).map(|t| t.to_ascii_uppercase()).as_deref() {
+            Some(b"SETUSER") if tokens.len() >= 3 => {
+                let name = tokens[2].clone();
+                let mut user = self.users.get(&name).cloned().unwrap_or_default();
+                for rule in &tokens[3..] {
+                    if user.apply(rule).is_err() {
+                        return self.send(
+                            id,
+                            resp::error(&format!(
+                                "ERR Error in ACL SETUSER modifier '{}'",
+                                String::from_utf8_lossy(rule)
+                            )),
+                        );
+                    }
+                }
+                self.users.insert(name, user);
+                self.send(id, resp::simple_string("OK"));
+            }
+            Some(b"GETUSER") if tokens.len() == 3 => match self.users.get(&tokens[2]) {
+                Some(u) => self.send(id, resp::bulk_array(&u.describe())),
+                None => self.send(id, resp::null_array()),
+            },
+            Some(b"DELUSER") if tokens.len() >= 3 => {
+                let mut n = 0;
+                for name in &tokens[2..] {
+                    if name.as_slice() != b"default" && self.users.remove(name).is_some() {
+                        n += 1;
+                    }
+                }
+                self.send(id, resp::integer(n));
+            }
+            Some(b"LIST") => {
+                let mut out: Vec<Vec<u8>> = Vec::new();
+                for (name, u) in &self.users {
+                    out.push(
+                        format!(
+                            "user {} {}",
+                            String::from_utf8_lossy(name),
+                            if u.enabled { "on" } else { "off" }
+                        )
+                        .into_bytes(),
+                    );
+                }
+                self.send(id, resp::bulk_array(&out));
+            }
+            Some(b"USERS") => {
+                let mut out: Vec<Vec<u8>> = self.users.keys().cloned().collect();
+                out.push(b"default".to_vec());
+                self.send(id, resp::bulk_array(&out));
+            }
+            Some(b"WHOAMI") => {
+                let name = self
+                    .current_user
+                    .get(&id)
+                    .cloned()
+                    .unwrap_or_else(|| b"default".to_vec());
+                self.send(id, resp::bulk_string(&name));
+            }
+            Some(b"CAT") => {
+                let cats: Vec<Vec<u8>> = ["read", "write", "admin", "connection", "pubsub"]
+                    .iter()
+                    .map(|c| c.as_bytes().to_vec())
+                    .collect();
+                self.send(id, resp::bulk_array(&cats));
+            }
+            _ => self.send(
+                id,
+                resp::error("ERR Unknown ACL subcommand or wrong number of arguments"),
+            ),
+        }
+    }
+
+    /// Build the INFO report (the sections redis_exporter and clients expect).
+    fn render_info(&self) -> Vec<u8> {
+        let used = self.db.mem_used();
+        let role = if self.master.is_some() {
+            "slave"
+        } else {
+            "master"
+        };
+        let ver = env!("CARGO_PKG_VERSION");
+        let mut s = String::new();
+        s.push_str("# Server\r\n");
+        s.push_str(&format!("redis_version:{ver}\r\n"));
+        s.push_str("redis_mode:standalone\r\n");
+        s.push_str(&format!("locus_version:{ver}\r\n"));
+        s.push_str(&format!(
+            "os:{} {}\r\n",
+            std::env::consts::OS,
+            std::env::consts::ARCH
+        ));
+        s.push_str(&format!("process_id:{}\r\n", std::process::id()));
+        s.push_str(&format!(
+            "tcp_port:{}\r\n",
+            std::env::var("LOCUS_PORT").unwrap_or_else(|_| "6379".into())
+        ));
+        s.push_str(&format!(
+            "uptime_in_seconds:{}\r\n",
+            self.start.elapsed().as_secs()
+        ));
+        s.push_str("# Clients\r\n");
+        s.push_str(&format!("connected_clients:{}\r\n", self.clients.len()));
+        s.push_str(&format!("blocked_clients:{}\r\n", self.blocked.len()));
+        s.push_str("# Memory\r\n");
+        s.push_str(&format!("used_memory:{used}\r\n"));
+        s.push_str(&format!(
+            "used_memory_human:{:.2}M\r\n",
+            used as f64 / (1024.0 * 1024.0)
+        ));
+        s.push_str(&format!("maxmemory:{}\r\n", self.maxmemory.unwrap_or(0)));
+        s.push_str(&format!(
+            "maxmemory_policy:{}\r\n",
+            if self.maxmemory.is_some() {
+                "allkeys-random"
+            } else {
+                "noeviction"
+            }
+        ));
+        s.push_str("mem_fragmentation_ratio:1.00\r\n");
+        s.push_str("# Persistence\r\n");
+        s.push_str("loading:0\r\n");
+        s.push_str(&format!(
+            "aof_enabled:{}\r\n",
+            if self.aof.is_some() { 1 } else { 0 }
+        ));
+        s.push_str(&format!(
+            "rdb_bgsave_in_progress:{}\r\n",
+            self.bgsave_in_progress.load(Ordering::Relaxed) as u8
+        ));
+        s.push_str("aof_last_write_status:ok\r\n");
+        s.push_str("rdb_last_bgsave_status:ok\r\n");
+        s.push_str("# Stats\r\n");
+        s.push_str(&format!(
+            "total_commands_processed:{}\r\n",
+            self.commands_processed
+        ));
+        s.push_str("# Replication\r\n");
+        s.push_str(&format!("role:{role}\r\n"));
+        s.push_str(&format!("connected_slaves:{}\r\n", self.replicas.len()));
+        s.push_str("master_repl_offset:0\r\n");
+        if let Some((h, p)) = &self.master {
+            s.push_str(&format!(
+                "master_host:{h}\r\nmaster_port:{p}\r\nmaster_link_status:up\r\n"
+            ));
+        }
+        s.push_str("# Keyspace\r\n");
+        let keys = self.db.dbsize();
+        if keys > 0 {
+            s.push_str(&format!("db0:keys={keys},expires=0,avg_ttl=0\r\n"));
+        }
+        resp::bulk_string(s.as_bytes())
+    }
+
     fn handle_command(&mut self, id: u64, tokens: Vec<Vec<u8>>) {
         if tokens.is_empty() {
             return;
         }
         let cmd = tokens[0].to_ascii_uppercase();
+        self.commands_processed = self.commands_processed.wrapping_add(1);
 
         // Protected mode: if no password is set, refuse non-loopback clients so an
         // accidentally-exposed instance (e.g. the 0.0.0.0 Docker image) isn't wide
@@ -461,6 +838,32 @@ impl Hub {
             && !is_no_auth(&cmd)
         {
             return self.send(id, resp::error("NOAUTH Authentication required."));
+        }
+
+        // ACL: a named user is restricted to its allowed command classes + key
+        // prefix. The implicit "default" user (and open mode) has no entry here
+        // and stays unrestricted.
+        if id != MASTER_ID
+            && let Some(uname) = self.current_user.get(&id)
+            && let Some(user) = self.users.get(uname)
+        {
+            let class = commands::command_class(&cmd);
+            if !user.allows_class(class) {
+                return self.send(
+                    id,
+                    resp::error(&format!(
+                        "NOPERM User {} has no permissions to run the '{}' command",
+                        String::from_utf8_lossy(uname),
+                        String::from_utf8_lossy(&cmd).to_ascii_lowercase()
+                    )),
+                );
+            }
+            if (class == acl::CLASS_READ || class == acl::CLASS_WRITE)
+                && tokens.len() >= 2
+                && !user.allows_key(&tokens[1])
+            {
+                return self.send(id, resp::error("NOPERM No permissions to access a key"));
+            }
         }
 
         // A connection in pub/sub or changefeed "push mode" may only run the
@@ -692,25 +1095,11 @@ impl Hub {
                 ));
             }
             b"REPLICAOF" | b"SLAVEOF" => self.handle_replicaof(id, &tokens),
-            b"INFO" => {
-                let role = if self.master.is_some() {
-                    "slave"
-                } else {
-                    "master"
-                };
-                let mut s = format!(
-                    "# Memory\r\nused_memory:{}\r\nmaxmemory:{}\r\n# Replication\r\nrole:{role}\r\nconnected_slaves:{}\r\n",
-                    self.db.mem_used(),
-                    self.maxmemory.unwrap_or(0),
-                    self.replicas.len()
-                );
-                if let Some((h, p)) = &self.master {
-                    s.push_str(&format!(
-                        "master_host:{h}\r\nmaster_port:{p}\r\nmaster_link_status:up\r\n"
-                    ));
-                }
-                self.send(id, resp::bulk_string(s.as_bytes()));
-            }
+            b"INFO" => self.send(id, self.render_info()),
+            b"CONFIG" => self.handle_config(id, &tokens),
+            b"CLIENT" => self.handle_client(id, &tokens),
+            b"SLOWLOG" => self.handle_slowlog(id, &tokens),
+            b"ACL" => self.handle_acl(id, &tokens),
 
             // --- persistence (owner-side) ---
             b"BGREWRITEAOF" => {
@@ -1456,12 +1845,8 @@ impl Hub {
         let pass = match tokens.len() {
             2 => &tokens[1],
             3 if tokens[1].eq_ignore_ascii_case(b"default") => &tokens[2],
-            3 => {
-                return self.send(
-                    id,
-                    resp::error("WRONGPASS invalid username-password pair or user is disabled."),
-                );
-            }
+            // A named (non-default) user authenticates against the ACL table.
+            3 => return self.auth_named_user(id, &tokens[1], &tokens[2]),
             _ => {
                 return self.send(
                     id,
@@ -1481,6 +1866,21 @@ impl Hub {
                 self.send(id, resp::simple_string("OK"));
             }
             Some(_) => self.send(
+                id,
+                resp::error("WRONGPASS invalid username-password pair or user is disabled."),
+            ),
+        }
+    }
+
+    /// Authenticate as a named ACL user and bind the connection to it.
+    fn auth_named_user(&mut self, id: u64, name: &[u8], pass: &[u8]) {
+        match self.users.get(name) {
+            Some(u) if u.enabled && u.check_password(pass) => {
+                self.authed.insert(id);
+                self.current_user.insert(id, name.to_vec());
+                self.send(id, resp::simple_string("OK"));
+            }
+            _ => self.send(
                 id,
                 resp::error("WRONGPASS invalid username-password pair or user is disabled."),
             ),
@@ -1592,7 +1992,8 @@ impl Hub {
         if is_write && self.master.is_none() && !self.evict_if_needed() {
             return resp::error("OOM command not allowed when used memory > 'maxmemory'.");
         }
-        let reply = execute(&tokens, &mut self.db);
+        let proto = self.protos.get(&id).copied().unwrap_or(2);
+        let reply = execute_proto(&tokens, &mut self.db, proto);
         let errored = reply.first() == Some(&b'-');
         if !errored && is_write {
             // Keep the memory estimate in sync with whatever the command changed
@@ -1893,6 +2294,24 @@ fn parse_mem(s: &str) -> Option<usize> {
     num.trim().parse::<usize>().ok().map(|n| n * mult)
 }
 
+/// A bounded copy of a command's args for the slow log (Redis caps at 32 args,
+/// 128 bytes each, to keep the ring small).
+fn slowlog_snapshot(tokens: &[Vec<u8>]) -> Vec<Vec<u8>> {
+    tokens
+        .iter()
+        .take(32)
+        .map(|t| {
+            if t.len() > 128 {
+                let mut s = t[..125].to_vec();
+                s.extend_from_slice(b"...");
+                s
+            } else {
+                t.clone()
+            }
+        })
+        .collect()
+}
+
 fn run_hub(rx: mpsc::Receiver<Msg>, tx: mpsc::Sender<Msg>) {
     let mut hub = Hub::new(tx);
     loop {
@@ -1915,8 +2334,22 @@ fn run_hub(rx: mpsc::Receiver<Msg>, tx: mpsc::Sender<Msg>) {
                 hub.changefeeds.remove(&id);
                 hub.authed.remove(&id);
                 hub.loopback.remove(&id);
+                hub.client_names.remove(&id);
+                hub.current_user.remove(&id);
             }
-            Ok(Msg::Command { id, tokens }) => hub.handle_command(id, tokens),
+            Ok(Msg::Command { id, tokens }) => {
+                if hub.slowlog_threshold_us >= 0 {
+                    let snap = slowlog_snapshot(&tokens);
+                    let t0 = Instant::now();
+                    hub.handle_command(id, tokens);
+                    let us = t0.elapsed().as_micros() as i64;
+                    if us >= hub.slowlog_threshold_us {
+                        hub.push_slowlog(us as u64, snap);
+                    }
+                } else {
+                    hub.handle_command(id, tokens);
+                }
+            }
             Ok(Msg::ReplaceDb(db, extras)) => {
                 hub.db = *db;
                 hub.apply_extras(*extras); // CDC offsets/log/groups + rebuilt indexes

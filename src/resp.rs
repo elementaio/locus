@@ -178,9 +178,61 @@ pub fn command(parts: &[Vec<u8>]) -> Vec<u8> {
     bulk_array(parts)
 }
 
+// --- RESP3 typed replies (fall back to RESP2 shapes when proto < 3) ----------
+
+/// A map from a flat `[k0, v0, k1, v1, ...]`: RESP3 `%N`, or a RESP2 flat array.
+pub fn map(flat: &[Vec<u8>], proto: u8) -> Vec<u8> {
+    if proto >= 3 {
+        let mut out = format!("%{}\r\n", flat.len() / 2).into_bytes();
+        for it in flat {
+            out.extend_from_slice(&bulk_string(it));
+        }
+        out
+    } else {
+        bulk_array(flat)
+    }
+}
+
+/// A set: RESP3 `~N`, or a RESP2 array.
+pub fn set(items: &[Vec<u8>], proto: u8) -> Vec<u8> {
+    if proto >= 3 {
+        let mut out = format!("~{}\r\n", items.len()).into_bytes();
+        for it in items {
+            out.extend_from_slice(&bulk_string(it));
+        }
+        out
+    } else {
+        bulk_array(items)
+    }
+}
+
+/// A double from already-formatted bytes: RESP3 `,<v>`, or a RESP2 bulk string.
+pub fn double(s: &[u8], proto: u8) -> Vec<u8> {
+    if proto >= 3 {
+        let mut out = vec![b','];
+        out.extend_from_slice(s);
+        out.extend_from_slice(b"\r\n");
+        out
+    } else {
+        bulk_string(s)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn resp3_encoders_match_protocol() {
+        let kv = [b"f".to_vec(), b"v".to_vec()];
+        assert_eq!(map(&kv, 3), b"%1\r\n$1\r\nf\r\n$1\r\nv\r\n".to_vec());
+        assert_eq!(map(&kv, 2), b"*2\r\n$1\r\nf\r\n$1\r\nv\r\n".to_vec());
+        let items = [b"a".to_vec()];
+        assert_eq!(set(&items, 3), b"~1\r\n$1\r\na\r\n".to_vec());
+        assert_eq!(set(&items, 2), b"*1\r\n$1\r\na\r\n".to_vec());
+        assert_eq!(double(b"1.5", 3), b",1.5\r\n".to_vec());
+        assert_eq!(double(b"1.5", 2), b"$3\r\n1.5\r\n".to_vec());
+    }
 
     fn complete(buf: &[u8]) -> (Vec<Vec<u8>>, usize) {
         match parse_command(buf) {

@@ -71,6 +71,12 @@ fn parse_int(arg: &[u8]) -> Option<i64> {
 }
 
 pub fn execute(tokens: &[Vec<u8>], db: &mut Db) -> Vec<u8> {
+    execute_proto(tokens, db, 2)
+}
+
+/// Like `execute`, but `proto` (2 or 3) selects RESP2 vs RESP3 typed replies for
+/// the shape-sensitive commands (maps / sets / doubles).
+pub fn execute_proto(tokens: &[Vec<u8>], db: &mut Db, proto: u8) -> Vec<u8> {
     if tokens.is_empty() {
         return Vec::new();
     }
@@ -91,6 +97,10 @@ pub fn execute(tokens: &[Vec<u8>], db: &mut Db) -> Vec<u8> {
         b"EXISTS" => exists_cmd(db, tokens),
         b"TOUCH" => exists_cmd(db, tokens), // no LRU, so equivalent to EXISTS
         b"KEYS" => keys_cmd(db, tokens),
+        b"SCAN" => scan_cmd(db, tokens),
+        b"HSCAN" => hscan_cmd(db, tokens),
+        b"SSCAN" => sscan_cmd(db, tokens),
+        b"ZSCAN" => zscan_cmd(db, tokens),
         b"DBSIZE" => dbsize_cmd(db, tokens),
         b"RANDOMKEY" => randomkey_cmd(db, tokens),
         b"RENAME" => rename_cmd(db, tokens, false),
@@ -120,6 +130,8 @@ pub fn execute(tokens: &[Vec<u8>], db: &mut Db) -> Vec<u8> {
         // strings
         b"SET" => set_cmd(db, tokens),
         b"GET" => get_cmd(db, tokens),
+        b"GETEX" => getex_cmd(db, tokens),
+        b"OBJECT" => object_cmd(db, tokens),
         b"GETDEL" => getdel_cmd(db, tokens),
         b"GETSET" => getset_cmd(db, tokens),
         b"SETNX" => setnx_cmd(db, tokens),
@@ -185,7 +197,7 @@ pub fn execute(tokens: &[Vec<u8>], db: &mut Db) -> Vec<u8> {
         b"HSETNX" => hsetnx_cmd(db, tokens),
         b"HGET" => hget_cmd(db, tokens),
         b"HMGET" => hmget_cmd(db, tokens),
-        b"HGETALL" => hgetall_cmd(db, tokens),
+        b"HGETALL" => hgetall_cmd(db, tokens, proto),
         b"HDEL" => hdel_cmd(db, tokens),
         b"HEXISTS" => hexists_cmd(db, tokens),
         b"HLEN" => hlen_cmd(db, tokens),
@@ -195,7 +207,7 @@ pub fn execute(tokens: &[Vec<u8>], db: &mut Db) -> Vec<u8> {
         // sets
         b"SADD" => sadd_cmd(db, tokens),
         b"SREM" => srem_cmd(db, tokens),
-        b"SMEMBERS" => smembers_cmd(db, tokens),
+        b"SMEMBERS" => smembers_cmd(db, tokens, proto),
         b"SISMEMBER" => sismember_cmd(db, tokens),
         b"SMISMEMBER" => smismember_cmd(db, tokens),
         b"SCARD" => scard_cmd(db, tokens),
@@ -211,7 +223,7 @@ pub fn execute(tokens: &[Vec<u8>], db: &mut Db) -> Vec<u8> {
         b"SMOVE" => smove_cmd(db, tokens),
         // sorted sets
         b"ZADD" => zadd_cmd(db, tokens),
-        b"ZSCORE" => zscore_cmd(db, tokens),
+        b"ZSCORE" => zscore_cmd(db, tokens, proto),
         b"ZMSCORE" => zmscore_cmd(db, tokens),
         b"ZCARD" => zcard_cmd(db, tokens),
         b"ZREM" => zrem_cmd(db, tokens),
@@ -242,11 +254,8 @@ pub fn execute(tokens: &[Vec<u8>], db: &mut Db) -> Vec<u8> {
         // persistence: SAVE / BGSAVE are handled by the hub — they need its CDC /
         // secondary-index state (and BGSAVE a background thread).
         // stubs
-        b"COMMAND" => b"*0\r\n".to_vec(),
-        b"CONFIG" => match tokens.get(1).map(|t| t.to_ascii_uppercase()).as_deref() {
-            Some(b"GET") => b"*0\r\n".to_vec(),
-            _ => simple_string("OK"),
-        },
+        b"COMMAND" => command_cmd(tokens),
+        // CONFIG is handled by the hub (it needs live server / runtime config).
         other => error(&format!(
             "ERR unknown command '{}'",
             String::from_utf8_lossy(other)
@@ -288,16 +297,16 @@ pub fn command_meta(cmd: &[u8]) -> Option<CmdMeta> {
         | b"EXISTS" | b"TOUCH" | b"KEYS" | b"MGET" | b"SINTER" | b"SUNION" | b"SDIFF"
         | b"WATCH" | b"SUBSCRIBE" | b"PSUBSCRIBE" | b"PUBSUB" | b"BITCOUNT" | b"SRANDMEMBER"
         | b"SELECT" | b"CDCREAD" | b"CDCPENDING" | b"GEOPOS" | b"TOPKLIST" | b"IDXDROP"
-        | b"AUTH" => (2, false),
+        | b"AUTH" | b"SCAN" | b"OBJECT" | b"CLIENT" | b"SLOWLOG" | b"ACL" => (2, false),
         // arity 2 writes
         b"PERSIST" | b"INCR" | b"DECR" | b"GETDEL" | b"LPOP" | b"RPOP" | b"SPOP" | b"ZPOPMIN"
-        | b"ZPOPMAX" | b"DEL" | b"UNLINK" => (2, true),
+        | b"ZPOPMAX" | b"DEL" | b"UNLINK" | b"GETEX" => (2, true),
         // arity 3 reads
         b"LINDEX" | b"HGET" | b"HEXISTS" | b"HMGET" | b"SISMEMBER" | b"SMISMEMBER" | b"ZSCORE"
         | b"ZMSCORE" | b"ZRANK" | b"ZREVRANK" | b"PUBLISH" | b"REPLICAOF" | b"SLAVEOF"
         | b"LPOS" | b"SINTERCARD" | b"GETBIT" | b"BITPOS" | b"CDCGROUP" | b"CDCREADGROUP"
         | b"CDCACK" | b"GEODIST" | b"BFEXISTS" | b"CMSQUERY" | b"TOPKCOUNT" | b"TDQUANTILE"
-        | b"IDXCREATE" | b"IDXGET" => (3, false),
+        | b"IDXCREATE" | b"IDXGET" | b"HSCAN" | b"SSCAN" | b"ZSCAN" => (3, false),
         // arity 3 writes
         b"INCRBY" | b"DECRBY" | b"APPEND" | b"HDEL" | b"SADD" | b"SREM" | b"ZREM" | b"EXPIRE"
         | b"PEXPIRE" | b"EXPIREAT" | b"PEXPIREAT" | b"LPUSH" | b"RPUSH" | b"LPUSHX" | b"RPUSHX"
@@ -330,6 +339,261 @@ pub fn min_arity(cmd: &[u8]) -> Option<usize> {
 /// Whether `cmd` (case-insensitive) mutates the keyspace. See [`command_meta`].
 pub fn is_write(cmd: &[u8]) -> bool {
     command_meta(&cmd.to_ascii_uppercase()).is_some_and(|m| m.write)
+}
+
+/// The ACL command class for `cmd` (upper-case). Connection / Admin / PubSub are
+/// listed explicitly; everything else is Read or Write per the keyspace flag.
+pub fn command_class(cmd: &[u8]) -> u8 {
+    use crate::acl::*;
+    match cmd {
+        b"PING" | b"ECHO" | b"HELLO" | b"AUTH" | b"QUIT" | b"RESET" | b"SELECT" | b"COMMAND"
+        | b"CLIENT" => CLASS_CONNECTION,
+        b"CONFIG" | b"SLOWLOG" | b"INFO" | b"DBSIZE" | b"REPLICAOF" | b"SLAVEOF" | b"REPLCONF"
+        | b"PSYNC" | b"SYNC" | b"SHUTDOWN" | b"SAVE" | b"BGSAVE" | b"BGREWRITEAOF"
+        | b"FLUSHALL" | b"FLUSHDB" | b"ACL" | b"IDXCREATE" | b"IDXDROP" => CLASS_ADMIN,
+        b"SUBSCRIBE" | b"UNSUBSCRIBE" | b"PSUBSCRIBE" | b"PUNSUBSCRIBE" | b"PUBLISH"
+        | b"PUBSUB" => CLASS_PUBSUB,
+        c if c.starts_with(b"CDC") => CLASS_PUBSUB,
+        _ if command_meta(cmd).is_some_and(|m| m.write) => CLASS_WRITE,
+        _ => CLASS_READ,
+    }
+}
+
+/// Every command name (upper-case), for COMMAND/COMMAND COUNT introspection.
+/// A regression test pins this against `command_meta` so they can't drift.
+static COMMAND_NAMES: &[&[u8]] = &[
+    b"ACL",
+    b"APPEND",
+    b"AUTH",
+    b"BFADD",
+    b"BFEXISTS",
+    b"BFLOAD",
+    b"BGREWRITEAOF",
+    b"BGSAVE",
+    b"BITCOUNT",
+    b"BITOP",
+    b"BITPOS",
+    b"CADEL",
+    b"CAS",
+    b"CDCACK",
+    b"CDCGROUP",
+    b"CDCPENDING",
+    b"CDCREAD",
+    b"CDCREADGROUP",
+    b"CDCSUBSCRIBE",
+    b"CDCUNSUBSCRIBE",
+    b"CLIENT",
+    b"CMSINCRBY",
+    b"CMSLOAD",
+    b"CMSQUERY",
+    b"COMMAND",
+    b"CONFIG",
+    b"DBSIZE",
+    b"DECR",
+    b"DECRBY",
+    b"DEL",
+    b"DISCARD",
+    b"ECHO",
+    b"EXEC",
+    b"EXISTS",
+    b"EXPIRE",
+    b"EXPIREAT",
+    b"FLUSHALL",
+    b"FLUSHDB",
+    b"GEODIST",
+    b"GEOPOS",
+    b"GEOSEARCH",
+    b"GEOSET",
+    b"GET",
+    b"GETBIT",
+    b"GETDEL",
+    b"GETEX",
+    b"GETRANGE",
+    b"GETSET",
+    b"HDEL",
+    b"HELLO",
+    b"HEXISTS",
+    b"HGET",
+    b"HGETALL",
+    b"HINCRBY",
+    b"HKEYS",
+    b"HLEN",
+    b"HMGET",
+    b"HSCAN",
+    b"HSET",
+    b"HSETNX",
+    b"HVALS",
+    b"IDXCREATE",
+    b"IDXDROP",
+    b"IDXGET",
+    b"IDXRANGE",
+    b"INCR",
+    b"INCRBY",
+    b"INCRBYFLOAT",
+    b"INCRCAP",
+    b"INFO",
+    b"KEYS",
+    b"LINDEX",
+    b"LINSERT",
+    b"LLEN",
+    b"LMOVE",
+    b"LPOP",
+    b"LPOS",
+    b"LPUSH",
+    b"LPUSHX",
+    b"LRANGE",
+    b"LREM",
+    b"LSET",
+    b"LTRIM",
+    b"MGET",
+    b"MSET",
+    b"MSETNX",
+    b"MULTI",
+    b"OBJECT",
+    b"PERSIST",
+    b"PEXPIRE",
+    b"PEXPIREAT",
+    b"PING",
+    b"PSETEX",
+    b"PSUBSCRIBE",
+    b"PSYNC",
+    b"PTTL",
+    b"PUBLISH",
+    b"PUBSUB",
+    b"PUNSUBSCRIBE",
+    b"QUIT",
+    b"RANDOMKEY",
+    b"RENAME",
+    b"RENAMENX",
+    b"REPLCONF",
+    b"REPLICAOF",
+    b"RESET",
+    b"RPOP",
+    b"RPOPLPUSH",
+    b"RPUSH",
+    b"RPUSHX",
+    b"SADD",
+    b"SAVE",
+    b"SCAN",
+    b"SCARD",
+    b"SDIFF",
+    b"SDIFFSTORE",
+    b"SELECT",
+    b"SET",
+    b"SETBIT",
+    b"SETEX",
+    b"SETMAX",
+    b"SETNX",
+    b"SETRANGE",
+    b"SHUTDOWN",
+    b"SINTER",
+    b"SINTERCARD",
+    b"SINTERSTORE",
+    b"SISMEMBER",
+    b"SLAVEOF",
+    b"SLOWLOG",
+    b"SMEMBERS",
+    b"SMISMEMBER",
+    b"SMOVE",
+    b"SPOP",
+    b"SRANDMEMBER",
+    b"SREM",
+    b"SSCAN",
+    b"STRLEN",
+    b"SUBSCRIBE",
+    b"SUNION",
+    b"SUNIONSTORE",
+    b"SYNC",
+    b"TDADD",
+    b"TDLOAD",
+    b"TDQUANTILE",
+    b"TOPKADD",
+    b"TOPKCOUNT",
+    b"TOPKLIST",
+    b"TOPKLOAD",
+    b"TOPKRESERVE",
+    b"TOUCH",
+    b"TTL",
+    b"TYPE",
+    b"UNLINK",
+    b"UNSUBSCRIBE",
+    b"UNWATCH",
+    b"WATCH",
+    b"XADD",
+    b"XLEN",
+    b"XRANGE",
+    b"XREAD",
+    b"XREVRANGE",
+    b"ZADD",
+    b"ZCARD",
+    b"ZCOUNT",
+    b"ZINCRBY",
+    b"ZINTERSTORE",
+    b"ZMSCORE",
+    b"ZPOPMAX",
+    b"ZPOPMIN",
+    b"ZRANGE",
+    b"ZRANGEBYSCORE",
+    b"ZRANK",
+    b"ZREM",
+    b"ZREMRANGEBYRANK",
+    b"ZREMRANGEBYSCORE",
+    b"ZREVRANGE",
+    b"ZREVRANGEBYSCORE",
+    b"ZREVRANK",
+    b"ZSCAN",
+    b"ZSCORE",
+    b"ZUNIONSTORE",
+];
+
+/// One COMMAND entry: [name(lower), arity, [flag], first_key, last_key, step].
+/// Key positions are a heuristic (1,1,1 for keyed commands) — good enough for
+/// non-cluster clients, which is the only mode Locus runs.
+fn command_info_entry(name: &[u8]) -> Vec<u8> {
+    let meta = command_meta(name);
+    let arity = meta.as_ref().map(|m| m.min_arity as i64).unwrap_or(-1);
+    let write = meta.as_ref().map(|m| m.write).unwrap_or(false);
+    let (first, last, step) = if arity >= 2 { (1, 1, 1) } else { (0, 0, 0) };
+    let mut e = b"*6\r\n".to_vec();
+    e.extend_from_slice(&bulk_string(&name.to_ascii_lowercase()));
+    e.extend_from_slice(&integer(arity));
+    e.extend_from_slice(b"*1\r\n");
+    e.extend_from_slice(&simple_string(if write { "write" } else { "readonly" }));
+    e.extend_from_slice(&integer(first));
+    e.extend_from_slice(&integer(last));
+    e.extend_from_slice(&integer(step));
+    e
+}
+
+fn command_cmd(tokens: &[Vec<u8>]) -> Vec<u8> {
+    match tokens.get(1).map(|t| t.to_ascii_uppercase()).as_deref() {
+        Some(b"COUNT") => integer(COMMAND_NAMES.len() as i64),
+        Some(b"DOCS") => b"*0\r\n".to_vec(), // empty docs map; clients tolerate it
+        Some(b"INFO") => {
+            let names: Vec<Vec<u8>> = if tokens.len() > 2 {
+                tokens[2..].iter().map(|t| t.to_ascii_uppercase()).collect()
+            } else {
+                COMMAND_NAMES.iter().map(|n| n.to_vec()).collect()
+            };
+            let mut reply = format!("*{}\r\n", names.len()).into_bytes();
+            for n in &names {
+                if command_meta(n).is_some() {
+                    reply.extend_from_slice(&command_info_entry(n));
+                } else {
+                    reply.extend_from_slice(&null_array());
+                }
+            }
+            reply
+        }
+        None => {
+            let mut reply = format!("*{}\r\n", COMMAND_NAMES.len()).into_bytes();
+            for &n in COMMAND_NAMES {
+                reply.extend_from_slice(&command_info_entry(n));
+            }
+            reply
+        }
+        _ => simple_string("OK"),
+    }
 }
 
 // === generic ================================================================
@@ -382,6 +646,330 @@ fn keys_cmd(db: &mut Db, tokens: &[Vec<u8>]) -> Vec<u8> {
         .filter(|k| crate::pubsub::glob_match(&tokens[1], k))
         .collect();
     bulk_array(&matched)
+}
+
+// --- SCAN family ------------------------------------------------------------
+//
+// std's HashMap exposes no stable bucket cursor, so we give each element a
+// stable FNV-1a hash and use a hash value as the (stateless, integer) cursor:
+// each call returns elements with hash >= cursor, advancing past the last hash
+// group. This preserves Redis's guarantee — every element present for the whole
+// scan is returned at least once — at O(n) work per call (COUNT is a hint).
+
+/// (field, value) for HSCAN; (member, score) for ZSCAN — named so the
+/// scan_select item types stay readable (and clippy's type-complexity lint quiet).
+type FieldVal = (Vec<u8>, Vec<u8>);
+type MemberScore = (Vec<u8>, f64);
+
+fn scan_hash(data: &[u8]) -> u64 {
+    let mut h: u64 = 0xcbf2_9ce4_8422_2325;
+    for &b in data {
+        h ^= b as u64;
+        h = h.wrapping_mul(0x0000_0100_0000_01b3);
+    }
+    h
+}
+
+fn parse_u64(arg: &[u8]) -> Option<u64> {
+    std::str::from_utf8(arg)
+        .ok()
+        .and_then(|s| s.parse::<u64>().ok())
+}
+
+struct ScanOpts {
+    pattern: Option<Vec<u8>>,
+    count: usize,
+    typ: Option<Vec<u8>>,
+}
+
+/// Parse the trailing `[MATCH p] [COUNT n] [TYPE t] [NOVALUES]` options; returns
+/// the options and whether NOVALUES was given.
+fn parse_scan_opts(
+    tokens: &[Vec<u8>],
+    start: usize,
+    allow_type: bool,
+    allow_novalues: bool,
+) -> Result<(ScanOpts, bool), Vec<u8>> {
+    let mut o = ScanOpts {
+        pattern: None,
+        count: 10,
+        typ: None,
+    };
+    let mut novalues = false;
+    let mut i = start;
+    while i < tokens.len() {
+        match tokens[i].to_ascii_uppercase().as_slice() {
+            b"MATCH" if i + 1 < tokens.len() => {
+                o.pattern = Some(tokens[i + 1].clone());
+                i += 2;
+            }
+            b"COUNT" if i + 1 < tokens.len() => {
+                match parse_int(&tokens[i + 1]) {
+                    Some(n) if n > 0 => o.count = n as usize,
+                    _ => return Err(not_integer()),
+                }
+                i += 2;
+            }
+            b"TYPE" if allow_type && i + 1 < tokens.len() => {
+                o.typ = Some(tokens[i + 1].to_ascii_lowercase());
+                i += 2;
+            }
+            b"NOVALUES" if allow_novalues => {
+                novalues = true;
+                i += 1;
+            }
+            _ => return Err(error("ERR syntax error")),
+        }
+    }
+    Ok((o, novalues))
+}
+
+/// Take the next batch from `(hash, element)` pairs: all with hash >= cursor,
+/// sorted, ~count of them (never splitting a hash group), plus the next cursor
+/// (0 when complete).
+fn scan_select<T>(mut items: Vec<(u64, T)>, cursor: u64, count: usize) -> (u64, Vec<T>) {
+    items.retain(|(h, _)| *h >= cursor);
+    items.sort_by(|a, b| a.0.cmp(&b.0));
+    let mut taken = items.len().min(count.max(1));
+    if taken < items.len() {
+        let last = items[taken - 1].0;
+        while taken < items.len() && items[taken].0 == last {
+            taken += 1;
+        }
+    }
+    let next = if taken >= items.len() {
+        0
+    } else {
+        items[taken - 1].0 + 1
+    };
+    (
+        next,
+        items.into_iter().take(taken).map(|(_, t)| t).collect(),
+    )
+}
+
+fn scan_reply(cursor: u64, flat: &[Vec<u8>]) -> Vec<u8> {
+    let mut out = b"*2\r\n".to_vec();
+    out.extend_from_slice(&bulk_string(cursor.to_string().as_bytes()));
+    out.extend_from_slice(&bulk_array(flat));
+    out
+}
+
+fn scan_cmd(db: &mut Db, tokens: &[Vec<u8>]) -> Vec<u8> {
+    if tokens.len() < 2 {
+        return wrong_args("scan");
+    }
+    let cursor = match parse_u64(&tokens[1]) {
+        Some(c) => c,
+        None => return error("ERR invalid cursor"),
+    };
+    let (opts, _) = match parse_scan_opts(tokens, 2, true, false) {
+        Ok(v) => v,
+        Err(e) => return e,
+    };
+    let items: Vec<(u64, Vec<u8>)> = db
+        .live_keys()
+        .into_iter()
+        .map(|k| (scan_hash(&k), k))
+        .collect();
+    let (next, batch) = scan_select(items, cursor, opts.count);
+    let mut out = Vec::new();
+    for k in batch {
+        if let Some(p) = &opts.pattern
+            && !crate::pubsub::glob_match(p, &k)
+        {
+            continue;
+        }
+        if let Some(t) = &opts.typ
+            && db.type_name(&k).map(|s| s.as_bytes()) != Some(t.as_slice())
+        {
+            continue;
+        }
+        out.push(k);
+    }
+    scan_reply(next, &out)
+}
+
+fn hscan_cmd(db: &mut Db, tokens: &[Vec<u8>]) -> Vec<u8> {
+    if tokens.len() < 3 {
+        return wrong_args("hscan");
+    }
+    let cursor = match parse_u64(&tokens[2]) {
+        Some(c) => c,
+        None => return error("ERR invalid cursor"),
+    };
+    let (opts, novalues) = match parse_scan_opts(tokens, 3, false, true) {
+        Ok(v) => v,
+        Err(e) => return e,
+    };
+    let items: Vec<(u64, FieldVal)> = match db.get(&tokens[1]) {
+        None => return scan_reply(0, &[]),
+        Some(Value::Hash(h)) => h
+            .iter()
+            .map(|(f, v)| (scan_hash(f), (f.clone(), v.clone())))
+            .collect(),
+        Some(_) => return wrongtype(),
+    };
+    let (next, batch) = scan_select(items, cursor, opts.count);
+    let mut out = Vec::new();
+    for (f, v) in batch {
+        if let Some(p) = &opts.pattern
+            && !crate::pubsub::glob_match(p, &f)
+        {
+            continue;
+        }
+        out.push(f);
+        if !novalues {
+            out.push(v);
+        }
+    }
+    scan_reply(next, &out)
+}
+
+fn sscan_cmd(db: &mut Db, tokens: &[Vec<u8>]) -> Vec<u8> {
+    if tokens.len() < 3 {
+        return wrong_args("sscan");
+    }
+    let cursor = match parse_u64(&tokens[2]) {
+        Some(c) => c,
+        None => return error("ERR invalid cursor"),
+    };
+    let (opts, _) = match parse_scan_opts(tokens, 3, false, false) {
+        Ok(v) => v,
+        Err(e) => return e,
+    };
+    let items: Vec<(u64, Vec<u8>)> = match db.get(&tokens[1]) {
+        None => return scan_reply(0, &[]),
+        Some(Value::Set(s)) => s.iter().map(|m| (scan_hash(m), m.clone())).collect(),
+        Some(_) => return wrongtype(),
+    };
+    let (next, batch) = scan_select(items, cursor, opts.count);
+    let mut out = Vec::new();
+    for m in batch {
+        if let Some(p) = &opts.pattern
+            && !crate::pubsub::glob_match(p, &m)
+        {
+            continue;
+        }
+        out.push(m);
+    }
+    scan_reply(next, &out)
+}
+
+fn zscan_cmd(db: &mut Db, tokens: &[Vec<u8>]) -> Vec<u8> {
+    if tokens.len() < 3 {
+        return wrong_args("zscan");
+    }
+    let cursor = match parse_u64(&tokens[2]) {
+        Some(c) => c,
+        None => return error("ERR invalid cursor"),
+    };
+    let (opts, _) = match parse_scan_opts(tokens, 3, false, false) {
+        Ok(v) => v,
+        Err(e) => return e,
+    };
+    let items: Vec<(u64, MemberScore)> = match db.get(&tokens[1]) {
+        None => return scan_reply(0, &[]),
+        Some(Value::ZSet(z)) => z
+            .iter()
+            .map(|(m, s)| (scan_hash(m), (m.clone(), *s)))
+            .collect(),
+        Some(_) => return wrongtype(),
+    };
+    let (next, batch) = scan_select(items, cursor, opts.count);
+    let mut out = Vec::new();
+    for (m, s) in batch {
+        if let Some(p) = &opts.pattern
+            && !crate::pubsub::glob_match(p, &m)
+        {
+            continue;
+        }
+        out.push(m);
+        out.push(fmt_score(s));
+    }
+    scan_reply(next, &out)
+}
+
+fn getex_cmd(db: &mut Db, tokens: &[Vec<u8>]) -> Vec<u8> {
+    if tokens.len() < 2 {
+        return wrong_args("getex");
+    }
+    let key = &tokens[1];
+    let val = match db.get(key) {
+        None => return null_bulk(),
+        Some(Value::Str(s)) => s.clone(),
+        Some(_) => return wrongtype(),
+    };
+    if tokens.len() > 2 {
+        let opt = tokens[2].to_ascii_uppercase();
+        match opt.as_slice() {
+            b"PERSIST" if tokens.len() == 3 => {
+                db.clear_expire(key);
+            }
+            b"EX" | b"PX" | b"EXAT" | b"PXAT" if tokens.len() == 4 => {
+                let unit = if matches!(opt.as_slice(), b"EX" | b"EXAT") {
+                    1000
+                } else {
+                    1
+                };
+                let absolute = matches!(opt.as_slice(), b"EXAT" | b"PXAT");
+                let n = match parse_int(&tokens[3]) {
+                    Some(n) => n,
+                    None => return not_integer(),
+                };
+                let at = if absolute {
+                    n.checked_mul(unit)
+                } else {
+                    n.checked_mul(unit)
+                        .and_then(|ms| (now_ms() as i64).checked_add(ms))
+                };
+                match at {
+                    Some(t) if t > 0 => db.set_expire(key, t as u64),
+                    _ => return error("ERR invalid expire time in 'getex' command"),
+                }
+            }
+            _ => return error("ERR syntax error"),
+        }
+    }
+    bulk_string(&val)
+}
+
+fn object_cmd(db: &mut Db, tokens: &[Vec<u8>]) -> Vec<u8> {
+    if tokens.len() < 2 {
+        return wrong_args("object");
+    }
+    match tokens[1].to_ascii_uppercase().as_slice() {
+        b"ENCODING" if tokens.len() == 3 => match db.type_name(&tokens[2]) {
+            None => error("ERR no such key"),
+            // Plausible encodings; Locus uses one representation per type.
+            Some(t) => {
+                let enc = match t {
+                    "string" => "raw",
+                    "list" => "listpack",
+                    "hash" | "set" => "hashtable",
+                    "zset" => "skiplist",
+                    other => other,
+                };
+                bulk_string(enc.as_bytes())
+            }
+        },
+        b"REFCOUNT" if tokens.len() == 3 => {
+            if db.contains(&tokens[2]) {
+                integer(1)
+            } else {
+                error("ERR no such key")
+            }
+        }
+        b"IDLETIME" | b"FREQ" if tokens.len() == 3 => {
+            if db.contains(&tokens[2]) {
+                integer(0)
+            } else {
+                error("ERR no such key")
+            }
+        }
+        b"HELP" => simple_string("OBJECT <ENCODING|REFCOUNT|IDLETIME|FREQ> <key>"),
+        _ => error("ERR Unknown OBJECT subcommand or wrong number of arguments"),
+    }
 }
 
 fn dbsize_cmd(db: &mut Db, tokens: &[Vec<u8>]) -> Vec<u8> {
@@ -1959,20 +2547,20 @@ fn hmget_cmd(db: &mut Db, tokens: &[Vec<u8>]) -> Vec<u8> {
     }
 }
 
-fn hgetall_cmd(db: &mut Db, tokens: &[Vec<u8>]) -> Vec<u8> {
+fn hgetall_cmd(db: &mut Db, tokens: &[Vec<u8>], proto: u8) -> Vec<u8> {
     if tokens.len() != 2 {
         return wrong_args("hgetall");
     }
     match with_hash(db, &tokens[1]) {
         Err(()) => wrongtype(),
-        Ok(None) => bulk_array(&[]),
+        Ok(None) => crate::resp::map(&[], proto),
         Ok(Some(h)) => {
             let mut flat = Vec::with_capacity(h.len() * 2);
             for (f, v) in h {
                 flat.push(f.clone());
                 flat.push(v.clone());
             }
-            bulk_array(&flat)
+            crate::resp::map(&flat, proto)
         }
     }
 }
@@ -2094,13 +2682,13 @@ fn srem_cmd(db: &mut Db, tokens: &[Vec<u8>]) -> Vec<u8> {
     integer(removed)
 }
 
-fn smembers_cmd(db: &mut Db, tokens: &[Vec<u8>]) -> Vec<u8> {
+fn smembers_cmd(db: &mut Db, tokens: &[Vec<u8>], proto: u8) -> Vec<u8> {
     if tokens.len() != 2 {
         return wrong_args("smembers");
     }
     match db.get(&tokens[1]) {
-        None => bulk_array(&[]),
-        Some(Value::Set(s)) => bulk_array(&s.iter().cloned().collect::<Vec<_>>()),
+        None => crate::resp::set(&[], proto),
+        Some(Value::Set(s)) => crate::resp::set(&s.iter().cloned().collect::<Vec<_>>(), proto),
         Some(_) => wrongtype(),
     }
 }
@@ -2515,7 +3103,7 @@ fn zadd_cmd(db: &mut Db, tokens: &[Vec<u8>]) -> Vec<u8> {
     integer(if ch { changed } else { added })
 }
 
-fn zscore_cmd(db: &mut Db, tokens: &[Vec<u8>]) -> Vec<u8> {
+fn zscore_cmd(db: &mut Db, tokens: &[Vec<u8>], proto: u8) -> Vec<u8> {
     if tokens.len() != 3 {
         return wrong_args("zscore");
     }
@@ -2524,7 +3112,7 @@ fn zscore_cmd(db: &mut Db, tokens: &[Vec<u8>]) -> Vec<u8> {
         Ok(None) => null_bulk(),
         Ok(Some(z)) => z
             .get(&tokens[2])
-            .map(|s| bulk_string(&fmt_score(*s)))
+            .map(|s| crate::resp::double(&fmt_score(*s), proto))
             .unwrap_or_else(null_bulk),
     }
 }
@@ -3247,6 +3835,78 @@ mod tests {
     fn cmd(db: &mut Db, parts: &[&[u8]]) -> Vec<u8> {
         let tokens: Vec<Vec<u8>> = parts.iter().map(|p| p.to_vec()).collect();
         execute(&tokens, db)
+    }
+
+    #[test]
+    fn command_catalog_matches_command_meta() {
+        for name in COMMAND_NAMES {
+            assert!(
+                command_meta(name).is_some(),
+                "{} is in COMMAND_NAMES but not command_meta",
+                String::from_utf8_lossy(name)
+            );
+        }
+        assert!(COMMAND_NAMES.len() > 100);
+    }
+
+    #[test]
+    fn command_count_and_info() {
+        let mut db = Db::new();
+        assert_eq!(
+            cmd(&mut db, &[b"COMMAND", b"COUNT"]),
+            integer(COMMAND_NAMES.len() as i64)
+        );
+        let info = cmd(&mut db, &[b"COMMAND", b"INFO", b"GET"]);
+        let s = String::from_utf8_lossy(&info);
+        assert!(s.contains("get") && s.contains("readonly"), "{s}");
+    }
+
+    #[test]
+    fn scan_select_covers_every_element_once() {
+        let items: Vec<(u64, u32)> = (0..1000u32)
+            .map(|i| (scan_hash(&i.to_le_bytes()), i))
+            .collect();
+        let mut cursor = 0u64;
+        let mut seen = std::collections::HashSet::new();
+        let mut rounds = 0;
+        loop {
+            rounds += 1;
+            assert!(rounds < 100_000, "scan did not terminate");
+            let (next, batch) = scan_select(items.clone(), cursor, 10);
+            for x in batch {
+                assert!(seen.insert(x), "element {x} returned twice");
+            }
+            if next == 0 {
+                break;
+            }
+            cursor = next;
+        }
+        assert_eq!(seen.len(), 1000, "scan missed elements");
+    }
+
+    #[test]
+    fn scan_keyspace_with_match() {
+        let mut db = Db::new();
+        for i in 0..50 {
+            cmd(&mut db, &[b"SET", format!("user:{i}").as_bytes(), b"v"]);
+            cmd(&mut db, &[b"SET", format!("other:{i}").as_bytes(), b"v"]);
+        }
+        // COUNT covers everything in one call -> cursor returns "0" (complete);
+        // MATCH filters to the 50 user keys.
+        let reply = cmd(
+            &mut db,
+            &[b"SCAN", b"0", b"MATCH", b"user:*", b"COUNT", b"1000"],
+        );
+        let s = String::from_utf8_lossy(&reply);
+        assert!(
+            s.starts_with("*2\r\n$1\r\n0\r\n"),
+            "expected complete scan: {s:?}"
+        );
+        assert_eq!(
+            s.matches("user:").count(),
+            50,
+            "expected 50 user keys: {s:?}"
+        );
     }
 
     #[test]
