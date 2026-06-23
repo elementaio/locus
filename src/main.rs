@@ -205,6 +205,9 @@ struct Hub {
     // ACL: named users + each connection's current user (default user is implicit).
     users: HashMap<Vec<u8>, acl::User>,
     current_user: HashMap<u64, Vec<u8>>,
+    // replication identity + stream position (bytes streamed to replicas).
+    replid: String,
+    master_repl_offset: u64,
 }
 
 /// One slow-log entry.
@@ -360,6 +363,11 @@ impl Hub {
                 .unwrap_or(128),
             users: HashMap::new(),
             current_user: HashMap::new(),
+            replid: acl::hex32(&acl::sha256(
+                format!("{}-{}", std::process::id(), now_ms()).as_bytes(),
+            ))[..40]
+                .to_string(),
+            master_repl_offset: 0,
         };
         hub.apply_extras(extras);
         hub
@@ -795,7 +803,11 @@ impl Hub {
         s.push_str("# Replication\r\n");
         s.push_str(&format!("role:{role}\r\n"));
         s.push_str(&format!("connected_slaves:{}\r\n", self.replicas.len()));
-        s.push_str("master_repl_offset:0\r\n");
+        s.push_str(&format!("master_replid:{}\r\n", self.replid));
+        s.push_str(&format!(
+            "master_repl_offset:{}\r\n",
+            self.master_repl_offset
+        ));
         if let Some((h, p)) = &self.master {
             s.push_str(&format!(
                 "master_host:{h}\r\nmaster_port:{p}\r\nmaster_link_status:up\r\n"
@@ -1081,7 +1093,11 @@ impl Hub {
             b"PSYNC" | b"SYNC" => {
                 self.send(
                     id,
-                    b"+FULLRESYNC 0000000000000000000000000000000000000000 0\r\n".to_vec(),
+                    format!(
+                        "+FULLRESYNC {} {}\r\n",
+                        self.replid, self.master_repl_offset
+                    )
+                    .into_bytes(),
                 );
                 let mut snap = rdb::serialize(&self.db);
                 rdb::append_extras(&mut snap, &self.build_extras());
@@ -2014,15 +2030,8 @@ impl Hub {
                     let _ = a.append(&entries);
                 }
                 // Propagate the deterministic form to every replica.
-                if !self.replicas.is_empty() {
-                    for e in &entries {
-                        let bytes = resp::command(e);
-                        for rid in self.replicas.iter() {
-                            if let Some(out) = self.clients.get(rid) {
-                                let _ = out.send(bytes.clone());
-                            }
-                        }
-                    }
+                for e in &entries {
+                    self.replicate(resp::command(e));
                 }
                 // Feed the changefeed (same modified-key set as WATCH/AOF).
                 self.emit_write_changes(&tokens);
@@ -2096,12 +2105,19 @@ impl Hub {
         if let Some(a) = self.aof.as_mut() {
             let _ = a.append(&batch);
         }
-        if !self.replicas.is_empty() {
-            let bytes = resp::command(tokens);
-            for rid in self.replicas.iter() {
-                if let Some(out) = self.clients.get(rid) {
-                    let _ = out.send(bytes.clone());
-                }
+        self.replicate(resp::command(tokens));
+    }
+
+    /// Stream one already-encoded command to every replica and advance the
+    /// replication offset (the running byte position in the write stream).
+    fn replicate(&mut self, bytes: Vec<u8>) {
+        if self.replicas.is_empty() {
+            return;
+        }
+        self.master_repl_offset += bytes.len() as u64;
+        for rid in self.replicas.iter() {
+            if let Some(out) = self.clients.get(rid) {
+                let _ = out.send(bytes.clone());
             }
         }
     }

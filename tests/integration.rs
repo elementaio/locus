@@ -1225,3 +1225,48 @@ fn replica_loses_keys_when_the_master_expires_them() {
         sleep(Duration::from_millis(50));
     }
 }
+
+#[test]
+fn master_reports_real_replid_and_advancing_offset() {
+    let master = Server::start();
+    let replica = Server::start();
+    let mut m = master.connect();
+    let mut r = replica.connect();
+    assert_eq!(
+        r.cmd(&["REPLICAOF", "127.0.0.1", &master.port.to_string()]),
+        "OK"
+    );
+    sleep(Duration::from_millis(400)); // full sync, replica registered
+    let field = |info: &str, key: &str| -> String {
+        info.split("\r\n")
+            .find_map(|l| l.strip_prefix(key).and_then(|x| x.strip_prefix(':')))
+            .unwrap_or("")
+            .trim()
+            .to_string()
+    };
+    let info0 = m.cmd(&["INFO"]);
+    let replid = field(&info0, "master_replid");
+    assert_eq!(
+        replid.len(),
+        40,
+        "replid should be 40 hex chars: {replid:?}"
+    );
+    assert_ne!(replid, "0".repeat(40), "replid must not be all zeros");
+    let off0: u64 = field(&info0, "master_repl_offset").parse().unwrap();
+    // A replicated write advances the offset.
+    m.cmd(&["SET", "k", "v"]);
+    let deadline = Instant::now() + Duration::from_secs(2);
+    loop {
+        let off1: u64 = field(&m.cmd(&["INFO"]), "master_repl_offset")
+            .parse()
+            .unwrap();
+        if off1 > off0 {
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "offset did not advance on a write"
+        );
+        sleep(Duration::from_millis(50));
+    }
+}
