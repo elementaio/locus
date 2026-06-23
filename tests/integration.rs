@@ -1163,3 +1163,30 @@ fn resp3_typed_replies() {
     // CONFIG GET is a map in RESP3 too.
     assert_eq!(c.cmd(&["CONFIG", "GET", "appendonly"]), "[appendonly, no]");
 }
+
+#[test]
+fn acl_user_least_privilege() {
+    let s = Server::start();
+    let mut admin = s.connect(); // default user, unrestricted (open mode)
+    // A read-only user scoped to the app:* keys.
+    assert_eq!(
+        admin.cmd(&["ACL", "SETUSER", "alice", "on", ">pw", "+@read", "~app:"]),
+        "OK"
+    );
+    admin.cmd(&["SET", "app:k", "v"]);
+    admin.cmd(&["SET", "other", "v"]);
+
+    let mut a = s.connect();
+    assert_eq!(a.cmd(&["AUTH", "alice", "pw"]), "OK");
+    assert_eq!(a.cmd(&["GET", "app:k"]), "v"); // read inside the prefix: allowed
+    assert!(a.cmd(&["SET", "app:k", "x"]).starts_with("-NOPERM")); // write: no @write
+    assert!(a.cmd(&["GET", "other"]).starts_with("-NOPERM")); // key outside prefix
+
+    // Wrong password is rejected.
+    let mut b = s.connect();
+    assert!(b.cmd(&["AUTH", "alice", "wrong"]).starts_with("-WRONGPASS"));
+
+    // The default user is unrestricted; introspection works.
+    assert_eq!(admin.cmd(&["ACL", "WHOAMI"]), "default");
+    assert!(admin.cmd(&["ACL", "USERS"]).contains("alice"));
+}

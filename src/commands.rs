@@ -297,7 +297,7 @@ pub fn command_meta(cmd: &[u8]) -> Option<CmdMeta> {
         | b"EXISTS" | b"TOUCH" | b"KEYS" | b"MGET" | b"SINTER" | b"SUNION" | b"SDIFF"
         | b"WATCH" | b"SUBSCRIBE" | b"PSUBSCRIBE" | b"PUBSUB" | b"BITCOUNT" | b"SRANDMEMBER"
         | b"SELECT" | b"CDCREAD" | b"CDCPENDING" | b"GEOPOS" | b"TOPKLIST" | b"IDXDROP"
-        | b"AUTH" | b"SCAN" | b"OBJECT" | b"CLIENT" | b"SLOWLOG" => (2, false),
+        | b"AUTH" | b"SCAN" | b"OBJECT" | b"CLIENT" | b"SLOWLOG" | b"ACL" => (2, false),
         // arity 2 writes
         b"PERSIST" | b"INCR" | b"DECR" | b"GETDEL" | b"LPOP" | b"RPOP" | b"SPOP" | b"ZPOPMIN"
         | b"ZPOPMAX" | b"DEL" | b"UNLINK" | b"GETEX" => (2, true),
@@ -341,9 +341,28 @@ pub fn is_write(cmd: &[u8]) -> bool {
     command_meta(&cmd.to_ascii_uppercase()).is_some_and(|m| m.write)
 }
 
+/// The ACL command class for `cmd` (upper-case). Connection / Admin / PubSub are
+/// listed explicitly; everything else is Read or Write per the keyspace flag.
+pub fn command_class(cmd: &[u8]) -> u8 {
+    use crate::acl::*;
+    match cmd {
+        b"PING" | b"ECHO" | b"HELLO" | b"AUTH" | b"QUIT" | b"RESET" | b"SELECT" | b"COMMAND"
+        | b"CLIENT" => CLASS_CONNECTION,
+        b"CONFIG" | b"SLOWLOG" | b"INFO" | b"DBSIZE" | b"REPLICAOF" | b"SLAVEOF" | b"REPLCONF"
+        | b"PSYNC" | b"SYNC" | b"SHUTDOWN" | b"SAVE" | b"BGSAVE" | b"BGREWRITEAOF"
+        | b"FLUSHALL" | b"FLUSHDB" | b"ACL" | b"IDXCREATE" | b"IDXDROP" => CLASS_ADMIN,
+        b"SUBSCRIBE" | b"UNSUBSCRIBE" | b"PSUBSCRIBE" | b"PUNSUBSCRIBE" | b"PUBLISH"
+        | b"PUBSUB" => CLASS_PUBSUB,
+        c if c.starts_with(b"CDC") => CLASS_PUBSUB,
+        _ if command_meta(cmd).is_some_and(|m| m.write) => CLASS_WRITE,
+        _ => CLASS_READ,
+    }
+}
+
 /// Every command name (upper-case), for COMMAND/COMMAND COUNT introspection.
 /// A regression test pins this against `command_meta` so they can't drift.
 static COMMAND_NAMES: &[&[u8]] = &[
+    b"ACL",
     b"APPEND",
     b"AUTH",
     b"BFADD",

@@ -11,6 +11,7 @@
 //! M4 lists/hashes/sets · M5 sorted sets · M6 RDB · M7 AOF · M8 pub/sub ·
 //! M9 replication (full sync + command streaming).
 
+mod acl;
 mod aof;
 mod commands;
 mod db;
@@ -201,6 +202,9 @@ struct Hub {
     slowlog_next_id: u64,
     slowlog_threshold_us: i64, // < 0 disables logging
     slowlog_max_len: usize,
+    // ACL: named users + each connection's current user (default user is implicit).
+    users: HashMap<Vec<u8>, acl::User>,
+    current_user: HashMap<u64, Vec<u8>>,
 }
 
 /// One slow-log entry.
@@ -354,6 +358,8 @@ impl Hub {
                 .ok()
                 .and_then(|s| s.trim().parse().ok())
                 .unwrap_or(128),
+            users: HashMap::new(),
+            current_user: HashMap::new(),
         };
         hub.apply_extras(extras);
         hub
@@ -649,6 +655,79 @@ impl Hub {
         }
     }
 
+    fn handle_acl(&mut self, id: u64, tokens: &[Vec<u8>]) {
+        match tokens.get(1).map(|t| t.to_ascii_uppercase()).as_deref() {
+            Some(b"SETUSER") if tokens.len() >= 3 => {
+                let name = tokens[2].clone();
+                let mut user = self.users.get(&name).cloned().unwrap_or_default();
+                for rule in &tokens[3..] {
+                    if user.apply(rule).is_err() {
+                        return self.send(
+                            id,
+                            resp::error(&format!(
+                                "ERR Error in ACL SETUSER modifier '{}'",
+                                String::from_utf8_lossy(rule)
+                            )),
+                        );
+                    }
+                }
+                self.users.insert(name, user);
+                self.send(id, resp::simple_string("OK"));
+            }
+            Some(b"GETUSER") if tokens.len() == 3 => match self.users.get(&tokens[2]) {
+                Some(u) => self.send(id, resp::bulk_array(&u.describe())),
+                None => self.send(id, resp::null_array()),
+            },
+            Some(b"DELUSER") if tokens.len() >= 3 => {
+                let mut n = 0;
+                for name in &tokens[2..] {
+                    if name.as_slice() != b"default" && self.users.remove(name).is_some() {
+                        n += 1;
+                    }
+                }
+                self.send(id, resp::integer(n));
+            }
+            Some(b"LIST") => {
+                let mut out: Vec<Vec<u8>> = Vec::new();
+                for (name, u) in &self.users {
+                    out.push(
+                        format!(
+                            "user {} {}",
+                            String::from_utf8_lossy(name),
+                            if u.enabled { "on" } else { "off" }
+                        )
+                        .into_bytes(),
+                    );
+                }
+                self.send(id, resp::bulk_array(&out));
+            }
+            Some(b"USERS") => {
+                let mut out: Vec<Vec<u8>> = self.users.keys().cloned().collect();
+                out.push(b"default".to_vec());
+                self.send(id, resp::bulk_array(&out));
+            }
+            Some(b"WHOAMI") => {
+                let name = self
+                    .current_user
+                    .get(&id)
+                    .cloned()
+                    .unwrap_or_else(|| b"default".to_vec());
+                self.send(id, resp::bulk_string(&name));
+            }
+            Some(b"CAT") => {
+                let cats: Vec<Vec<u8>> = ["read", "write", "admin", "connection", "pubsub"]
+                    .iter()
+                    .map(|c| c.as_bytes().to_vec())
+                    .collect();
+                self.send(id, resp::bulk_array(&cats));
+            }
+            _ => self.send(
+                id,
+                resp::error("ERR Unknown ACL subcommand or wrong number of arguments"),
+            ),
+        }
+    }
+
     /// Build the INFO report (the sections redis_exporter and clients expect).
     fn render_info(&self) -> Vec<u8> {
         let used = self.db.mem_used();
@@ -759,6 +838,32 @@ impl Hub {
             && !is_no_auth(&cmd)
         {
             return self.send(id, resp::error("NOAUTH Authentication required."));
+        }
+
+        // ACL: a named user is restricted to its allowed command classes + key
+        // prefix. The implicit "default" user (and open mode) has no entry here
+        // and stays unrestricted.
+        if id != MASTER_ID
+            && let Some(uname) = self.current_user.get(&id)
+            && let Some(user) = self.users.get(uname)
+        {
+            let class = commands::command_class(&cmd);
+            if !user.allows_class(class) {
+                return self.send(
+                    id,
+                    resp::error(&format!(
+                        "NOPERM User {} has no permissions to run the '{}' command",
+                        String::from_utf8_lossy(uname),
+                        String::from_utf8_lossy(&cmd).to_ascii_lowercase()
+                    )),
+                );
+            }
+            if (class == acl::CLASS_READ || class == acl::CLASS_WRITE)
+                && tokens.len() >= 2
+                && !user.allows_key(&tokens[1])
+            {
+                return self.send(id, resp::error("NOPERM No permissions to access a key"));
+            }
         }
 
         // A connection in pub/sub or changefeed "push mode" may only run the
@@ -994,6 +1099,7 @@ impl Hub {
             b"CONFIG" => self.handle_config(id, &tokens),
             b"CLIENT" => self.handle_client(id, &tokens),
             b"SLOWLOG" => self.handle_slowlog(id, &tokens),
+            b"ACL" => self.handle_acl(id, &tokens),
 
             // --- persistence (owner-side) ---
             b"BGREWRITEAOF" => {
@@ -1739,12 +1845,8 @@ impl Hub {
         let pass = match tokens.len() {
             2 => &tokens[1],
             3 if tokens[1].eq_ignore_ascii_case(b"default") => &tokens[2],
-            3 => {
-                return self.send(
-                    id,
-                    resp::error("WRONGPASS invalid username-password pair or user is disabled."),
-                );
-            }
+            // A named (non-default) user authenticates against the ACL table.
+            3 => return self.auth_named_user(id, &tokens[1], &tokens[2]),
             _ => {
                 return self.send(
                     id,
@@ -1764,6 +1866,21 @@ impl Hub {
                 self.send(id, resp::simple_string("OK"));
             }
             Some(_) => self.send(
+                id,
+                resp::error("WRONGPASS invalid username-password pair or user is disabled."),
+            ),
+        }
+    }
+
+    /// Authenticate as a named ACL user and bind the connection to it.
+    fn auth_named_user(&mut self, id: u64, name: &[u8], pass: &[u8]) {
+        match self.users.get(name) {
+            Some(u) if u.enabled && u.check_password(pass) => {
+                self.authed.insert(id);
+                self.current_user.insert(id, name.to_vec());
+                self.send(id, resp::simple_string("OK"));
+            }
+            _ => self.send(
                 id,
                 resp::error("WRONGPASS invalid username-password pair or user is disabled."),
             ),
@@ -2218,6 +2335,7 @@ fn run_hub(rx: mpsc::Receiver<Msg>, tx: mpsc::Sender<Msg>) {
                 hub.authed.remove(&id);
                 hub.loopback.remove(&id);
                 hub.client_names.remove(&id);
+                hub.current_user.remove(&id);
             }
             Ok(Msg::Command { id, tokens }) => {
                 if hub.slowlog_threshold_us >= 0 {
