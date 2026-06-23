@@ -2052,10 +2052,17 @@ impl Hub {
     /// Dirty the WATCHers of any key the keyspace expired since the last drain,
     /// and emit an `expire` change to changefeed subscribers.
     fn dirty_expired_watchers(&mut self) {
+        let is_master = self.master.is_none();
         for key in self.db.take_expired() {
             self.dirty_watchers(&key);
             self.record_change(b"expire", &key, None);
             self.reindex_key(&key); // drop expired key from secondary indexes
+            // The master is authoritative for expiry: stream a DEL to replicas
+            // (and the AOF) so they delete the key on our schedule instead of
+            // expiring independently (which would let the two diverge).
+            if is_master {
+                self.propagate(&[b"DEL".to_vec(), key]);
+            }
         }
     }
 
@@ -2370,7 +2377,11 @@ fn run_hub(rx: mpsc::Receiver<Msg>, tx: mpsc::Sender<Msg>) {
                 if let Some(a) = hub.aof.as_mut() {
                     a.maybe_fsync();
                 }
-                hub.db.active_expire();
+                // Only the master actively expires keys; a replica waits for the
+                // master's DELs, so the two never diverge on expiry timing.
+                if hub.master.is_none() {
+                    hub.db.active_expire();
+                }
                 hub.dirty_expired_watchers();
                 hub.expire_blocked();
             }

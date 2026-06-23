@@ -1190,3 +1190,38 @@ fn acl_user_least_privilege() {
     assert_eq!(admin.cmd(&["ACL", "WHOAMI"]), "default");
     assert!(admin.cmd(&["ACL", "USERS"]).contains("alice"));
 }
+
+#[test]
+fn replica_loses_keys_when_the_master_expires_them() {
+    let master = Server::start();
+    let replica = Server::start();
+    let (mut m, mut r) = (master.connect(), replica.connect());
+    assert_eq!(
+        r.cmd(&["REPLICAOF", "127.0.0.1", &master.port.to_string()]),
+        "OK"
+    );
+    sleep(Duration::from_millis(400)); // full sync
+    m.cmd(&["SET", "k", "v", "PX", "200"]);
+    // The write replicates...
+    let deadline = Instant::now() + Duration::from_secs(2);
+    loop {
+        if r.cmd(&["GET", "k"]) == "v" {
+            break;
+        }
+        assert!(Instant::now() < deadline, "key never replicated");
+        sleep(Duration::from_millis(20));
+    }
+    // ...then the master expires it and streams a DEL; the replica converges to
+    // empty rather than holding a stale key (the divergence REPL-1 fixes).
+    let deadline = Instant::now() + Duration::from_secs(3);
+    loop {
+        if r.cmd(&["GET", "k"]) == "(nil)" {
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "expiry not reflected on the replica"
+        );
+        sleep(Duration::from_millis(50));
+    }
+}
