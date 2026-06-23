@@ -287,7 +287,7 @@ pub fn command_meta(cmd: &[u8]) -> Option<CmdMeta> {
         b"PING" | b"QUIT" | b"COMMAND" | b"CONFIG" | b"SAVE" | b"BGSAVE" | b"BGREWRITEAOF"
         | b"MULTI" | b"EXEC" | b"DISCARD" | b"UNWATCH" | b"RESET" | b"INFO" | b"HELLO"
         | b"REPLCONF" | b"PSYNC" | b"SYNC" | b"UNSUBSCRIBE" | b"PUNSUBSCRIBE" | b"DBSIZE"
-        | b"RANDOMKEY" | b"CDCSUBSCRIBE" | b"CDCUNSUBSCRIBE" => (1, false),
+        | b"RANDOMKEY" | b"CDCSUBSCRIBE" | b"CDCUNSUBSCRIBE" | b"SHUTDOWN" => (1, false),
         // arity 1 writes
         b"FLUSHDB" | b"FLUSHALL" => (1, true),
         // arity 2 reads
@@ -295,9 +295,8 @@ pub fn command_meta(cmd: &[u8]) -> Option<CmdMeta> {
         | b"HLEN" | b"HKEYS" | b"HVALS" | b"SMEMBERS" | b"SCARD" | b"ZCARD" | b"XLEN"
         | b"EXISTS" | b"TOUCH" | b"KEYS" | b"MGET" | b"SINTER" | b"SUNION" | b"SDIFF"
         | b"WATCH" | b"SUBSCRIBE" | b"PSUBSCRIBE" | b"PUBSUB" | b"BITCOUNT" | b"SRANDMEMBER"
-        | b"SELECT" | b"CDCREAD" | b"CDCPENDING" | b"GEOPOS" | b"TOPKLIST" | b"IDXDROP" => {
-            (2, false)
-        }
+        | b"SELECT" | b"CDCREAD" | b"CDCPENDING" | b"GEOPOS" | b"TOPKLIST" | b"IDXDROP"
+        | b"AUTH" => (2, false),
         // arity 2 writes
         b"PERSIST" | b"INCR" | b"DECR" | b"GETDEL" | b"LPOP" | b"RPOP" | b"SPOP" | b"ZPOPMIN"
         | b"ZPOPMAX" | b"DEL" | b"UNLINK" => (2, true),

@@ -70,6 +70,12 @@ impl Aof {
             self.last_fsync = now_ms();
         }
     }
+
+    /// Force an fsync now, regardless of the everysec timer (graceful shutdown).
+    pub fn fsync(&mut self) {
+        let _ = self.file.sync_data();
+        self.last_fsync = now_ms();
+    }
 }
 
 fn encode_command(buf: &mut Vec<u8>, cmd: &[Vec<u8>]) {
