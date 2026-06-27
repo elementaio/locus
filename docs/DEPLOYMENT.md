@@ -36,13 +36,33 @@ Checklist before exposing a port:
 
 ---
 
-## 2. TLS — terminate with a sidecar
+## 2. TLS
 
-Locus's core is **zero-dependency by design**, and a correct, audited TLS 1.3
-stack is not something to vendor by hand — so Locus does **not** terminate TLS
-in-process (a native opt-in `tls` build feature is on the roadmap). The production
-answer today is a **TLS-terminating sidecar** co-located with each Locus process.
-This is exactly how many teams run plaintext services securely, and Locus's
+Two options, depending on whether you want to keep the binary 100% dependency-free.
+
+### Option 0 — in-process TLS (optional `tls` build feature)
+
+If you build with `--features tls`, Locus terminates TLS itself via rustls (pure
+Rust, `ring` provider — no OpenSSL/C). The **default build stays dependency-free**;
+only this feature pulls in a crate.
+
+```bash
+cargo build --release --features tls
+LOCUS_BIND=0.0.0.0 LOCUS_TLS_PORT=6380 \
+LOCUS_TLS_CERT=/etc/locus/server.crt LOCUS_TLS_KEY=/etc/locus/server.key \
+LOCUS_REQUIREPASS=$PW target/release/locus      # plaintext on 6379 + TLS on 6380
+redis-cli --tls -p 6380 -a $PW ping
+```
+
+The TLS listener runs alongside the plaintext one (bind plaintext to loopback and
+expose only the TLS port). Cert/key are PEM. This is the simplest path if you're
+comfortable with the one optional dependency.
+
+### Sidecar — keep the core zero-dependency
+
+To keep even the running binary free of a TLS stack, terminate TLS in a **sidecar**
+co-located with each Locus process (the default build does not terminate TLS). This
+is exactly how many teams run plaintext services securely, and Locus's
 loopback-by-default binding makes it clean: Locus listens only on `127.0.0.1`, the
 sidecar owns the public TLS port and forwards to it.
 
@@ -172,7 +192,7 @@ LOCUS_RDB=/data/locus.rdb        # snapshot path
 
 ---
 
-## 6. Replication & (manual) failover
+## 6. Replication & failover
 
 ```bash
 # replica:
@@ -185,7 +205,29 @@ report `master_link_status` + `master_repl_offset` in `INFO`. Use **`WAIT n
 <timeout>`** after a critical write to block until `n` replicas have acknowledged
 it — ack-based durability across nodes.
 
-**Failover is currently manual / orchestrated** (no built-in Sentinel yet):
+### Automatic failover — built-in sentinel
+
+Run the same `locus` binary as a **sentinel** to get automatic failover, no external
+orchestrator:
+
+```bash
+LOCUS_SENTINEL=master.host:6379 \
+LOCUS_SENTINEL_REPLICAS=replica1:6379,replica2:6379 \
+LOCUS_SENTINEL_AUTH=$PW \
+LOCUS_SENTINEL_DOWN_AFTER_MS=5000 \
+LOCUS_SENTINEL_QUORUM=1 \
+  locus
+```
+
+It health-checks the master and, when it's been unreachable past `DOWN_AFTER_MS`
+**and** a quorum of replicas confirm their link is down, promotes the most
+up-to-date replica (`REPLICAOF NO ONE`) and repoints the rest. While the master is
+healthy it reconciles stray nodes (e.g. a returned old master) back to replicas —
+basic split-brain protection. It's a single-sentinel design today (inter-sentinel
+agreement is on the roadmap), so run one per failure domain. Repoint **clients** via
+your service discovery / proxy / DNS after a switch.
+
+### Manual failover (runbook / fallback)
 
 1. Detect master loss (health checks / your supervisor).
 2. Pick the most up-to-date replica (highest `master_repl_offset`).
@@ -195,7 +237,7 @@ it — ack-based durability across nodes.
 
 To avoid split-brain, ensure the old master cannot keep taking writes after it's
 declared dead (fence it at the network/orchestrator layer before promoting).
-Automatic failover (Sentinel-lite) and horizontal clustering are on the roadmap.
+Horizontal clustering is on the roadmap.
 
 ---
 
