@@ -1,40 +1,41 @@
 # Locus
 
-**An in-memory datastore that speaks the Redis protocol — written from scratch in Rust, with zero dependencies.**
+**The reactive, geo-first datastore that speaks Redis.**
 
 [![CI](https://github.com/intenttext/locus/actions/workflows/ci.yml/badge.svg)](https://github.com/intenttext/locus/actions/workflows/ci.yml)
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
 [![Rust](https://img.shields.io/badge/rust-2024-orange.svg)](https://www.rust-lang.org/)
 
-Locus is a single-binary, RESP-compatible key-value/data-structure server. You can drive it with the
-real `redis-cli`, point existing Redis clients at it, and benchmark it with `redis-benchmark`. It's
-built around the same core idea that makes Redis elegant — **one thread executes commands serially, so
-every command is atomic by construction** — and it ships with no third-party crates: just the Rust
-standard library.
+Point any Redis client at Locus — then get what a vanilla Redis can't cleanly give you:
 
-On top of that Redis-compatible core, Locus adds a **reactive, geo-first** layer that a vanilla Redis
-can't cleanly offer — because the single-threaded hub sees every mutation's before/after at one ordered
-point:
+- a reliable, ordered **[changefeed](docs/CHANGEFEED.md)** — snapshot + live deltas, offsets, consumer
+  groups (keyspace notifications done right);
+- **[geo-first](docs/GEO.md)** objects with `GEOSEARCH` and **live geofencing**;
+- mergeable **[sketches](docs/SKETCHES.md)** — Bloom, Count-Min, Top-K, t-digest;
+- atomic **CAS** write verbs and a drift-free **secondary index** (query by field).
 
-- a reliable, ordered **[changefeed](docs/CHANGEFEED.md)** (snapshot + live deltas, offsets, consumer
-  groups) — keyspace notifications done right;
-- **[geo-first](docs/GEO.md)** objects with `GEOSEARCH` and **live geofencing** over the changefeed;
-- mergeable **[sketches](docs/SKETCHES.md)** (Bloom, Count-Min, Top-K, t-digest);
-- **CAS** write verbs and a drift-free **secondary index** (query by field).
-
-> **Status:** pre-1.0 and **not yet production-hardened** (no AUTH/TLS; single node). It is a faithful,
-> readable implementation with a complete data-type core *and* the full reactive/geo differentiator set
-> — a solid foundation rather than a drop-in production Redis. ~8k lines of `std`-only Rust, 9 modules.
+**Why it can do this:** every command runs on a single hub thread, so Locus sees each mutation's
+*ordered before/after at one point* — which makes a gap-free change-log and live queries **natural,
+not bolted on**. It ships as one small static binary with **zero third-party dependencies** (just the
+Rust standard library) — a real supply-chain and reproducibility win, but the *how*, not the pitch.
 
 ```console
-$ cargo run
-Locus listening on 127.0.0.1:6379
-
-$ redis-cli -p 6379 set hello world
+$ redis-cli -p 6379 SET hello world          # …it's the Redis you already know,
 OK
-$ redis-cli -p 6379 get hello
-"world"
+$ redis-cli -p 6379 CDCSUBSCRIBE app:         # …that also streams every change back to you,
+$ redis-cli -p 6379 GEOSEARCH fleet FROMLONLAT 55.27 25.2 BYRADIUS 5 km ASC   # …and is geo-native.
 ```
+
+> **Why not just Redis?** If you only need a cache or a KV store, use Redis — it's superb. Reach for
+> Locus when you want the *reactive + spatial* layer (live change-streams, geofencing, sketches) in
+> one dependency-free binary, with Redis-compatible wire access so your existing clients and tooling
+> just work.
+
+> **Status:** pre-1.0, actively hardening toward production. **Done:** AUTH + ACL + protected-mode,
+> durable persistence (crash-tested), the full reactive/geo differentiator set, and broad driver/ops
+> compatibility (`SCAN`, `INFO`, `redis_exporter`, RESP3). **Maturing:** replication (correct +
+> `WAIT`; partial-resync & failover next). **Not yet:** native in-process TLS (use a sidecar today)
+> and horizontal clustering. ~10k lines of `std`-only Rust.
 
 ---
 
@@ -43,23 +44,39 @@ $ redis-cli -p 6379 get hello
 **Redis-compatible core**
 
 - **Data types:** strings, lists, hashes, sets, sorted sets, streams, bitmaps — broad per-type command
-  coverage with `WRONGTYPE` checks. ~115 commands; see [docs/COMMANDS.md](docs/COMMANDS.md).
-- **Key expiration:** `SET ... EX/PX/EXAT/PXAT/NX/XX/KEEPTTL`, `EXPIRE`/`TTL`/`PERSIST`, with both
-  passive (on-access) and active (background sampling) expiry.
-- **`maxmemory` + eviction:** soft memory cap with arbitrary-key eviction and `OOM` rejection.
-- **Persistence:** RDB-style binary snapshots (`SAVE`/`BGSAVE`) and an append-only file (AOF) with
-  crash-safe, torn-tail-tolerant replay and `BGREWRITEAOF` compaction.
-- **Replication:** `REPLICAOF` master/replica with full-sync snapshot transfer + live command
-  streaming; read-only replicas; `INFO`.
-- **Pub/Sub:** `SUBSCRIBE`/`PSUBSCRIBE`/`PUBLISH` with glob patterns.
-- **Transactions:** `MULTI`/`EXEC`/`DISCARD` and `WATCH`/`UNWATCH` (with correct EXECABORT + WATCH-on-expiry).
+  coverage with `WRONGTYPE` checks. ~180 commands; see [docs/COMMANDS.md](docs/COMMANDS.md).
+- **Iteration & introspection:** real incremental `SCAN`/`HSCAN`/`SSCAN`/`ZSCAN`, `COMMAND`/`COMMAND
+  DOCS`, `OBJECT ENCODING`, `CLIENT`, `GETEX` — off-the-shelf clients connect without fallbacks.
+- **Key expiration:** `SET … EX/PX/EXAT/PXAT/NX/XX/KEEPTTL`, `EXPIRE`/`TTL`/`PERSIST`, passive + active.
+- **`maxmemory` + eviction:** soft cap with key eviction and `OOM` rejection.
+- **Transactions:** `MULTI`/`EXEC`/`DISCARD`, `WATCH`/`UNWATCH` (EXECABORT + WATCH-on-expiry).
 - **Streams:** `XADD`/`XRANGE`/`XREAD`, including **blocking `XREAD`**.
-- **Protocol:** RESP2 + `HELLO` RESP3 negotiation; pipelining.
+- **Protocol:** RESP2 **and RESP3** typed replies (maps/sets/doubles) on `HELLO 3`; pipelining.
+
+**Security & operations** *(safe on a trusted network)*
+
+- **AUTH + ACL:** `requirepass`, **protected mode** (no accidental `0.0.0.0` exposure), and a simple
+  **multi-user ACL** (`ACL SETUSER` with command classes + key prefixes) — least-privilege users.
+- **Observability:** a full `INFO` (works with `redis_exporter`), `SLOWLOG`, `CONFIG GET/SET`,
+  structured leveled logging, graceful `SIGTERM` shutdown (drain → fsync → final save).
+- **Resource safety:** per-connection read timeout, `TCP_NODELAY`, a max-connections cap.
+
+**Durability**
+
+- **Snapshots + AOF:** RDB-style binary snapshots (truly-async `BGSAVE`) and an append-only file with
+  crash-safe, torn-tail-tolerant replay, configurable `appendfsync`, and `BGREWRITEAOF` compaction.
+  Directory-fsync'd renames; **fuzz- and `kill -9` crash-recovery-tested.**
+
+**Replication**
+
+- `REPLICAOF` master/replica: full-sync snapshot + live command streaming, read-only replicas, real
+  replication IDs + offsets, authenticated links (`masterauth`), and **`WAIT`** for ack-based
+  durability. Expiry is master-authoritative, so replicas never diverge on timing.
 
 **Reactive + geo differentiators**
 
 - **[Changefeed](docs/CHANGEFEED.md):** `CDCSUBSCRIBE` (snapshot + live deltas, no gap/dup), offsets +
-  `CDCREAD` catch-up, and consumer groups — a reliable, ordered keyspace feed.
+  `CDCREAD` catch-up, and consumer groups — a reliable, ordered keyspace feed (persisted + replicated).
 - **[Geo-first](docs/GEO.md):** `GEOSET`/`GEOPOS`/`GEODIST`/`GEOSEARCH`, plus **live geofencing** via
   `CDCSUBSCRIBE REGION`.
 - **[Sketches](docs/SKETCHES.md):** Bloom (dedup), Count-Min (trending), Top-K (heavy hitters),
@@ -67,11 +84,11 @@ $ redis-cli -p 6379 get hello
 - **CAS verbs:** `CAS`/`CADEL`/`SETMAX`/`INCRCAP` — atomic check-and-write.
 - **Secondary index:** `IDXCREATE`/`IDXGET`/`IDXRANGE` — query by hash field, auto-maintained (no drift).
 
-**Zero dependencies.** Pure `std`, ~8k lines across 9 modules.
+**Zero dependencies.** Pure `std`; one small static binary; reproducible builds.
 
-See [docs/COMMANDS.md](docs/COMMANDS.md) for the full command reference, [docs/CLIENTS.md](docs/CLIENTS.md)
-for driving Locus from Node/Python (any Redis client works), the guides above for the differentiators,
-and [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) for how it works inside.
+See [docs/COMMANDS.md](docs/COMMANDS.md) for the full reference, [docs/CLIENTS.md](docs/CLIENTS.md) for
+driving Locus from Node/Python (any Redis client works), the guides above for the differentiators, and
+[docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) for how it works inside.
 
 ---
 
@@ -81,37 +98,28 @@ Requires a recent Rust toolchain (edition 2024). The official `redis-cli` / `red
 for driving it (`brew install redis` on macOS) but not required to build.
 
 ```console
-# build & run
 cargo run                 # debug, listens on 127.0.0.1:6379
 cargo run --release       # optimized
 
-# drive it with the real redis-cli
 redis-cli -p 6379 ping
-redis-cli -p 6379 rpush mylist a b c
-redis-cli -p 6379 lrange mylist 0 -1
 redis-cli -p 6379 zadd board 100 alice 50 bob
 redis-cli -p 6379 zrange board 0 -1 withscores
 
-# run the tests
-cargo test
+cargo test                # unit + end-to-end integration tests
 ```
 
 ### Install (Docker / prebuilt binary)
 
-No Rust toolchain required to *run* Locus:
-
 ```console
-# Docker — pull and run (RESP on 6379)
+# Docker — RESP on 6379
 docker run -p 6379:6379 ghcr.io/intenttext/locus:latest
 # persist across restarts:
 docker run -p 6379:6379 -v locus-data:/data -e LOCUS_RDB=/data/locus.rdb ghcr.io/intenttext/locus:latest
 ```
 
 Or grab a prebuilt static binary from the [latest release](https://github.com/intenttext/locus/releases/latest)
-(Linux x86_64/aarch64, macOS x86_64/aarch64): download the archive for your platform, verify the
-`.sha256`, extract, and run `./locus`.
-
-With a Rust toolchain, install from crates.io (the crate is `locusdb`; the command it installs is `locus`):
+(Linux x86_64/aarch64, macOS x86_64/aarch64). With a Rust toolchain, install from crates.io (the crate
+is `locusdb`; the installed command is `locus`):
 
 ```console
 cargo install locusdb && locus
@@ -119,62 +127,63 @@ cargo install locusdb && locus
 
 ### Configuration
 
-Locus is configured entirely through environment variables (minimal config by design):
+Configured entirely through environment variables (minimal config by design):
 
 | Variable | Default | Meaning |
 |---|---|---|
-| `LOCUS_BIND` | `127.0.0.1` | Interface to bind. Defaults to loopback (no AUTH/TLS — don't expose by accident); the Docker image sets `0.0.0.0` |
-| `LOCUS_PORT` | `6379` | TCP port to listen on |
-| `LOCUS_RDB` | `locus.rdb` | RDB snapshot file path |
-| `LOCUS_AOF` | _(off)_ | Set to a path (or `1`) to enable append-only persistence |
-| `LOCUS_MAXMEMORY` | _(unlimited)_ | Soft memory cap; accepts bytes or `kb`/`mb`/`gb` (e.g. `256mb`). Over the cap, a master evicts keys; writes get `OOM` only if the cap still can't be met |
-| `LOCUS_CDC_MAXLEN` | _(off)_ | Retained changefeed log size (records) for `CDCREAD` catch-up / consumer groups; `0`/unset = off (live `CDCSUBSCRIBE` still works) |
+| `LOCUS_BIND` | `127.0.0.1` | Interface to bind. Loopback by default; the Docker image sets `0.0.0.0` (protected mode then guards it until a password is set) |
+| `LOCUS_PORT` | `6379` | TCP port |
+| `LOCUS_REQUIREPASS` | _(off)_ | Require `AUTH <password>` before any command |
+| `LOCUS_MASTERAUTH` | _(off)_ | Password a replica presents to its master |
+| `LOCUS_PROTECTED_MODE` | `on` | Refuse non-loopback clients when no password is set; `no` to disable |
+| `LOCUS_MAXCLIENTS` | `10000` | Max concurrent connections |
+| `LOCUS_TIMEOUT` | `0` | Idle-connection timeout in seconds (`0` = off) |
+| `LOCUS_RDB` | `locus.rdb` | RDB snapshot path |
+| `LOCUS_AOF` | _(off)_ | Path (or `1`) to enable append-only persistence |
+| `LOCUS_APPENDFSYNC` | `everysec` | AOF fsync policy: `always` / `everysec` / `no` |
+| `LOCUS_MAXMEMORY` | _(unlimited)_ | Soft cap; `kb`/`mb`/`gb` (e.g. `256mb`). Master evicts; `OOM` if still over |
+| `LOCUS_CDC_MAXLEN` | _(off)_ | Retained changefeed log size for `CDCREAD` catch-up / consumer groups |
+| `LOCUS_SLOWLOG_US` | `10000` | Log commands slower than this (µs); `<0` disables |
+| `LOCUS_LOGLEVEL` | `info` | `error` / `warn` / `info` / `debug` |
+
+### Security & replication in 30 seconds
 
 ```console
-LOCUS_AOF=1 cargo run --release          # durable, append-only mode
-LOCUS_PORT=6380 cargo run --release      # run a second instance (e.g. a replica)
-```
+# require a password
+LOCUS_REQUIREPASS=s3cret cargo run --release
+redis-cli -p 6379 -a s3cret ping
 
-### Replication in 30 seconds
+# a least-privilege, read-only user scoped to app:* keys
+redis-cli -p 6379 -a s3cret ACL SETUSER reader on '>pw' +@read '~app:'
 
-```console
-# terminal 1 — master
-LOCUS_PORT=6379 cargo run --release
-
-# terminal 2 — replica
-LOCUS_PORT=6380 cargo run --release
+# master + replica, then WAIT for the write to reach 1 replica
 redis-cli -p 6380 replicaof 127.0.0.1 6379
-
-# terminal 3
 redis-cli -p 6379 set foo bar
-redis-cli -p 6380 get foo        # -> "bar"  (replicated)
-redis-cli -p 6380 set x y        # -> READONLY (replicas reject writes)
+redis-cli -p 6379 wait 1 1000        # -> (integer) 1
 ```
+
+> **TLS:** Locus does not (yet) terminate TLS in-process — keeping the core zero-dependency. Run it
+> behind a TLS proxy/sidecar (stunnel, ghostunnel, nginx `stream`) for encrypted client and replica
+> links; native opt-in TLS is on the roadmap.
 
 ---
 
 ## Architecture
 
 ```
-        ┌── reader thread ──┐                         ┌─────────────────────────┐
-client ─┤  parse RESP       │── command ──▶  channel ─▶│      hub (1 thread)     │
-        │                   │                          │  • keyspace (the data)  │
-        └── writer thread ◀─┘◀── reply/message ── channel │  • pub/sub registry  │
-                                                        │  • replication state    │
-                                                        │  • transactions         │
-                                                        │  • blocking readers      │
-                                                        └─────────────────────────┘
+        ┌── reader thread ──┐                          ┌─────────────────────────┐
+client ─┤  parse RESP       │── command ──▶  channel ──▶│      hub (1 thread)     │
+        │                   │                           │  • keyspace (the data)  │
+        └── writer thread ◀─┘◀── reply/message ─ channel │  • pub/sub + changefeed │
+                                                         │  • replication state    │
+                                                         │  • transactions / ACL   │
+                                                         └─────────────────────────┘
 ```
 
-- Each connection gets a **reader thread** (parse the resumable RESP stream) and a **writer thread**
-  (drain an output channel to the socket).
-- A single **hub thread** owns all mutable state and runs every command serially — so atomicity comes
-  from the architecture, not from locks. Replies, published messages, and replicated writes all flow
-  back through clients' output channels.
-- Persistence and replication sit **off the hot path**: snapshots and the append-only log are written
-  alongside, never blocking reads.
-
-Full details, including the persistence formats and the design philosophy, are in
+A single **hub thread** owns all mutable state and runs every command serially — atomicity comes from
+the architecture, not from locks — and, crucially, it observes every mutation at one ordered point,
+which is what makes the reliable changefeed and live geo-queries possible. Each connection gets a
+**reader** and **writer** thread; persistence and replication sit **off the hot path**. Full details in
 [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md).
 
 ---
@@ -191,42 +200,39 @@ with the official `redis-benchmark` (release build, single instance):
 
 Throughput is bounded by the single-hub design (one channel hop per command) — the deliberate price of
 lock-free, serially-consistent execution. The path to more is **thread-per-core / shared-nothing
-sharding** (each shard its own single-threaded hub), which is on the roadmap rather than retrofitted in.
+sharding** (each shard its own single-threaded hub), on the roadmap rather than retrofitted.
 
 ---
 
 ## Project status & roadmap
 
-The Redis-compatible core was built in twelve milestones (M0–M12); the reactive + geo differentiator
-layer followed. See [docs/ROADMAP.md](docs/ROADMAP.md) for the full ledger.
+**Production-readiness so far:** safe on a trusted network (AUTH/ACL/protected-mode/limits), durable
+(async snapshots, AOF + crash-recovery, persisted/replicated reactive state), observable
+(`INFO`/`SLOWLOG`/`redis_exporter`), driver-compatible (`SCAN`/`COMMAND`/`CONFIG`/RESP3), with correct
+replication (real offsets, `WAIT`, no expiry divergence) — plus the full reactive/geo differentiator set.
 
-**Implemented:** the Redis-compatible core (data types incl. bitmaps · expiry · `maxmemory` · RDB ·
-AOF + recovery · pub/sub · replication · transactions · streams · RESP3 negotiation · pipelining) **plus**
-the differentiators (changefeed with offsets/groups/geofencing · geo-first index · Bloom/Count-Min/Top-K/
-t-digest sketches · CAS verbs · secondary index).
+**Next:** PSYNC partial-resync & failover; native opt-in TLS; a real S2/R-tree geo index with combined
+attribute filters; and the horizontal **spatial clustering** that nobody in the in-memory-geo space has
+packaged simply — Locus's flagship lane.
 
-**Deliberately deferred:** AUTH/TLS; replication's deep tail (PSYNC partial resync, backlog, `WAIT`,
-failover); a skiplist for O(log n) sorted-set ops; a real S2/R-tree geo index + combined filters +
-spatial clustering; thread-per-core execution; multiple logical DBs.
-
-The next major arc is **geo phase 3** — a real spatial index, combined attribute filters, and the
-horizontal **spatial clustering** that nobody in the in-memory-geo space has packaged simply.
+**Explicit non-goals:** scripting/`EVAL`, an embedded HTTP `/metrics` endpoint (`INFO` + `redis_exporter`
+instead), and active-active replication.
 
 ---
 
 ## Building & testing
 
 ```console
-cargo build --release      # the optimized binary at target/release/locus
-cargo test                 # unit tests (parser, commands, persistence, ...)
-cargo clippy               # lints (the codebase is clippy-clean)
+cargo build --release      # optimized binary at target/release/locus
+cargo test                 # unit + integration (parser fuzz, crash-recovery, replication, ACL, …)
+cargo clippy               # lints (clippy-clean under -D warnings)
 cargo fmt                  # formatting
 ```
 
 ## Contributing
 
 Contributions are welcome — see [CONTRIBUTING.md](CONTRIBUTING.md). The codebase is intentionally small
-and readable; new commands generally mean one match arm plus a focused function and a test.
+and readable; a new command is generally one match arm plus a focused function and a test.
 
 ## License
 
