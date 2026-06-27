@@ -2086,7 +2086,10 @@ fn cluster_cdcmerge_holds_watermark_for_downed_shard() {
     // Write `early`, then merge once so node1 learns node2's floor (both up).
     c1.cmd(&["SET", early, "1"]);
     let r0 = c1.cmd(&["CLUSTER", "CDCMERGE", "0", "COUNT", "10"]);
-    assert!(r0.contains(early.as_str()), "early not merged while up: {r0}");
+    assert!(
+        r0.contains(early.as_str()),
+        "early not merged while up: {r0}"
+    );
 
     // node2 dies, then a later write lands above node2's last-known floor.
     let _ = n2.kill();
@@ -2097,7 +2100,10 @@ fn cluster_cdcmerge_holds_watermark_for_downed_shard() {
     // node2 is down but was seen, so the watermark is held at its last floor:
     // `late` (stamped after) is withheld, while `early` still delivers.
     let r1 = c1.cmd(&["CLUSTER", "CDCMERGE", "0", "COUNT", "10"]);
-    assert!(r1.contains(early.as_str()), "early should still deliver: {r1}");
+    assert!(
+        r1.contains(early.as_str()),
+        "early should still deliver: {r1}"
+    );
     assert!(
         !r1.contains(late.as_str()),
         "late write must be held below the downed shard's watermark: {r1}"
