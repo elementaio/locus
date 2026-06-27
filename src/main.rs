@@ -72,6 +72,9 @@ enum Msg {
     /// An async BGREWRITEAOF finished writing its base image off-thread; carries
     /// the temp path on success (to finalize) or an error string.
     AofRewriteDone(Result<String, String>),
+    /// A peer's gossiped slot topology, as (start, end, owner, epoch) runs — the
+    /// gossip thread fetched it off-hub; the hub adopts higher-epoch entries.
+    ClusterGossip(Vec<(u16, u16, String, u64)>),
 }
 
 /// Set by the SIGTERM/SIGINT handler so the hub can persist and exit cleanly.
@@ -109,6 +112,21 @@ fn main() -> io::Result<()> {
     let hub_tx = tx.clone();
     thread::spawn(move || run_hub(rx, hub_tx));
     install_signal_handlers();
+
+    // Cluster topology gossip: with a multi-node topology, periodically pull each
+    // peer's slot map and let the hub adopt higher-epoch entries, so SETSLOT /
+    // REASSIGN / MIGRATESLOT changes converge cluster-wide without pushing to each.
+    if let Some(peers) = cluster_gossip_peers_from_env() {
+        let gtx = tx.clone();
+        let interval = Duration::from_millis(
+            std::env::var("LOCUS_CLUSTER_GOSSIP_MS")
+                .ok()
+                .and_then(|s| s.trim().parse().ok())
+                .filter(|&n| n > 0)
+                .unwrap_or(1000),
+        );
+        thread::spawn(move || run_gossip(gtx, peers, interval));
+    }
 
     let port = std::env::var("LOCUS_PORT").unwrap_or_else(|_| "6379".to_string());
     // Bind to loopback by default (Locus has no AUTH/TLS — don't expose it by
@@ -234,6 +252,10 @@ struct Cluster {
     // `cell_bits` of the point's geohash, hex-rendered). 0 = off (GEOSEARCH
     // scatters to all shards); >0 = bounded scatter to the cells a query covers.
     cell_bits: u32,
+    // Per-slot ownership epoch (HLC stamp at the last change). Anti-entropy gossip
+    // adopts a peer's owner for a slot only if the peer's epoch is higher, so the
+    // most recent SETSLOT/REASSIGN/MIGRATESLOT wins and stale nodes converge.
+    epoch: Vec<u64>,
 }
 
 impl Cluster {
@@ -281,7 +303,30 @@ impl Cluster {
             my_addr,
             owner,
             cell_bits,
+            epoch: vec![0; commands::CLUSTER_SLOTS],
         })
+    }
+
+    /// Contiguous (start, end, owner, epoch) runs — like `ranges` but also broken
+    /// by epoch changes, for gossiping the topology compactly with versions.
+    fn ranges_with_epoch(&self) -> Vec<(u16, u16, String, u64)> {
+        let mut out = Vec::new();
+        let mut i = 0usize;
+        while i < self.owner.len() {
+            let Some(a) = &self.owner[i] else {
+                i += 1;
+                continue;
+            };
+            let (start, owner, ep) = (i, a.clone(), self.epoch[i]);
+            while i < self.owner.len()
+                && self.owner[i].as_deref() == Some(&owner)
+                && self.epoch[i] == ep
+            {
+                i += 1;
+            }
+            out.push((start as u16, (i - 1) as u16, owner, ep));
+        }
+        out
     }
 
     /// Contiguous (start, end, owner) slot ranges, for CLUSTER SLOTS/INFO.
@@ -853,6 +898,13 @@ impl Hub {
         q.format(hits)
     }
 
+    /// Advance and return this node's hybrid logical clock — the monotonic stamp
+    /// for CDC records and slot-ownership epochs.
+    fn hlc_now(&mut self) -> u64 {
+        self.hlc_last = hlc::tick(self.hlc_last);
+        self.hlc_last
+    }
+
     /// Local changefeed records stamped after `since` (HLC), as
     /// `(hlc, event, key, value)`. Shared by XCDCSINCE and the merge coordinator.
     fn cdc_since(&self, since: u64) -> Vec<CdcMergeRec> {
@@ -992,6 +1044,24 @@ impl Hub {
         }
     }
 
+    /// Adopt a peer's gossiped topology: for each (start,end,owner,epoch) run, take
+    /// the owner only where the peer's epoch is higher than ours (last-writer-wins
+    /// by HLC epoch). This is how SETSLOT/REASSIGN/MIGRATESLOT changes converge
+    /// across nodes without the operator pushing to each one.
+    fn merge_gossip(&mut self, ranges: Vec<(u16, u16, String, u64)>) {
+        let Some(c) = self.cluster.as_mut() else {
+            return;
+        };
+        for (start, end, owner, ep) in ranges {
+            for slot in (start as usize)..=(end as usize).min(c.epoch.len() - 1) {
+                if ep > c.epoch[slot] {
+                    c.owner[slot] = Some(owner.clone());
+                    c.epoch[slot] = ep;
+                }
+            }
+        }
+    }
+
     /// CLUSTER introspection. With cluster mode off we report cluster_enabled:0 so
     /// clients fall back to standalone; with it on we report the real slot
     /// ownership. KEYSLOT/MYID work in both modes.
@@ -1108,9 +1178,11 @@ impl Hub {
                     .ok()
                     .and_then(|s| s.trim().parse::<usize>().ok());
                 let addr = String::from_utf8_lossy(&tokens[4]).into_owned();
+                let ep = self.hlc_now();
                 match (self.cluster.as_mut(), slot) {
                     (Some(c), Some(s)) if s < commands::CLUSTER_SLOTS => {
                         c.owner[s] = Some(addr);
+                        c.epoch[s] = ep;
                         self.send(id, resp::simple_string("OK"));
                     }
                     (Some(_), _) => self.send(id, resp::error("ERR Invalid or out of range slot")),
@@ -1166,8 +1238,10 @@ impl Hub {
                         for (k, _) in &dumps {
                             self.db.remove(k);
                         }
+                        let ep = self.hlc_now();
                         if let Some(c) = self.cluster.as_mut() {
                             c.owner[s] = Some(dst);
+                            c.epoch[s] = ep;
                         }
                         self.send(id, resp::integer(dumps.len() as i64));
                     }
@@ -1180,12 +1254,14 @@ impl Hub {
             Some(b"REASSIGN") if tokens.len() == 4 => {
                 let old = String::from_utf8_lossy(&tokens[2]).into_owned();
                 let new = String::from_utf8_lossy(&tokens[3]).into_owned();
+                let ep = self.hlc_now();
                 match self.cluster.as_mut() {
                     Some(c) => {
                         let mut n = 0i64;
-                        for o in c.owner.iter_mut() {
-                            if o.as_deref() == Some(old.as_str()) {
-                                *o = Some(new.clone());
+                        for s in 0..c.owner.len() {
+                            if c.owner[s].as_deref() == Some(old.as_str()) {
+                                c.owner[s] = Some(new.clone());
+                                c.epoch[s] = ep;
                                 n += 1;
                             }
                         }
@@ -1216,6 +1292,27 @@ impl Hub {
                         resp::error("ERR value is not an integer or out of range"),
                     ),
                 }
+            }
+            // CLUSTER GOSSIP — internal: our slot topology as (start,end,owner,
+            // epoch) runs (4 bulks each), so peers can adopt higher-epoch entries
+            // and converge without the operator touching every node.
+            Some(b"GOSSIP") => {
+                let out: Vec<Vec<u8>> = match &self.cluster {
+                    Some(c) => c
+                        .ranges_with_epoch()
+                        .into_iter()
+                        .flat_map(|(s, e, owner, ep)| {
+                            [
+                                resp::bulk_string(s.to_string().as_bytes()),
+                                resp::bulk_string(e.to_string().as_bytes()),
+                                resp::bulk_string(owner.as_bytes()),
+                                resp::bulk_string(ep.to_string().as_bytes()),
+                            ]
+                        })
+                        .collect(),
+                    None => vec![],
+                };
+                self.send(id, resp::array(&out));
             }
             Some(b"COUNTKEYSINSLOT") => self.send(id, resp::integer(0)),
             Some(b"RESET") => self.send(id, resp::simple_string("OK")),
@@ -2133,8 +2230,7 @@ impl Hub {
         }
         let offset = self.cdc_next_offset;
         self.cdc_next_offset += 1;
-        self.hlc_last = hlc::tick(self.hlc_last); // monotonic stamp for global merge
-        let hlc = self.hlc_last;
+        let hlc = self.hlc_now(); // monotonic stamp for cross-shard merge order
         if !self.changefeeds.is_empty() {
             let val = match &value {
                 Some(v) => resp::bulk_string(v),
@@ -3260,6 +3356,7 @@ fn run_hub(rx: mpsc::Receiver<Msg>, tx: mpsc::Sender<Msg>) {
                 hub.serve_blocked();
             }
             Ok(Msg::MasterLinkDown) => hub.master_link_up = false,
+            Ok(Msg::ClusterGossip(ranges)) => hub.merge_gossip(ranges),
             Ok(Msg::AofRewriteDone(res)) => {
                 // Fold the writes buffered during the rewrite into the new file,
                 // then swap it in. On any failure we keep the old AOF (which still
@@ -3510,6 +3607,67 @@ fn cluster_call_int(addr: &str, args: &[&[u8]]) -> Option<i64> {
         }
     };
     go().ok()
+}
+
+/// `(distinct peer addresses)` for gossip when cluster mode is on with a
+/// multi-node topology. None for off / single-node (nothing to gossip with).
+fn cluster_gossip_peers_from_env() -> Option<Vec<String>> {
+    let on = std::env::var("LOCUS_CLUSTER_ENABLED")
+        .map(|v| matches!(v.trim(), "1" | "yes" | "on" | "true"))
+        .unwrap_or(false);
+    if !on {
+        return None;
+    }
+    let my_addr = std::env::var("LOCUS_CLUSTER_ANNOUNCE").unwrap_or_else(|_| {
+        let bind = std::env::var("LOCUS_BIND").unwrap_or_else(|_| "127.0.0.1".to_string());
+        let port = std::env::var("LOCUS_PORT").unwrap_or_else(|_| "6379".to_string());
+        format!("{bind}:{port}")
+    });
+    let spec = std::env::var("LOCUS_CLUSTER_NODES").ok()?;
+    let mut peers = Vec::new();
+    for node in spec.split(';').map(str::trim).filter(|s| !s.is_empty()) {
+        if let Some(addr) = node.split_whitespace().next()
+            && addr != my_addr
+            && !peers.iter().any(|p| p == addr)
+        {
+            peers.push(addr.to_string());
+        }
+    }
+    (!peers.is_empty()).then_some(peers)
+}
+
+/// Periodically pull each peer's `CLUSTER GOSSIP` topology and hand it to the hub
+/// to merge (adopt higher-epoch slot owners). Anti-entropy: topology changes
+/// converge without the operator pushing to every node. Each round is bounded by
+/// `cluster_call_array`'s timeouts; a down peer is skipped and retried next round.
+fn run_gossip(tx: mpsc::Sender<Msg>, peers: Vec<String>, interval: Duration) {
+    loop {
+        thread::sleep(interval);
+        for peer in &peers {
+            let Some(flat) = cluster_call_array(peer, &[b"CLUSTER", b"GOSSIP"]) else {
+                continue;
+            };
+            let u16p = |b: &[u8]| {
+                std::str::from_utf8(b)
+                    .ok()
+                    .and_then(|s| s.parse::<u16>().ok())
+            };
+            let u64p = |b: &[u8]| {
+                std::str::from_utf8(b)
+                    .ok()
+                    .and_then(|s| s.parse::<u64>().ok())
+            };
+            let mut ranges = Vec::new();
+            for g in flat.chunks_exact(4) {
+                if let (Some(s), Some(e), Some(ep)) = (u16p(&g[0]), u16p(&g[1]), u64p(&g[3])) {
+                    ranges.push((s, e, String::from_utf8_lossy(&g[2]).into_owned(), ep));
+                }
+            }
+            if !ranges.is_empty() {
+                let _ = tx.send(Msg::ClusterGossip(ranges));
+            }
+        }
+    }
 }
 
 /// Parse an optional `COUNT <n>` argument anywhere from index 2 (case-insensitive).

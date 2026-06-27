@@ -1674,6 +1674,7 @@ fn spawn_cluster_node_cells(port: u16, nodes: &str, cell_bits: u32) -> Child {
         .env("LOCUS_CLUSTER_ANNOUNCE", format!("127.0.0.1:{port}"))
         .env("LOCUS_CLUSTER_NODES", nodes)
         .env("LOCUS_CDC_MAXLEN", "1000") // retain changes for CLUSTER CDCMERGE
+        .env("LOCUS_CLUSTER_GOSSIP_MS", "200") // fast topology convergence in tests
         .stdout(Stdio::piped())
         .stderr(Stdio::null());
     if cell_bits > 0 {
@@ -2111,6 +2112,57 @@ fn cluster_cdcmerge_holds_watermark_for_downed_shard() {
 
     let _ = n1.kill();
     let _ = n1.wait();
+}
+
+#[test]
+fn cluster_topology_gossip_converges() {
+    let (p1, p2) = (free_port(), free_port());
+    let nodes = format!("127.0.0.1:{p1} 0-8191;127.0.0.1:{p2} 8192-16383");
+    let mut n1 = spawn_cluster_node(p1, &nodes);
+    let mut n2 = spawn_cluster_node(p2, &nodes);
+    let mut c1 = conn_to(p1);
+    let mut c2 = conn_to(p2);
+
+    // A key node2 owns. Before any change, node2 serves it locally (no redirect).
+    let mut k2 = None;
+    for i in 0..400 {
+        let k = format!("g{i}");
+        let s: i64 = c1.cmd(&["CLUSTER", "KEYSLOT", &k]).parse().unwrap();
+        if s > 8191 {
+            k2 = Some(k);
+            break;
+        }
+    }
+    let k = k2.expect("need a node2-owned key");
+    let (a1, a2) = (format!("127.0.0.1:{p1}"), format!("127.0.0.1:{p2}"));
+
+    // Reassign node2's slots to node1 on node1 ONLY (no manual push to node2).
+    assert!(
+        c1.cmd(&["CLUSTER", "REASSIGN", &a2, &a1])
+            .parse::<i64>()
+            .unwrap()
+            > 0
+    );
+
+    // Gossip carries node1's higher-epoch ownership to node2, which then redirects
+    // the key to node1 — convergence with no operator action on node2.
+    let deadline = Instant::now() + Duration::from_secs(6);
+    let converged = loop {
+        let r = c2.cmd(&["GET", &k]);
+        if r.contains("MOVED") && r.contains(&a1) {
+            break true;
+        }
+        if Instant::now() > deadline {
+            break false;
+        }
+        sleep(Duration::from_millis(150));
+    };
+    assert!(converged, "node2 did not adopt node1's topology via gossip");
+
+    let _ = n1.kill();
+    let _ = n1.wait();
+    let _ = n2.kill();
+    let _ = n2.wait();
 }
 
 #[test]

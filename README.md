@@ -162,6 +162,7 @@ Configured entirely through environment variables (minimal config by design):
 | `LOCUS_CLUSTER_ANNOUNCE` | `LOCUS_BIND:PORT` | This node's address in the cluster |
 | `LOCUS_CLUSTER_NODES` | _(self owns all)_ | Topology: `host:port 0-5460;host:port 5461-10922;…` |
 | `LOCUS_CLUSTER_CELL_BITS` | `0` (off) | Cell-in-key spatial sharding: bits of geohash per cell; >0 makes `GEOSEARCH` a bounded scatter (`CLUSTER CELL` gives the tag) |
+| `LOCUS_CLUSTER_GOSSIP_MS` | `1000` | Topology anti-entropy interval — how often a node pulls peers' slot maps to converge on ownership changes |
 
 ### Security & replication in 30 seconds
 
@@ -294,7 +295,10 @@ global result merged by distance), and **cell-in-key spatial sharding** — name
 **bounded** scatter that only consults the shards whose cells the query covers — the Tile38-beating lane.
 Resharding is **live and zero-loss**: `CLUSTER MIGRATESLOT slot dst` copies a slot's keys to another node
 (two-phase — copy-all then commit), and `CLUSTER SETSLOT slot NODE addr` repoints ownership at runtime
-(`CLUSTERDOWN` covers an unowned slot). **Per-shard failover** reuses the built-in sentinel: set
+(`CLUSTERDOWN` covers an unowned slot). Topology changes **converge automatically** — each is stamped with
+an HLC epoch and a background **anti-entropy gossip** (`LOCUS_CLUSTER_GOSSIP_MS`) pulls peers' maps and
+adopts the higher epoch, so a change made on one node reaches the rest without pushing to each. **Per-shard
+failover** reuses the built-in sentinel: set
 `LOCUS_SENTINEL_CLUSTER_NODES` and, when a shard's master dies, the sentinel promotes its replica and
 broadcasts `CLUSTER REASSIGN old new` so the cluster routes the dead master's slots to the successor. And
 the changefeed goes **cross-shard**: every change is stamped with a hybrid logical clock, and `CLUSTER
