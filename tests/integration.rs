@@ -1270,3 +1270,40 @@ fn master_reports_real_replid_and_advancing_offset() {
         sleep(Duration::from_millis(50));
     }
 }
+
+#[test]
+fn replica_reports_link_up_and_its_own_offset() {
+    let master = Server::start();
+    let replica = Server::start();
+    let mut m = master.connect();
+    let mut r = replica.connect();
+    assert_eq!(
+        r.cmd(&["REPLICAOF", "127.0.0.1", &master.port.to_string()]),
+        "OK"
+    );
+    sleep(Duration::from_millis(400));
+    m.cmd(&["SET", "k", "v"]);
+    let field = |info: &str, key: &str| -> String {
+        info.split("\r\n")
+            .find_map(|l| l.strip_prefix(key).and_then(|x| x.strip_prefix(':')))
+            .unwrap_or("")
+            .trim()
+            .to_string()
+    };
+    // The replica reports the link up and its applied offset advancing as it
+    // consumes the master's stream.
+    let deadline = Instant::now() + Duration::from_secs(3);
+    loop {
+        let info = r.cmd(&["INFO"]);
+        let link = field(&info, "master_link_status");
+        let off: u64 = field(&info, "master_repl_offset").parse().unwrap_or(0);
+        if link == "up" && off > 0 {
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "replica link/offset wrong: link={link} off={off}"
+        );
+        sleep(Duration::from_millis(50));
+    }
+}

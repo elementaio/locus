@@ -57,7 +57,9 @@ enum Msg {
     },
     /// Replica received a full-sync snapshot; replace the whole dataset plus the
     /// CDC / secondary-index state carried in the snapshot trailer.
-    ReplaceDb(Box<Db>, Box<rdb::Extras>),
+    ReplaceDb(Box<Db>, Box<rdb::Extras>, String, u64),
+    /// The replica's link to its master dropped (clear master_link_status).
+    MasterLinkDown,
 }
 
 /// Set by the SIGTERM/SIGINT handler so the hub can persist and exit cleanly.
@@ -208,6 +210,7 @@ struct Hub {
     // replication identity + stream position (bytes streamed to replicas).
     replid: String,
     master_repl_offset: u64,
+    master_link_up: bool, // replica side: is the link to our master up?
 }
 
 /// One slow-log entry.
@@ -368,6 +371,7 @@ impl Hub {
             ))[..40]
                 .to_string(),
             master_repl_offset: 0,
+            master_link_up: false,
         };
         hub.apply_extras(extras);
         hub
@@ -809,8 +813,9 @@ impl Hub {
             self.master_repl_offset
         ));
         if let Some((h, p)) = &self.master {
+            let link = if self.master_link_up { "up" } else { "down" };
             s.push_str(&format!(
-                "master_host:{h}\r\nmaster_port:{p}\r\nmaster_link_status:up\r\n"
+                "master_host:{h}\r\nmaster_port:{p}\r\nmaster_link_status:{link}\r\n"
             ));
         }
         s.push_str("# Keyspace\r\n");
@@ -827,6 +832,11 @@ impl Hub {
         }
         let cmd = tokens[0].to_ascii_uppercase();
         self.commands_processed = self.commands_processed.wrapping_add(1);
+        // On a replica, applying the master's stream advances our offset by the
+        // same bytes the master counted (canonical RESP encoding is identical).
+        if id == MASTER_ID {
+            self.master_repl_offset += resp::command(&tokens).len() as u64;
+        }
 
         // Protected mode: if no password is set, refuse non-loopback clients so an
         // accidentally-exposed instance (e.g. the 0.0.0.0 Docker image) isn't wide
@@ -2152,6 +2162,7 @@ impl Hub {
         let host = String::from_utf8_lossy(&tokens[1]).to_string();
         let port = String::from_utf8_lossy(&tokens[2]).to_string();
         self.master = Some((host.clone(), port.clone()));
+        self.master_link_up = false; // until the full sync completes
         let stop = Arc::new(AtomicBool::new(false));
         self.replica_stop = Some(stop.clone());
         let addr = format!("{host}:{port}");
@@ -2373,13 +2384,19 @@ fn run_hub(rx: mpsc::Receiver<Msg>, tx: mpsc::Sender<Msg>) {
                     hub.handle_command(id, tokens);
                 }
             }
-            Ok(Msg::ReplaceDb(db, extras)) => {
+            Ok(Msg::ReplaceDb(db, extras, replid, offset)) => {
                 hub.db = *db;
                 hub.apply_extras(*extras); // CDC offsets/log/groups + rebuilt indexes
+                // Adopt the master's replication id + offset (Redis semantics) so
+                // our INFO and future reconnects line up with the master's stream.
+                hub.replid = replid;
+                hub.master_repl_offset = offset;
+                hub.master_link_up = true;
                 // A replica that just loaded a full-sync snapshot may now be able
                 // to satisfy readers parked on a blocking XREAD.
                 hub.serve_blocked();
             }
+            Ok(Msg::MasterLinkDown) => hub.master_link_up = false,
             Err(mpsc::RecvTimeoutError::Timeout) => {
                 if SHUTDOWN.load(Ordering::Relaxed) {
                     // Drain anything already queued, then persist and exit.
@@ -2408,6 +2425,16 @@ fn run_hub(rx: mpsc::Receiver<Msg>, tx: mpsc::Sender<Msg>) {
 
 // === replica side: connect to a master and apply its stream =================
 
+/// Parse `+FULLRESYNC <replid> <offset>` into (replid, offset). Best-effort.
+fn parse_fullresync(line: &[u8]) -> (String, u64) {
+    let s = String::from_utf8_lossy(line);
+    let mut parts = s.trim_start_matches('+').split_whitespace();
+    let _ = parts.next(); // "FULLRESYNC"
+    let replid = parts.next().unwrap_or("").to_string();
+    let offset = parts.next().and_then(|o| o.parse().ok()).unwrap_or(0);
+    (replid, offset)
+}
+
 fn replica_sync(
     addr: String,
     masterauth: Option<Vec<u8>>,
@@ -2418,6 +2445,7 @@ fn replica_sync(
         if let Err(e) = try_sync(&addr, masterauth.as_deref(), &hub_tx, &stop) {
             log::warn(&format!("replication: link to {addr} dropped: {e}"));
         }
+        let _ = hub_tx.send(Msg::MasterLinkDown);
         // Reconnect after a short delay (a real impl would PSYNC partial-resync).
         for _ in 0..10 {
             if stop.load(Ordering::Relaxed) {
@@ -2461,7 +2489,8 @@ fn try_sync(
     )?;
     read_line(&mut stream)?;
     send_cmd(&mut stream, &[b"PSYNC", b"?", b"-1"])?;
-    read_line(&mut stream)?; // +FULLRESYNC <id> <offset>
+    let resync = read_line(&mut stream)?; // +FULLRESYNC <replid> <offset>
+    let (replid, offset) = parse_fullresync(&resync);
 
     // Full-sync snapshot: $<len>\r\n<bytes>
     let len = read_bulk_header(&mut stream)?;
@@ -2469,7 +2498,12 @@ fn try_sync(
     stream.read_exact(&mut snap)?;
     let (db, extras) = rdb::deserialize_with_extras(&snap)?;
     if hub_tx
-        .send(Msg::ReplaceDb(Box::new(db), Box::new(extras)))
+        .send(Msg::ReplaceDb(
+            Box::new(db),
+            Box::new(extras),
+            replid,
+            offset,
+        ))
         .is_err()
     {
         return Ok(());
