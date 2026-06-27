@@ -34,10 +34,11 @@ $ redis-cli -p 6379 GEOSEARCH fleet FROMLONLAT 55.27 25.2 BYRADIUS 5 km ASC   # 
 > **Status:** pre-1.0, actively hardening toward production. **Done:** AUTH + ACL + protected-mode,
 > durable persistence (crash-tested), the full reactive/geo differentiator set, broad driver/ops
 > compatibility (`SCAN`, `INFO`, `redis_exporter`, RESP3), correct replication (`WAIT`, no expiry
-> divergence, **partial-resync** on reconnect), **automatic failover** (built-in sentinel), and **TLS**
-> (sidecar, or in-process via the optional `tls` feature). **Not yet:** horizontal
-> clustering. The **default build stays 100% dependency-free** — the `tls` feature is the only thing
-> that pulls a crate, and only when you ask. ~10k lines of `std`-only Rust.
+> divergence, **partial-resync** on reconnect), **automatic failover** (built-in sentinel), **TLS**
+> (sidecar, or in-process via the optional `tls` feature), and **horizontal spatial clustering**
+> (cell-in-key sharding, bounded cross-shard `GEOSEARCH`, live resharding, per-shard failover, a global
+> HLC-ordered changefeed). The **default build stays 100% dependency-free** — the `tls` feature is the only
+> thing that pulls a crate, and only when you ask. ~14k lines of `std`-only Rust.
 
 ---
 
@@ -157,6 +158,7 @@ Configured entirely through environment variables (minimal config by design):
 | `LOCUS_MAXMEMORY` | _(unlimited)_ | Soft cap; `kb`/`mb`/`gb` (e.g. `256mb`). Master evicts; `OOM` if still over |
 | `LOCUS_CDC_MAXLEN` | _(off)_ | Retained changefeed log size for `CDCREAD` catch-up / consumer groups |
 | `LOCUS_SLOWLOG_US` | `10000` | Log commands slower than this (µs); `<0` disables |
+| `LOCUS_SLOWLOG_MAXLEN` | `128` | Max entries retained in the `SLOWLOG` ring |
 | `LOCUS_LOGLEVEL` | `info` | `error` / `warn` / `info` / `debug` |
 | `LOCUS_CLUSTER_ENABLED` | `off` | Enable cluster routing (`MOVED`/`CROSSSLOT`) |
 | `LOCUS_CLUSTER_ANNOUNCE` | `LOCUS_BIND:PORT` | This node's address in the cluster |
@@ -287,8 +289,8 @@ push), with correct replication (real offsets, `WAIT`, partial-resync, no expiry
 **automatic failover** (built-in sentinel) — plus the reactive/geo differentiator set, now with a
 **geohash-indexed `GEOSEARCH` + `WHERE` filters**, ordered-index sorted sets, and a CRC16 routing seam.
 
-**In progress — the last milestone:** horizontal **spatial clustering** (P6), Locus's flagship lane.
-Landed so far: **static hash-slot routing** (`MOVED`/`CROSSSLOT`, `CLUSTER SLOTS/NODES/KEYSLOT`), the
+**Shipped — the flagship milestone:** horizontal **spatial clustering** (P6), Locus's flagship lane.
+It includes: **static hash-slot routing** (`MOVED`/`CROSSSLOT`, `CLUSTER SLOTS/NODES/KEYSLOT`), the
 **inter-node transport** layer (cluster-wide `DBSIZE`), **cross-shard scatter-gather `GEOSEARCH`** (one
 global result merged by distance), and **cell-in-key spatial sharding** — name geo keys `{cell}id`
 (`cell` from `CLUSTER CELL lon lat`) so a region co-locates on one shard, and `GEOSEARCH` becomes a

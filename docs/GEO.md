@@ -63,8 +63,8 @@ redis-cli GEOSET driver:7 30 30             # moves out      -> cdc-change del  
   52-bit interleaved cell id held in a `BTreeMap`, so `GEOSEARCH` range-scans only the handful of cells
   covering the query box and then refines those candidates by true haversine distance. This makes the
   common case (small radius) **sub-linear** instead of scanning every geo key. A box that straddles a pole
-  or the ±180° meridian safely falls back to a full scan. The 52-bit cell id is also the future shard key
-  for spatial clustering. *(A finer S2-cell / R-tree index is the next step; combined attribute filters
+  or the ±180° meridian safely falls back to a full scan. The 52-bit cell id is also the shard key for
+  spatial clustering (cell-in-key sharding). *(A finer S2-cell / R-tree index is a later refinement; combined attribute filters
   are implemented — see `WHERE`; the query interface won't change.)*
 - **Attribute filter (`WHERE`):** evaluated on each spatial candidate after the shape test, so it composes
   with the index for free. Attributes are stored inline on the point (`Vec` of pairs — geo objects are

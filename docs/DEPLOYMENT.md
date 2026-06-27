@@ -5,10 +5,11 @@ This guide covers running Locus safely outside a trusted laptop: **network expos
 failover.** Locus is a single static binary configured entirely through environment
 variables, so most of this is wiring, not code.
 
-> **Scope.** Locus today is a hardened **single node** with master/replica
-> replication. It does *not* yet do automatic failover or horizontal clustering
-> (see [ROADMAP.md](ROADMAP.md)). Plan your topology accordingly: one writable
-> master, optional read replicas, and an external supervisor for promotion.
+> **Scope.** Locus runs as a single hardened node, as a master with replicas and
+> **automatic failover** (built-in sentinel, §6), or as a **horizontal cluster**
+> with spatial sharding (§7). Pick the topology that fits: one node to start,
+> master/replica + sentinel for HA, or a multi-shard cluster for scale and
+> locality.
 
 ---
 
@@ -270,7 +271,41 @@ replica already holds the data). Run one sentinel set per shard.
 
 To avoid split-brain, ensure the old master cannot keep taking writes after it's
 declared dead (fence it at the network/orchestrator layer before promoting).
-Horizontal clustering is on the roadmap.
+
+## 7. Clustering (horizontal spatial sharding)
+
+Turn on cluster mode and give every node the same slot topology. Each node owns a
+contiguous slot range; clients reach any node and follow `MOVED` to the owner (any
+cluster-aware Redis client does this automatically).
+
+```bash
+# node A (run B symmetrically, swapping ANNOUNCE/PORT)
+LOCUS_CLUSTER_ENABLED=1 \
+LOCUS_CLUSTER_ANNOUNCE=10.0.0.1:6379 \
+LOCUS_CLUSTER_NODES="10.0.0.1:6379 0-8191;10.0.0.2:6379 8192-16383" \
+  locus
+```
+
+- **Keys** route by CRC16 hash slot, honoring a `{hashtag}` (so related keys
+  co-locate). Multi-key ops across slots return `CROSSSLOT`; a slot no node owns
+  returns `CLUSTERDOWN`.
+- **Spatial locality (the point of it).** Set `LOCUS_CLUSTER_CELL_BITS=N` and name
+  geo keys `{cell}id`, where `cell = CLUSTER CELL <lon> <lat>`. A region then
+  co-locates on one shard and `GEOSEARCH` becomes a **bounded** scatter that only
+  queries the shards whose cells the query covers (instead of all of them).
+- **Resharding, live and zero-loss.** `CLUSTER MIGRATESLOT <slot> <dst>` copies a
+  slot's keys to another node then hands it ownership; `CLUSTER SETSLOT <slot> NODE
+  <addr>` repoints ownership directly. Both are HLC-epoch-stamped and **gossip to
+  the other nodes automatically** (`LOCUS_CLUSTER_GOSSIP_MS`, default 1s) — no need
+  to run them everywhere by hand.
+- **Per-shard failover.** Run a sentinel per shard with
+  `LOCUS_SENTINEL_CLUSTER_NODES` set; on a master's death it promotes the shard's
+  replica and broadcasts `CLUSTER REASSIGN` so the slots follow (see §6).
+- **Global changefeed.** `CLUSTER CDCMERGE <since-hlc>` merges every shard's
+  changefeed into one HLC-ordered stream (see [CHANGEFEED.md](CHANGEFEED.md)).
+
+Each shard is itself a master (+ optional replicas + sentinel), so combine this
+with §6 for an HA cluster. Replication runs per shard, not cluster-wide.
 
 ---
 

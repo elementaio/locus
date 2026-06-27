@@ -1,8 +1,8 @@
 # Architecture
 
 Locus is small on purpose. This document explains how it's put together and the design choices behind
-it. The whole server is ~8k lines of `std`-only Rust across 9 modules — a Redis-compatible core plus a
-reactive/geo differentiator layer, all on one single-threaded hub.
+it. The whole server is ~14k lines of `std`-only Rust across 15 modules — a Redis-compatible core, a
+reactive/geo differentiator layer, and a spatial-clustering layer, all on one single-threaded hub.
 
 ## Design philosophy
 
@@ -61,9 +61,15 @@ feel why the single-owner model is cleaner.
 | `streams` | The stream type and its commands (XADD/XRANGE/XREAD). |
 | `sketch` | Probabilistic sketches: Bloom, Count-Min, Top-K, t-digest. |
 | `pubsub` | The publish/subscribe registry, glob matching, and message encoders. |
-| `rdb` | Binary snapshot serialization (save/load + in-memory serialize for replication). |
+| `rdb` | Binary snapshot serialization (save/load + in-memory serialize for replication; per-entry dump/restore for slot migration). |
 | `aof` | The append-only log: append, replay, rewrite, and command rewriting for determinism. |
-| `main` | The hub, the connection threads, replication, the changefeed, and secondary indexes. |
+| `geohash` | 52-bit interleaved geohash: point encode, box→cell ranges (spatial index), and the cluster cell id (cell-in-key sharding). |
+| `hlc` | Hybrid logical clock: the monotonic stamp for changefeed records and slot-ownership epochs (cross-shard ordering). |
+| `acl` | Users, classes, and key-prefix rules (vendored SHA-256) layered over `requirepass`. |
+| `sentinel` | Failover monitor mode: health checks, quorum/inter-sentinel agreement, promotion, and cluster slot reassignment. |
+| `tls` | Optional (`tls` feature) in-process TLS via rustls; the default build never compiles it. |
+| `log` | The std-only timestamped leveled logger. |
+| `main` | The hub, the connection threads, replication, the changefeed, secondary indexes, and the cluster layer (routing, scatter-gather, gossip). |
 
 ## Values and expiry
 
@@ -148,10 +154,12 @@ offsets. Full details in [CHANGEFEED.md](CHANGEFEED.md).
 
 ## Geo
 
-A geo object is its own key holding a `Geo(lon, lat)` value; the keyspace maintains a set of geo keys as
-the `GEOSEARCH` candidate set. Search filters candidates by true haversine distance (a real S2/R-tree
-index is the documented next phase; the interface won't change). Because geo writes flow through the
-changefeed like any other, a *region* filter yields live geofencing. See [GEO.md](GEO.md).
+A geo object is its own key holding a `Geo(lon, lat, attrs)` value. The keyspace keeps a **geohash
+spatial index** — a `BTreeMap<u64 cell, keys>` over 52-bit interleaved geohash cells — so `GEOSEARCH`
+range-scans only the handful of cells covering the query box (sub-linear) and then refines by true
+haversine distance, with optional `WHERE` attribute filters. Because geo writes flow through the
+changefeed like any other, a *region* filter yields live geofencing. The same cell id is the cluster
+shard key (see Clustering). See [GEO.md](GEO.md).
 
 ## Sketches
 
@@ -174,3 +182,34 @@ In-memory (rebuilt by `IDXCREATE` after a restart).
 `CAS`/`CADEL`/`SETMAX`/`INCRCAP` are atomic check-and-write: because the check and the write happen in
 one hub turn, there's no race and no need for `WATCH`/Lua. They log their concrete *effect* to the AOF
 (`SET`/`DEL`) so replay and replication stay deterministic.
+
+## Clustering (horizontal spatial sharding)
+
+Cluster mode adds a layer *around* the hub, never inside it — the hub stays single-threaded and
+oblivious. A `Cluster` struct holds a 16384-slot `owner` map (from `LOCUS_CLUSTER_NODES`) plus a per-slot
+HLC `epoch`.
+
+- **Routing.** Before executing a key command, the hub maps its keys to a CRC16 slot (honoring
+  `{hashtag}`) and returns `MOVED`/`CROSSSLOT`/`CLUSTERDOWN` if it isn't the owner. Cluster-aware clients
+  follow the redirect — no proxy.
+- **Spatial sharding.** With `cell_bits` set, geo keys carry their geohash cell as the hashtag, so a
+  region co-locates on one shard. `GEOSEARCH` computes the cells its box covers, maps them to owners, and
+  **scatters only to those shards** (bounded fan-out); without cell mode it scatters to all and merges.
+- **Inter-node transport.** A tiny RESP client (`cluster_call_int`/`_array`) with short timeouts talks to
+  peers. Scatter is **parallelized** (one short-lived thread per peer, joined within ~one timeout) so a
+  slow shard can't stall the hub for `peers × timeout`; replies stay synchronous, so connection ordering
+  is preserved. Internal verbs `GEOSEARCHSHARD`, `XCDCSINCE`, `XRESTORE`, `XDBSIZE` serve these.
+- **Live resharding.** `MIGRATESLOT` dumps a slot's keys (`rdb::dump_entry`) to the destination
+  (`XRESTORE`) in a two-phase copy-then-commit, so a key never exists nowhere. `SETSLOT`/`REASSIGN`
+  repoint ownership directly.
+- **Convergence.** Each ownership change bumps the slot's HLC epoch; a background gossip thread pulls
+  peers' `CLUSTER GOSSIP` maps and adopts higher-epoch entries (last-writer-wins), so changes propagate
+  without touching every node. The sentinel's `REASSIGN` broadcast gives fast failover; gossip is the
+  backstop.
+- **Cross-shard changefeed.** Every change gets an HLC stamp (the hub's one ordered point makes it
+  monotonic). `CLUSTER CDCMERGE` merges all shards' feeds in HLC order up to a watermark — the min HLC
+  floor across reachable shards — which bounds staleness; a previously-seen shard that goes down holds the
+  watermark so order is never violated.
+
+What's intentionally *not* here: gossip-based membership/consensus (Raft) — topology comes from config +
+epoch anti-entropy, keeping the zero-dependency, no-consensus stance.
