@@ -1,5 +1,5 @@
 {
-  "name": "locusdb-client",
+  "name": "locusdb",
   "version": "0.1.0",
   "description": "Node.js client for Locus — typed access to the differentiator verbs (geo, sketches, CAS, secondary index) plus the reactive changefeed and live geofencing that a plain Redis driver can't surface.",
   "keywords": ["locus", "locusdb", "redis", "changefeed", "cdc", "geo", "geofence"],

@@ -1,4 +1,4 @@
-# locusdb-client
+# locusdb
 
 The Node.js client for [Locus](https://github.com/intenttext/locus). Any Redis
 driver works against Locus for standard commands — this package adds the two
@@ -16,13 +16,13 @@ It wraps `ioredis` (exposed as `.redis`) — it does not reimplement RESP.
 ## Install
 
 ```bash
-npm install locusdb-client ioredis
+npm install locusdb ioredis
 ```
 
 ## Use
 
 ```ts
-import { LocusClient } from "locusdb-client";
+import { LocusClient } from "locusdb";
 
 const locus = new LocusClient({ host: "127.0.0.1", port: 6379 });
 

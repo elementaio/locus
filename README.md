@@ -99,7 +99,7 @@ $ redis-cli -p 6379 GEOSEARCH fleet FROMLONLAT 55.27 25.2 BYRADIUS 5 km ASC   # 
 
 **Zero dependencies.** Pure `std`; one small static binary; reproducible builds.
 
-For **Node**, the [`locusdb-client`](clients/node) wrapper adds typed verbs and the reactive
+For **Node**, the [`locusdb`](clients/node) npm client adds typed verbs and the reactive
 changefeed/geofence as events (`feed.on('change', …)`, `fence.on('enter', …)`) — the push API a stock
 driver can't surface. See [docs/COMMANDS.md](docs/COMMANDS.md) for the full reference,
 [docs/CLIENTS.md](docs/CLIENTS.md) for driving Locus from Node/Python (any Redis client works), the guides above for the differentiators,

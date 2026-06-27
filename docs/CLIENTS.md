@@ -146,17 +146,17 @@ while True:
 ```
 
 In Node, ioredis doesn't surface a per-frame reader for custom push commands, so use the official
-**[`locusdb-client`](../clients/node)** wrapper (below), which owns the dedicated connection and emits
+**[`locusdb`](../clients/node)** npm client (below), which owns the dedicated connection and emits
 events. (Or drop to a raw `net.Socket` with a small RESP reader, or prefer the **pull** model.)
 
-## Node SDK — `locusdb-client`
+## Node SDK — `locusdb`
 
 A thin wrapper over ioredis that adds typed helpers for the differentiator verbs and the reactive
-**changefeed / geofence** as events — the one thing a stock driver can't do. `npm install locusdb-client
+**changefeed / geofence** as events — the one thing a stock driver can't do. `npm install locusdb
 ioredis`:
 
 ```js
-import { LocusClient } from 'locusdb-client';
+import { LocusClient } from 'locusdb';
 const locus = new LocusClient({ host: '127.0.0.1', port: 6379 });
 
 await locus.geoSet('driver:7', 13.36, 38.11, { status: 'free' });
