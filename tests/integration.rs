@@ -1563,6 +1563,120 @@ fn two_sentinels_agree_and_promote_exactly_once() {
     );
 }
 
+// === partial resync (PSYNC CONTINUE) =========================================
+
+fn send_resp(s: &mut TcpStream, args: &[&[u8]]) {
+    let mut out = format!("*{}\r\n", args.len()).into_bytes();
+    for a in args {
+        out.extend_from_slice(format!("${}\r\n", a.len()).as_bytes());
+        out.extend_from_slice(a);
+        out.extend_from_slice(b"\r\n");
+    }
+    s.write_all(&out).unwrap();
+}
+
+fn read_line_raw(s: &mut TcpStream) -> Vec<u8> {
+    let mut line = Vec::new();
+    let mut b = [0u8; 1];
+    loop {
+        s.read_exact(&mut b).unwrap();
+        if b[0] == b'\n' {
+            if line.last() == Some(&b'\r') {
+                line.pop();
+            }
+            return line;
+        }
+        line.push(b[0]);
+    }
+}
+
+/// Read one RESP array-of-bulks command from the replication stream, returning
+/// (args, bytes_consumed) — bytes_consumed matches the master's offset accounting.
+fn read_command_raw(s: &mut TcpStream) -> (Vec<Vec<u8>>, usize) {
+    let mut consumed = 0;
+    let hdr = read_line_raw(s);
+    consumed += hdr.len() + 2; // + CRLF
+    assert_eq!(hdr.first(), Some(&b'*'), "expected array, got {hdr:?}");
+    let n: usize = std::str::from_utf8(&hdr[1..]).unwrap().parse().unwrap();
+    let mut args = Vec::new();
+    for _ in 0..n {
+        let lh = read_line_raw(s);
+        consumed += lh.len() + 2;
+        assert_eq!(lh.first(), Some(&b'$'));
+        let l: usize = std::str::from_utf8(&lh[1..]).unwrap().parse().unwrap();
+        let mut buf = vec![0u8; l + 2];
+        s.read_exact(&mut buf).unwrap();
+        consumed += l + 2;
+        args.push(buf[..l].to_vec());
+    }
+    (args, consumed)
+}
+
+/// Connect as a replica and full-sync; returns (stream, replid, offset).
+fn replica_full_sync(port: u16) -> (TcpStream, String, u64) {
+    let mut s = TcpStream::connect(("127.0.0.1", port)).unwrap();
+    s.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+    send_resp(&mut s, &[b"PSYNC", b"?", b"-1"]);
+    let line = read_line_raw(&mut s); // +FULLRESYNC <replid> <offset>
+    let text = String::from_utf8_lossy(&line);
+    let mut parts = text.trim_start_matches('+').split_whitespace();
+    assert_eq!(parts.next(), Some("FULLRESYNC"));
+    let replid = parts.next().unwrap().to_string();
+    let offset: u64 = parts.next().unwrap().parse().unwrap();
+    // Snapshot bulk: $<len>\r\n<len bytes> (no trailing CRLF).
+    let hdr = read_line_raw(&mut s);
+    assert_eq!(hdr.first(), Some(&b'$'));
+    let len: usize = std::str::from_utf8(&hdr[1..]).unwrap().parse().unwrap();
+    let mut snap = vec![0u8; len];
+    s.read_exact(&mut snap).unwrap();
+    (s, replid, offset)
+}
+
+#[test]
+fn replica_partial_resync_after_reconnect() {
+    let server = Server::start();
+    let mut writer = server.connect();
+
+    // Attach as a replica and full-sync (this activates the backlog).
+    let (mut repl, replid, off0) = replica_full_sync(server.port);
+
+    // A write streams to us; track our processed offset.
+    assert_eq!(writer.cmd(&["SET", "a", "1"]), "OK");
+    let (cmd1, n1) = read_command_raw(&mut repl);
+    assert_eq!(cmd1[0], b"SET");
+    let my_offset = off0 + n1 as u64;
+
+    // Drop the link, but the master keeps the offset + backlog advancing.
+    drop(repl);
+    assert_eq!(writer.cmd(&["SET", "b", "2"]), "OK"); // missed while "disconnected"
+    sleep(Duration::from_millis(100));
+
+    // Reconnect with our last offset -> partial resync, no full snapshot.
+    let mut repl2 = TcpStream::connect(("127.0.0.1", server.port)).unwrap();
+    repl2
+        .set_read_timeout(Some(Duration::from_secs(5)))
+        .unwrap();
+    send_resp(
+        &mut repl2,
+        &[
+            b"PSYNC",
+            replid.as_bytes(),
+            my_offset.to_string().as_bytes(),
+        ],
+    );
+    let line = read_line_raw(&mut repl2);
+    assert!(
+        line.starts_with(b"+CONTINUE"),
+        "expected +CONTINUE, got {:?}",
+        String::from_utf8_lossy(&line)
+    );
+    // The write we missed is delivered from the backlog — nothing lost.
+    let (buffered, _) = read_command_raw(&mut repl2);
+    assert_eq!(buffered[0], b"SET");
+    assert_eq!(buffered[1], b"b");
+    assert_eq!(buffered[2], b"2");
+}
+
 // === native TLS (only built/run under `cargo test --features tls`) ===========
 
 #[cfg(feature = "tls")]

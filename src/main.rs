@@ -41,6 +41,10 @@ use resp::{Parsed, parse_command};
 /// Reserved client id for commands replicated from a master.
 const MASTER_ID: u64 = 0;
 
+/// Cap on the replication backlog ring (bytes). A replica that fell further behind
+/// than this must take a full resync. ~4 MiB mirrors Redis's repl-backlog-size.
+const REPL_BACKLOG_MAX: usize = 4 * 1024 * 1024;
+
 /// Returned to a non-loopback client when protected mode is active (no password
 /// set). Mirrors Redis's protected-mode guidance.
 const PROTECTED_MODE_MSG: &str = "DENIED Locus is running in protected mode because protected mode is enabled and no password is set. To use Locus from a non-loopback address, set a password (LOCUS_REQUIREPASS / requirepass), or disable protected mode with LOCUS_PROTECTED_MODE=no — only on a trusted network or behind TLS.";
@@ -279,6 +283,12 @@ struct Hub {
     replid: String,
     master_repl_offset: u64,
     master_link_up: bool, // replica side: is the link to our master up?
+    // master side: a ring of the recent replication stream so a briefly-dropped
+    // replica can PSYNC partial-resync (CONTINUE) instead of a full snapshot.
+    // Invariant: repl_backlog_start + repl_backlog.len() == master_repl_offset.
+    repl_backlog: VecDeque<u8>,
+    repl_backlog_start: u64,
+    repl_active: bool, // a replica has attached -> keep offset+backlog advancing through gaps
     // master side: each replica's last-acked offset + clients parked on WAIT.
     replica_acks: HashMap<u64, u64>,
     waiting: Vec<WaitReq>,
@@ -452,6 +462,9 @@ impl Hub {
                 .to_string(),
             master_repl_offset: 0,
             master_link_up: false,
+            repl_backlog: VecDeque::new(),
+            repl_backlog_start: 0,
+            repl_active: false,
             replica_acks: HashMap::new(),
             waiting: Vec::new(),
         };
@@ -1202,24 +1215,62 @@ impl Hub {
             }
             b"WAIT" => self.handle_wait(id, &tokens),
             b"PSYNC" | b"SYNC" => {
-                self.send(
-                    id,
-                    format!(
-                        "+FULLRESYNC {} {}\r\n",
-                        self.replid, self.master_repl_offset
-                    )
-                    .into_bytes(),
-                );
-                let mut snap = rdb::serialize(&self.db);
-                rdb::append_extras(&mut snap, &self.build_extras());
-                let mut bulk = format!("${}\r\n", snap.len()).into_bytes();
-                bulk.extend_from_slice(&snap);
-                self.send(id, bulk);
-                self.replicas.insert(id);
-                log::info(&format!(
-                    "replication: replica {id} attached ({} byte snapshot)",
-                    snap.len()
-                ));
+                // PSYNC <replid> <offset>: a partial resync is possible iff the
+                // replid matches ours and the requested offset is still covered by
+                // the backlog. Otherwise fall back to a full snapshot.
+                let req_off = tokens
+                    .get(2)
+                    .and_then(|t| std::str::from_utf8(t).ok())
+                    .and_then(|s| s.trim().parse::<u64>().ok());
+                let replid_ok = tokens
+                    .get(1)
+                    .is_some_and(|r| r.as_slice() == self.replid.as_bytes());
+                let can_continue = self.repl_active
+                    && replid_ok
+                    && req_off.is_some_and(|o| {
+                        o >= self.repl_backlog_start && o <= self.master_repl_offset
+                    });
+
+                if can_continue {
+                    let off = req_off.unwrap();
+                    let from = (off - self.repl_backlog_start) as usize;
+                    let tail: Vec<u8> = self.repl_backlog.iter().skip(from).copied().collect();
+                    self.send(id, format!("+CONTINUE {}\r\n", self.replid).into_bytes());
+                    if !tail.is_empty() {
+                        self.send(id, tail);
+                    }
+                    self.replicas.insert(id);
+                    self.replica_acks.insert(id, off);
+                    log::info(&format!(
+                        "replication: replica {id} partial resync from offset {off} (+{} buffered bytes)",
+                        self.master_repl_offset - off
+                    ));
+                } else {
+                    self.send(
+                        id,
+                        format!(
+                            "+FULLRESYNC {} {}\r\n",
+                            self.replid, self.master_repl_offset
+                        )
+                        .into_bytes(),
+                    );
+                    let mut snap = rdb::serialize(&self.db);
+                    rdb::append_extras(&mut snap, &self.build_extras());
+                    let mut bulk = format!("${}\r\n", snap.len()).into_bytes();
+                    bulk.extend_from_slice(&snap);
+                    self.send(id, bulk);
+                    self.replicas.insert(id);
+                    self.replica_acks.insert(id, self.master_repl_offset);
+                    // Activate the backlog at the current offset on the first attach.
+                    if !self.repl_active {
+                        self.repl_active = true;
+                        self.repl_backlog_start = self.master_repl_offset;
+                    }
+                    log::info(&format!(
+                        "replication: replica {id} full resync ({} byte snapshot)",
+                        snap.len()
+                    ));
+                }
             }
             b"REPLICAOF" | b"SLAVEOF" => self.handle_replicaof(id, &tokens),
             b"INFO" => self.send(id, self.render_info()),
@@ -2289,13 +2340,21 @@ impl Hub {
         self.replicate(resp::command(tokens));
     }
 
-    /// Stream one already-encoded command to every replica and advance the
-    /// replication offset (the running byte position in the write stream).
+    /// Stream one already-encoded command to every replica, append it to the
+    /// backlog, and advance the replication offset (the running byte position in
+    /// the write stream). Once a replica has ever attached (`repl_active`) we keep
+    /// advancing + buffering even with no replica currently connected, so a
+    /// reconnecting replica's offset still reflects what it missed.
     fn replicate(&mut self, bytes: Vec<u8>) {
-        if self.replicas.is_empty() {
-            return;
+        if !self.repl_active {
+            return; // replication never started; nothing to track yet
         }
         self.master_repl_offset += bytes.len() as u64;
+        self.repl_backlog.extend(bytes.iter().copied());
+        while self.repl_backlog.len() > REPL_BACKLOG_MAX {
+            self.repl_backlog.pop_front();
+            self.repl_backlog_start += 1;
+        }
         for rid in self.replicas.iter() {
             if let Some(out) = self.clients.get(rid) {
                 let _ = out.send(bytes.clone());
@@ -2637,12 +2696,16 @@ fn replica_sync(
     hub_tx: mpsc::Sender<Msg>,
     stop: Arc<AtomicBool>,
 ) {
+    // Remembered (replid, processed-offset) so a reconnect can PSYNC for a partial
+    // resync (CONTINUE) instead of pulling a full snapshot again.
+    let mut known: Option<(String, u64)> = None;
     while !stop.load(Ordering::Relaxed) {
-        if let Err(e) = try_sync(&addr, masterauth.as_deref(), &hub_tx, &stop) {
+        if let Err(e) = try_sync(&addr, masterauth.as_deref(), &hub_tx, &stop, &mut known) {
             log::warn(&format!("replication: link to {addr} dropped: {e}"));
         }
         let _ = hub_tx.send(Msg::MasterLinkDown);
-        // Reconnect after a short delay (a real impl would PSYNC partial-resync).
+        // Reconnect after a short delay; the next try_sync will attempt a partial
+        // resync using `known`.
         for _ in 0..10 {
             if stop.load(Ordering::Relaxed) {
                 return;
@@ -2657,6 +2720,7 @@ fn try_sync(
     masterauth: Option<&[u8]>,
     hub_tx: &mpsc::Sender<Msg>,
     stop: &Arc<AtomicBool>,
+    known: &mut Option<(String, u64)>,
 ) -> io::Result<()> {
     let mut stream = TcpStream::connect(addr)?;
     // Bound the handshake + snapshot reads so a master that accepts the TCP
@@ -2684,34 +2748,63 @@ fn try_sync(
         &[b"REPLCONF", b"listening-port", myport.as_bytes()],
     )?;
     read_line(&mut stream)?;
-    send_cmd(&mut stream, &[b"PSYNC", b"?", b"-1"])?;
-    let resync = read_line(&mut stream)?; // +FULLRESYNC <replid> <offset>
-    let (replid, offset) = parse_fullresync(&resync);
-
-    // Full-sync snapshot: $<len>\r\n<bytes>
-    let len = read_bulk_header(&mut stream)?;
-    let mut snap = vec![0u8; len];
-    stream.read_exact(&mut snap)?;
-    let (db, extras) = rdb::deserialize_with_extras(&snap)?;
-    if hub_tx
-        .send(Msg::ReplaceDb(
-            Box::new(db),
-            Box::new(extras),
-            replid,
-            offset,
-        ))
-        .is_err()
-    {
-        return Ok(());
+    // Request a partial resync when we have prior state, else a full resync.
+    match known.as_ref() {
+        Some((rid, off)) => send_cmd(
+            &mut stream,
+            &[b"PSYNC", rid.as_bytes(), off.to_string().as_bytes()],
+        )?,
+        None => send_cmd(&mut stream, &[b"PSYNC", b"?", b"-1"])?,
     }
-    log::info(&format!("replication: full sync complete ({len} bytes)"));
+    let resync = read_line(&mut stream)?; // +FULLRESYNC <id> <off> | +CONTINUE <id>
+    let session_replid: String;
+    let mut applied: u64;
+    if resync.starts_with(b"+CONTINUE") {
+        // Partial resync: keep our dataset; the master streams only what we missed.
+        let line = String::from_utf8_lossy(&resync);
+        let cont_id = line
+            .trim_start_matches('+')
+            .split_whitespace()
+            .nth(1)
+            .unwrap_or("");
+        session_replid = if cont_id.is_empty() {
+            known.as_ref().map(|(r, _)| r.clone()).unwrap_or_default()
+        } else {
+            cont_id.to_string()
+        };
+        applied = known.as_ref().map(|(_, o)| *o).unwrap_or(0);
+        log::info(&format!(
+            "replication: partial resync (CONTINUE) at offset {applied}"
+        ));
+    } else {
+        // Full resync: replace the whole dataset from the snapshot.
+        let (replid, offset) = parse_fullresync(&resync);
+        let len = read_bulk_header(&mut stream)?;
+        let mut snap = vec![0u8; len];
+        stream.read_exact(&mut snap)?;
+        let (db, extras) = rdb::deserialize_with_extras(&snap)?;
+        if hub_tx
+            .send(Msg::ReplaceDb(
+                Box::new(db),
+                Box::new(extras),
+                replid.clone(),
+                offset,
+            ))
+            .is_err()
+        {
+            return Ok(());
+        }
+        session_replid = replid;
+        applied = offset;
+        log::info(&format!("replication: full sync complete ({len} bytes)"));
+    }
+    *known = Some((session_replid.clone(), applied));
 
     // Stream and apply the master's writes. The read timeout lets us notice a
     // stop request even when the master is idle.
     stream.set_read_timeout(Some(Duration::from_millis(200)))?;
     let mut inbuf: Vec<u8> = Vec::new();
     let mut chunk = [0u8; 4096];
-    let mut applied = offset; // our processed offset, seeded from FULLRESYNC
     loop {
         if stop.load(Ordering::Relaxed) {
             return Ok(());
@@ -2740,6 +2833,7 @@ fn try_sync(
                         Parsed::Error(_) => return Ok(()),
                     }
                 }
+                *known = Some((session_replid.clone(), applied));
                 let off = applied.to_string();
                 let _ = send_cmd(&mut stream, &[b"REPLCONF", b"ACK", off.as_bytes()]);
             }

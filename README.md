@@ -34,8 +34,8 @@ $ redis-cli -p 6379 GEOSEARCH fleet FROMLONLAT 55.27 25.2 BYRADIUS 5 km ASC   # 
 > **Status:** pre-1.0, actively hardening toward production. **Done:** AUTH + ACL + protected-mode,
 > durable persistence (crash-tested), the full reactive/geo differentiator set, broad driver/ops
 > compatibility (`SCAN`, `INFO`, `redis_exporter`, RESP3), correct replication (`WAIT`, no expiry
-> divergence), **automatic failover** (built-in sentinel), and **TLS** (sidecar, or in-process via the
-> optional `tls` feature). **Maturing:** replication's partial-resync. **Not yet:** horizontal
+> divergence, **partial-resync** on reconnect), **automatic failover** (built-in sentinel), and **TLS**
+> (sidecar, or in-process via the optional `tls` feature). **Not yet:** horizontal
 > clustering. The **default build stays 100% dependency-free** — the `tls` feature is the only thing
 > that pulls a crate, and only when you ask. ~10k lines of `std`-only Rust.
 
@@ -75,10 +75,13 @@ $ redis-cli -p 6379 GEOSEARCH fleet FROMLONLAT 55.27 25.2 BYRADIUS 5 km ASC   # 
 
 - `REPLICAOF` master/replica: full-sync snapshot + live command streaming, read-only replicas, real
   replication IDs + offsets, authenticated links (`masterauth`), and **`WAIT`** for ack-based
-  durability. Expiry is master-authoritative, so replicas never diverge on timing.
+  durability. Expiry is master-authoritative, so replicas never diverge on timing. A briefly-dropped
+  replica reconnects with a **partial resync** (`PSYNC` `CONTINUE` over a backlog ring) — no full
+  snapshot when it only missed a little.
 - **Automatic failover:** the same binary runs as a built-in **sentinel** (`LOCUS_SENTINEL`) that
   promotes the most up-to-date replica when the master dies and repoints the rest — no external
-  orchestrator. See [High availability](#high-availability--automatic-failover).
+  orchestrator; run several sentinels for quorum-based agreement. See
+  [High availability](#high-availability--automatic-failover).
 
 **Reactive + geo differentiators**
 
@@ -275,9 +278,8 @@ sharding** (each shard its own single-threaded hub), on the roadmap rather than 
 replication (real offsets, `WAIT`, no expiry divergence) and **automatic failover** (built-in sentinel)
 — plus the full reactive/geo differentiator set.
 
-**Next:** PSYNC partial-resync; inter-sentinel quorum (multi-sentinel agreement); a real S2/R-tree geo
-index with combined attribute filters; and the horizontal **spatial clustering** that nobody in the
-in-memory-geo space has packaged simply — Locus's flagship lane.
+**Next:** a real S2/R-tree geo index with combined attribute filters; and the horizontal **spatial
+clustering** that nobody in the in-memory-geo space has packaged simply — Locus's flagship lane.
 
 **Explicit non-goals:** scripting/`EVAL`, an embedded HTTP `/metrics` endpoint (`INFO` + `redis_exporter`
 instead), and active-active replication.
