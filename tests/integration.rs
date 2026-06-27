@@ -1327,3 +1327,76 @@ fn wait_counts_replicas_that_acked() {
     // Asking for more replicas than exist times out and returns the real count.
     assert_eq!(m.cmd(&["WAIT", "5", "300"]), "1");
 }
+
+fn role(c: &mut Conn) -> String {
+    c.cmd(&["INFO"])
+        .split("\r\n")
+        .find_map(|l| l.strip_prefix("role:"))
+        .unwrap_or("")
+        .trim()
+        .to_string()
+}
+
+#[test]
+fn sentinel_promotes_replica_and_repoints_on_master_death() {
+    let master = Server::start();
+    let r1 = Server::start();
+    let r2 = Server::start();
+    let mport = master.port;
+    r1.connect()
+        .cmd(&["REPLICAOF", "127.0.0.1", &mport.to_string()]);
+    r2.connect()
+        .cmd(&["REPLICAOF", "127.0.0.1", &mport.to_string()]);
+    sleep(Duration::from_millis(500)); // initial sync
+    master.connect().cmd(&["SET", "k", "v"]);
+    sleep(Duration::from_millis(400)); // replicas apply + ack offsets
+
+    // Run the same binary as a sentinel monitoring the master + both replicas.
+    let mut sentinel = Command::new(env!("CARGO_BIN_EXE_locus"))
+        .env("LOCUS_SENTINEL", format!("127.0.0.1:{mport}"))
+        .env(
+            "LOCUS_SENTINEL_REPLICAS",
+            format!("127.0.0.1:{},127.0.0.1:{}", r1.port, r2.port),
+        )
+        .env("LOCUS_SENTINEL_DOWN_AFTER_MS", "700")
+        .env("LOCUS_SENTINEL_INTERVAL_MS", "200")
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .expect("spawn sentinel");
+
+    drop(master); // kill the master
+
+    // A replica is promoted to master; the other is repointed to it and resyncs.
+    let deadline = Instant::now() + Duration::from_secs(12);
+    let (newm, follower) = loop {
+        if role(&mut r1.connect()) == "master" {
+            break (&r1, &r2);
+        }
+        if role(&mut r2.connect()) == "master" {
+            break (&r2, &r1);
+        }
+        assert!(
+            Instant::now() < deadline,
+            "sentinel did not promote a replica"
+        );
+        sleep(Duration::from_millis(200));
+    };
+    // A write to the new master must reach the repointed follower.
+    newm.connect().cmd(&["SET", "after", "failover"]);
+    let propagated = loop {
+        if follower.connect().cmd(&["GET", "after"]) == "failover" {
+            break true;
+        }
+        if Instant::now() > deadline {
+            break false;
+        }
+        sleep(Duration::from_millis(200));
+    };
+    let _ = sentinel.kill();
+    let _ = sentinel.wait();
+    assert!(
+        propagated,
+        "follower was not repointed to / synced from the new master"
+    );
+}

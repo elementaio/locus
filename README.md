@@ -32,10 +32,11 @@ $ redis-cli -p 6379 GEOSEARCH fleet FROMLONLAT 55.27 25.2 BYRADIUS 5 km ASC   # 
 > just work.
 
 > **Status:** pre-1.0, actively hardening toward production. **Done:** AUTH + ACL + protected-mode,
-> durable persistence (crash-tested), the full reactive/geo differentiator set, and broad driver/ops
-> compatibility (`SCAN`, `INFO`, `redis_exporter`, RESP3). **Maturing:** replication (correct +
-> `WAIT`; partial-resync & failover next). **Not yet:** native in-process TLS (use a sidecar today)
-> and horizontal clustering. ~10k lines of `std`-only Rust.
+> durable persistence (crash-tested), the full reactive/geo differentiator set, broad driver/ops
+> compatibility (`SCAN`, `INFO`, `redis_exporter`, RESP3), correct replication (`WAIT`, no expiry
+> divergence), and **automatic failover** via a built-in sentinel. **Maturing:** replication's
+> partial-resync. **Not yet:** native in-process TLS (use a sidecar today) and horizontal clustering.
+> ~10k lines of `std`-only Rust.
 
 ---
 
@@ -67,11 +68,14 @@ $ redis-cli -p 6379 GEOSEARCH fleet FROMLONLAT 55.27 25.2 BYRADIUS 5 km ASC   # 
   crash-safe, torn-tail-tolerant replay, configurable `appendfsync`, and `BGREWRITEAOF` compaction.
   Directory-fsync'd renames; **fuzz- and `kill -9` crash-recovery-tested.**
 
-**Replication**
+**Replication & high availability**
 
 - `REPLICAOF` master/replica: full-sync snapshot + live command streaming, read-only replicas, real
   replication IDs + offsets, authenticated links (`masterauth`), and **`WAIT`** for ack-based
   durability. Expiry is master-authoritative, so replicas never diverge on timing.
+- **Automatic failover:** the same binary runs as a built-in **sentinel** (`LOCUS_SENTINEL`) that
+  promotes the most up-to-date replica when the master dies and repoints the rest — no external
+  orchestrator. See [High availability](#high-availability--automatic-failover).
 
 **Reactive + geo differentiators**
 
@@ -166,6 +170,32 @@ redis-cli -p 6379 wait 1 1000        # -> (integer) 1
 > behind a TLS proxy/sidecar (stunnel, ghostunnel, nginx `stream`) for encrypted client and replica
 > links; native opt-in TLS is on the roadmap.
 
+### High availability — automatic failover
+
+The same `locus` binary runs as a lightweight **sentinel** (set `LOCUS_SENTINEL`) that monitors a
+master and, if it dies, automatically promotes the most up-to-date replica and repoints the others —
+no external orchestrator required. While the master is healthy it also reconciles stray nodes (e.g. a
+returned old master) back to replicas, reducing split-brain risk.
+
+```console
+# monitor a master + its replicas; promote on failure
+LOCUS_SENTINEL=127.0.0.1:6379 \
+LOCUS_SENTINEL_REPLICAS=127.0.0.1:6380,127.0.0.1:6381 \
+LOCUS_SENTINEL_DOWN_AFTER_MS=5000 \
+  cargo run --release
+```
+
+| Variable | Default | Meaning |
+|---|---|---|
+| `LOCUS_SENTINEL` | _(off)_ | Master `host:port` to monitor — **enables sentinel mode** for this process |
+| `LOCUS_SENTINEL_REPLICAS` | _(empty)_ | Comma-separated replica `host:port` list |
+| `LOCUS_SENTINEL_AUTH` | _(off)_ | Password presented to the monitored nodes |
+| `LOCUS_SENTINEL_DOWN_AFTER_MS` | `5000` | How long the master must be unreachable before failover |
+| `LOCUS_SENTINEL_INTERVAL_MS` | `1000` | Health-check poll interval |
+
+It's a single-sentinel design today (no inter-sentinel quorum yet) — run one per failure domain, or
+alongside your supervisor. See [docs/DEPLOYMENT.md](docs/DEPLOYMENT.md) for the full HA topology.
+
 ---
 
 ## Architecture
@@ -209,11 +239,12 @@ sharding** (each shard its own single-threaded hub), on the roadmap rather than 
 **Production-readiness so far:** safe on a trusted network (AUTH/ACL/protected-mode/limits), durable
 (async snapshots, AOF + crash-recovery, persisted/replicated reactive state), observable
 (`INFO`/`SLOWLOG`/`redis_exporter`), driver-compatible (`SCAN`/`COMMAND`/`CONFIG`/RESP3), with correct
-replication (real offsets, `WAIT`, no expiry divergence) — plus the full reactive/geo differentiator set.
+replication (real offsets, `WAIT`, no expiry divergence) and **automatic failover** (built-in sentinel)
+— plus the full reactive/geo differentiator set.
 
-**Next:** PSYNC partial-resync & failover; native opt-in TLS; a real S2/R-tree geo index with combined
-attribute filters; and the horizontal **spatial clustering** that nobody in the in-memory-geo space has
-packaged simply — Locus's flagship lane.
+**Next:** PSYNC partial-resync; inter-sentinel quorum; native opt-in TLS; a real S2/R-tree geo index
+with combined attribute filters; and the horizontal **spatial clustering** that nobody in the
+in-memory-geo space has packaged simply — Locus's flagship lane.
 
 **Explicit non-goals:** scripting/`EVAL`, an embedded HTTP `/metrics` endpoint (`INFO` + `redis_exporter`
 instead), and active-active replication.
