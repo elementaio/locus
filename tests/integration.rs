@@ -1563,6 +1563,24 @@ fn two_sentinels_agree_and_promote_exactly_once() {
     );
 }
 
+#[test]
+fn cluster_introspection_standalone() {
+    let s = Server::start();
+    let mut c = s.connect();
+    // Standalone: cluster disabled, so clients fall back to single-node.
+    assert!(c.cmd(&["CLUSTER", "INFO"]).contains("cluster_enabled:0"));
+    // KEYSLOT computes a slot in range; a hashtag routes keys together.
+    let slot: i64 = c.cmd(&["CLUSTER", "KEYSLOT", "foo"]).parse().unwrap();
+    assert!((0..16384).contains(&slot));
+    assert_eq!(
+        c.cmd(&["CLUSTER", "KEYSLOT", "{x}a"]),
+        c.cmd(&["CLUSTER", "KEYSLOT", "{x}b"])
+    );
+    // MYID is the 40-hex node id; no slots assigned.
+    assert_eq!(c.cmd(&["CLUSTER", "MYID"]).len(), 40);
+    assert_eq!(c.cmd(&["CLUSTER", "SLOTS"]), "[]");
+}
+
 // === partial resync (PSYNC CONTINUE) =========================================
 
 fn send_resp(s: &mut TcpStream, args: &[&[u8]]) {

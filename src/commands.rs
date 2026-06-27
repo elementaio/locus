@@ -40,6 +40,37 @@ fn rand_index(n: usize) -> usize {
     (next_rand() % n as u64) as usize
 }
 
+/// CRC16-CCITT/XMODEM (poly 0x1021, init 0) — the hash Redis Cluster uses for key
+/// slots. The 52-bit geohash cell id is Locus's *spatial* shard key; this is the
+/// hash-slot fallback for non-geo keys and `CLUSTER KEYSLOT`.
+pub fn crc16(data: &[u8]) -> u16 {
+    let mut crc: u16 = 0;
+    for &b in data {
+        crc ^= (b as u16) << 8;
+        for _ in 0..8 {
+            crc = if crc & 0x8000 != 0 {
+                (crc << 1) ^ 0x1021
+            } else {
+                crc << 1
+            };
+        }
+    }
+    crc
+}
+
+/// Map a key to one of 16384 hash slots, honoring a `{hashtag}` (the first
+/// non-empty `{...}` is hashed instead of the whole key) — Redis Cluster's rule.
+pub fn hash_slot(key: &[u8]) -> u16 {
+    let tag = match key.iter().position(|&c| c == b'{') {
+        Some(open) => match key[open + 1..].iter().position(|&c| c == b'}') {
+            Some(rel) if rel > 0 => &key[open + 1..open + 1 + rel],
+            _ => key,
+        },
+        None => key,
+    };
+    crc16(tag) % 16384
+}
+
 /// Pick `k` distinct indices from `0..n` (k clamped to n) via partial
 /// Fisher-Yates shuffle.
 fn distinct_indices(n: usize, k: usize) -> Vec<usize> {
@@ -285,10 +316,12 @@ pub fn command_meta(cmd: &[u8]) -> Option<CmdMeta> {
     // (min_arity, is_write)
     let (min_arity, write) = match cmd {
         // arity 1 reads — bare commands / all-optional args
-        b"PING" | b"QUIT" | b"COMMAND" | b"CONFIG" | b"SAVE" | b"BGSAVE" | b"BGREWRITEAOF"
-        | b"MULTI" | b"EXEC" | b"DISCARD" | b"UNWATCH" | b"RESET" | b"INFO" | b"HELLO"
-        | b"REPLCONF" | b"PSYNC" | b"SYNC" | b"UNSUBSCRIBE" | b"PUNSUBSCRIBE" | b"DBSIZE"
-        | b"RANDOMKEY" | b"CDCSUBSCRIBE" | b"CDCUNSUBSCRIBE" | b"SHUTDOWN" => (1, false),
+        b"PING" | b"QUIT" | b"COMMAND" | b"CONFIG" | b"CLUSTER" | b"SAVE" | b"BGSAVE"
+        | b"BGREWRITEAOF" | b"MULTI" | b"EXEC" | b"DISCARD" | b"UNWATCH" | b"RESET" | b"INFO"
+        | b"HELLO" | b"REPLCONF" | b"PSYNC" | b"SYNC" | b"UNSUBSCRIBE" | b"PUNSUBSCRIBE"
+        | b"DBSIZE" | b"RANDOMKEY" | b"CDCSUBSCRIBE" | b"CDCUNSUBSCRIBE" | b"SHUTDOWN" => {
+            (1, false)
+        }
         // arity 1 writes
         b"FLUSHDB" | b"FLUSHALL" => (1, true),
         // arity 2 reads
@@ -348,9 +381,11 @@ pub fn command_class(cmd: &[u8]) -> u8 {
     match cmd {
         b"PING" | b"ECHO" | b"HELLO" | b"AUTH" | b"QUIT" | b"RESET" | b"SELECT" | b"COMMAND"
         | b"CLIENT" => CLASS_CONNECTION,
-        b"CONFIG" | b"SLOWLOG" | b"INFO" | b"DBSIZE" | b"REPLICAOF" | b"SLAVEOF" | b"REPLCONF"
-        | b"PSYNC" | b"SYNC" | b"SHUTDOWN" | b"SAVE" | b"BGSAVE" | b"BGREWRITEAOF"
-        | b"FLUSHALL" | b"FLUSHDB" | b"ACL" | b"IDXCREATE" | b"IDXDROP" => CLASS_ADMIN,
+        b"CONFIG" | b"CLUSTER" | b"SLOWLOG" | b"INFO" | b"DBSIZE" | b"REPLICAOF" | b"SLAVEOF"
+        | b"REPLCONF" | b"PSYNC" | b"SYNC" | b"SHUTDOWN" | b"SAVE" | b"BGSAVE"
+        | b"BGREWRITEAOF" | b"FLUSHALL" | b"FLUSHDB" | b"ACL" | b"IDXCREATE" | b"IDXDROP" => {
+            CLASS_ADMIN
+        }
         b"SUBSCRIBE" | b"UNSUBSCRIBE" | b"PSUBSCRIBE" | b"PUNSUBSCRIBE" | b"PUBLISH"
         | b"PUBSUB" => CLASS_PUBSUB,
         c if c.starts_with(b"CDC") => CLASS_PUBSUB,
@@ -383,6 +418,7 @@ static COMMAND_NAMES: &[&[u8]] = &[
     b"CDCSUBSCRIBE",
     b"CDCUNSUBSCRIBE",
     b"CLIENT",
+    b"CLUSTER",
     b"CMSINCRBY",
     b"CMSLOAD",
     b"CMSQUERY",
@@ -4742,6 +4778,21 @@ mod tests {
             .parse()
             .unwrap();
         assert_eq!(n, expected, "indexed GEOSEARCH count != brute force");
+    }
+
+    #[test]
+    fn crc16_and_hash_slot() {
+        // 0x31C3 is the canonical CRC16-CCITT/XMODEM check value (same as Redis).
+        assert_eq!(crc16(b"123456789"), 0x31C3);
+        assert_eq!(hash_slot(b"123456789"), 0x31C3); // 12739 < 16384, slot == crc
+        // {hashtag}: only the tag is hashed, so these route to the same slot.
+        assert_eq!(
+            hash_slot(b"{user1000}.following"),
+            hash_slot(b"{user1000}.followers")
+        );
+        // An empty tag falls back to hashing the whole key.
+        assert_eq!(hash_slot(b"foo{}bar"), crc16(b"foo{}bar") % 16384);
+        assert!(hash_slot(b"anything") < 16384);
     }
 
     #[test]

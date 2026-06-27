@@ -16,6 +16,7 @@ works. This is a curated subset of Redis — the common, useful commands per typ
 | `SELECT 0` | single logical DB; `SELECT 0` is OK, other indexes error |
 | `QUIT` | |
 | `COMMAND` / `CONFIG GET` | minimal stubs so clients connect cleanly |
+| `CLUSTER INFO\|MYID\|SLOTS\|SHARDS\|NODES\|KEYSLOT key` | standalone introspection (`cluster_enabled:0`); `KEYSLOT` is CRC16 + `{hashtag}`, the slot model for future clustering |
 
 ## Generic / keyspace
 

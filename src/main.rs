@@ -626,6 +626,48 @@ impl Hub {
         ]
     }
 
+    /// CLUSTER introspection for a standalone node. We report cluster_enabled:0 so
+    /// cluster-aware clients fall back to standalone, but answer KEYSLOT/MYID/SLOTS
+    /// usefully. This is the routing seam (the slot model) that P6 builds on.
+    fn handle_cluster(&mut self, id: u64, tokens: &[Vec<u8>]) {
+        match tokens.get(1).map(|t| t.to_ascii_uppercase()).as_deref() {
+            Some(b"INFO") => {
+                let body = "cluster_enabled:0\r\ncluster_state:ok\r\n\
+                    cluster_slots_assigned:0\r\ncluster_slots_ok:0\r\n\
+                    cluster_slots_pfail:0\r\ncluster_slots_fail:0\r\n\
+                    cluster_known_nodes:1\r\ncluster_size:0\r\n\
+                    cluster_current_epoch:0\r\ncluster_my_epoch:0\r\n\
+                    cluster_stats_messages_sent:0\r\ncluster_stats_messages_received:0\r\n";
+                self.send(id, resp::bulk_string(body.as_bytes()));
+            }
+            Some(b"MYID") => {
+                let myid = self.replid.clone();
+                self.send(id, resp::bulk_string(myid.as_bytes()));
+            }
+            // Not clustered: no slots/shards assigned.
+            Some(b"SLOTS") | Some(b"SHARDS") | Some(b"LINKS") => self.send(id, resp::array(&[])),
+            Some(b"NODES") => {
+                // One line for ourselves (myself,master), no slots — matches the
+                // shape cluster-aware clients parse.
+                let line = format!(
+                    "{} 127.0.0.1:0@0 myself,master - 0 0 0 connected\n",
+                    self.replid
+                );
+                self.send(id, resp::bulk_string(line.as_bytes()));
+            }
+            Some(b"KEYSLOT") if tokens.len() == 3 => {
+                let slot = commands::hash_slot(&tokens[2]) as i64;
+                self.send(id, resp::integer(slot));
+            }
+            Some(b"COUNTKEYSINSLOT") => self.send(id, resp::integer(0)),
+            Some(b"RESET") => self.send(id, resp::simple_string("OK")),
+            _ => self.send(
+                id,
+                resp::error("ERR Unknown CLUSTER subcommand or wrong number of arguments"),
+            ),
+        }
+    }
+
     fn handle_config(&mut self, id: u64, tokens: &[Vec<u8>]) {
         match tokens.get(1).map(|t| t.to_ascii_uppercase()).as_deref() {
             Some(b"GET") if tokens.len() >= 3 => {
@@ -1276,6 +1318,7 @@ impl Hub {
             b"REPLICAOF" | b"SLAVEOF" => self.handle_replicaof(id, &tokens),
             b"INFO" => self.send(id, self.render_info()),
             b"CONFIG" => self.handle_config(id, &tokens),
+            b"CLUSTER" => self.handle_cluster(id, &tokens),
             b"CLIENT" => self.handle_client(id, &tokens),
             b"SLOWLOG" => self.handle_slowlog(id, &tokens),
             b"ACL" => self.handle_acl(id, &tokens),
