@@ -25,7 +25,7 @@ works. This is a curated subset of Redis — the common, useful commands per typ
 | `DEL key [key ...]` / `UNLINK key [key ...]` | returns count removed (UNLINK is synchronous here) |
 | `EXISTS key [key ...]` / `TOUCH key [key ...]` | counts each occurrence (no LRU, so TOUCH == EXISTS) |
 | `KEYS pattern` | keys matching a glob (`*`/`?`) |
-| `DBSIZE` | number of keys |
+| `DBSIZE` | number of keys (cluster-wide total across shards when cluster mode is on) |
 | `RANDOMKEY` | a random key (nil if empty) |
 | `RENAME key newkey` / `RENAMENX key newkey` | move value+TTL; RENAMENX fails if dest exists |
 | `FLUSHDB` / `FLUSHALL` | empty the keyspace (single logical DB) |

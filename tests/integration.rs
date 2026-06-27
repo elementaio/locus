@@ -1618,6 +1618,79 @@ fn cluster_routing_moved_and_crossslot() {
     assert!(cs.starts_with("-CROSSSLOT"), "{cs}");
 }
 
+/// Spawn a cluster node on a fixed port with the given topology; wait until it listens.
+fn spawn_cluster_node(port: u16, nodes: &str) -> Child {
+    let rdb = format!(
+        "{}/locus-clu-{}-{}.rdb",
+        std::env::temp_dir().display(),
+        std::process::id(),
+        port
+    );
+    let _ = std::fs::remove_file(&rdb);
+    let mut child = Command::new(env!("CARGO_BIN_EXE_locus"))
+        .env("LOCUS_PORT", port.to_string())
+        .env("LOCUS_RDB", &rdb)
+        .env_remove("LOCUS_AOF")
+        .env("LOCUS_CLUSTER_ENABLED", "1")
+        .env("LOCUS_CLUSTER_ANNOUNCE", format!("127.0.0.1:{port}"))
+        .env("LOCUS_CLUSTER_NODES", nodes)
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()
+        .expect("spawn cluster node");
+    let mut reader = BufReader::new(child.stdout.take().unwrap());
+    loop {
+        let mut l = String::new();
+        assert!(reader.read_line(&mut l).unwrap() > 0, "node exited early");
+        if l.contains("listening on") {
+            break;
+        }
+    }
+    std::thread::spawn(move || {
+        let mut sink = Vec::new();
+        let _ = reader.read_to_end(&mut sink);
+    });
+    child
+}
+
+fn conn_to(port: u16) -> Conn {
+    let stream = TcpStream::connect(("127.0.0.1", port)).expect("connect");
+    stream
+        .set_read_timeout(Some(Duration::from_secs(5)))
+        .unwrap();
+    Conn {
+        reader: BufReader::new(stream.try_clone().unwrap()),
+        stream,
+    }
+}
+
+#[test]
+fn cluster_dbsize_sums_all_shards() {
+    let (p1, p2) = (free_port(), free_port());
+    let nodes = format!("127.0.0.1:{p1} 0-8191;127.0.0.1:{p2} 8192-16383");
+    let mut n1 = spawn_cluster_node(p1, &nodes);
+    let mut n2 = spawn_cluster_node(p2, &nodes);
+    let mut c1 = conn_to(p1);
+    let mut c2 = conn_to(p2);
+
+    // Place each key on its owning node (no MOVED, since we target the owner).
+    let total = 24;
+    for i in 0..total {
+        let k = format!("key{i}");
+        let slot: i64 = c1.cmd(&["CLUSTER", "KEYSLOT", &k]).parse().unwrap();
+        let owner = if slot <= 8191 { &mut c1 } else { &mut c2 };
+        assert_eq!(owner.cmd(&["SET", &k, "v"]), "OK");
+    }
+    // DBSIZE from either node sums both shards (local + peer via XDBSIZE).
+    assert_eq!(c1.cmd(&["DBSIZE"]).parse::<i64>().unwrap(), total);
+    assert_eq!(c2.cmd(&["DBSIZE"]).parse::<i64>().unwrap(), total);
+
+    let _ = n1.kill();
+    let _ = n1.wait();
+    let _ = n2.kill();
+    let _ = n2.wait();
+}
+
 #[test]
 fn resp3_pubsub_uses_push_frames() {
     fn drain(s: &mut TcpStream) -> Vec<u8> {

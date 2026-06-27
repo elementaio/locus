@@ -28,7 +28,7 @@ mod tls;
 
 use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 use std::io::{self, Read, Write};
-use std::net::{TcpListener, TcpStream};
+use std::net::{TcpListener, TcpStream, ToSocketAddrs};
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, mpsc};
 use std::thread;
@@ -710,6 +710,38 @@ impl Hub {
                 std::env::var("LOCUS_PORT").unwrap_or_else(|_| "6379".into()),
             ),
         ]
+    }
+
+    /// Distinct peer node addresses (excluding ourselves); empty if cluster off.
+    fn cluster_peers(&self) -> Vec<String> {
+        match &self.cluster {
+            None => vec![],
+            Some(c) => {
+                let mut p: Vec<String> = c
+                    .owner
+                    .iter()
+                    .flatten()
+                    .filter(|a| *a != &c.my_addr)
+                    .cloned()
+                    .collect();
+                p.sort();
+                p.dedup();
+                p
+            }
+        }
+    }
+
+    /// DBSIZE: our keyspace plus every peer's (via XDBSIZE) in cluster mode — a
+    /// cluster-wide total. Unreachable peers are skipped. The peer calls are
+    /// bounded by short timeouts so they can't stall the hub indefinitely.
+    fn handle_dbsize(&mut self, id: u64) {
+        let mut total = self.db.dbsize() as i64;
+        for addr in self.cluster_peers() {
+            if let Some(n) = cluster_call_int(&addr, &[b"XDBSIZE"]) {
+                total += n;
+            }
+        }
+        self.send(id, resp::integer(total));
     }
 
     /// Should `tokens` be redirected to another node? Returns the MOVED/CROSSSLOT
@@ -1490,6 +1522,10 @@ impl Hub {
             }
             b"REPLICAOF" | b"SLAVEOF" => self.handle_replicaof(id, &tokens),
             b"INFO" => self.send(id, self.render_info()),
+            // DBSIZE sums all shards in cluster mode (XDBSIZE is the internal,
+            // local-only variant peers answer); plain DBSIZE otherwise.
+            b"DBSIZE" => self.handle_dbsize(id),
+            b"XDBSIZE" => self.send(id, resp::integer(self.db.dbsize() as i64)),
             b"CONFIG" => self.handle_config(id, &tokens),
             b"CLUSTER" => self.handle_cluster(id, &tokens),
             b"CLIENT" => self.handle_client(id, &tokens),
@@ -3080,6 +3116,30 @@ fn try_sync(
 fn send_cmd(s: &mut TcpStream, parts: &[&[u8]]) -> io::Result<()> {
     let owned: Vec<Vec<u8>> = parts.iter().map(|p| p.to_vec()).collect();
     s.write_all(&resp::command(&owned))
+}
+
+/// Node-to-node call returning an integer reply (`:N`). Bounded by short connect/IO
+/// timeouts so a dead peer can't stall the single-threaded hub. None on any error.
+fn cluster_call_int(addr: &str, args: &[&[u8]]) -> Option<i64> {
+    let sa = addr.to_socket_addrs().ok()?.next()?;
+    let go = || -> io::Result<i64> {
+        let mut s = TcpStream::connect_timeout(&sa, Duration::from_millis(500))?;
+        s.set_read_timeout(Some(Duration::from_millis(500)))?;
+        s.set_write_timeout(Some(Duration::from_millis(500)))?;
+        send_cmd(&mut s, args)?;
+        let line = read_line(&mut s)?;
+        match line.first() {
+            Some(b':') => std::str::from_utf8(&line[1..])
+                .ok()
+                .and_then(|t| t.trim().parse().ok())
+                .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "bad integer reply")),
+            _ => Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "expected integer reply",
+            )),
+        }
+    };
+    go().ok()
 }
 
 fn read_line(s: &mut TcpStream) -> io::Result<Vec<u8>> {
