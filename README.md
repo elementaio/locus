@@ -158,6 +158,9 @@ Configured entirely through environment variables (minimal config by design):
 | `LOCUS_CDC_MAXLEN` | _(off)_ | Retained changefeed log size for `CDCREAD` catch-up / consumer groups |
 | `LOCUS_SLOWLOG_US` | `10000` | Log commands slower than this (µs); `<0` disables |
 | `LOCUS_LOGLEVEL` | `info` | `error` / `warn` / `info` / `debug` |
+| `LOCUS_CLUSTER_ENABLED` | `off` | Enable cluster routing (`MOVED`/`CROSSSLOT`) |
+| `LOCUS_CLUSTER_ANNOUNCE` | `LOCUS_BIND:PORT` | This node's address in the cluster |
+| `LOCUS_CLUSTER_NODES` | _(self owns all)_ | Topology: `host:port 0-5460;host:port 5461-10922;…` |
 
 ### Security & replication in 30 seconds
 
@@ -282,10 +285,12 @@ push), with correct replication (real offsets, `WAIT`, partial-resync, no expiry
 **automatic failover** (built-in sentinel) — plus the reactive/geo differentiator set, now with a
 **geohash-indexed `GEOSEARCH` + `WHERE` filters**, ordered-index sorted sets, and a CRC16 routing seam.
 
-**Next — the last milestone:** the horizontal **spatial clustering** that nobody in the in-memory-geo
-space has packaged simply — Locus's flagship lane (a finer S2/R-tree geo index rides along). Thread-per-core,
-replica chaining, and numbered multi-DB are explicit non-goals (the first two fold into clustering;
-prefer key-prefix namespacing over multi-DB).
+**In progress — the last milestone:** horizontal **spatial clustering** (P6), Locus's flagship lane.
+Landed so far: **static hash-slot routing** — enable cluster mode, give each node a slot range, and
+clients that follow `MOVED`/`ASK` see a working cluster (`CLUSTER SLOTS/NODES/KEYSLOT`, `CROSSSLOT`
+guarding). Next: routing geo keys by their **spatial cell**, inter-node transport, and cross-shard
+scatter-gather `GEOSEARCH`. Thread-per-core, replica chaining, and numbered multi-DB are explicit
+non-goals (the first two fold into clustering; prefer key-prefix namespacing over multi-DB).
 
 **Explicit non-goals:** scripting/`EVAL`, an embedded HTTP `/metrics` endpoint (`INFO` + `redis_exporter`
 instead), and active-active replication.

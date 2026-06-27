@@ -220,10 +220,95 @@ fn spawn_tls_listener(
     });
 }
 
+// === cluster routing (P6, step 1: static hash-slot topology) =================
+
+/// Static cluster topology: which node owns each of the 16384 hash slots, plus our
+/// own address. `None` everywhere when cluster mode is off. Step 1 is client-side
+/// routing — each node serves its own slots and returns MOVED for the rest, so N
+/// independently-run nodes form a cluster once clients follow redirects.
+struct Cluster {
+    my_addr: String,
+    owner: Vec<Option<String>>, // len 16384: slot -> owner "host:port"
+}
+
+impl Cluster {
+    /// Build from env, or `None` unless `LOCUS_CLUSTER_ENABLED` is truthy.
+    /// `LOCUS_CLUSTER_NODES` = `"host:port 0-5460;host:port 5461-10922;…"`; absent
+    /// means a single-node cluster owning all slots. Our address is
+    /// `LOCUS_CLUSTER_ANNOUNCE` or `LOCUS_BIND:LOCUS_PORT`.
+    fn from_env() -> Option<Cluster> {
+        let on = std::env::var("LOCUS_CLUSTER_ENABLED")
+            .map(|v| matches!(v.trim(), "1" | "yes" | "on" | "true"))
+            .unwrap_or(false);
+        if !on {
+            return None;
+        }
+        let my_addr = std::env::var("LOCUS_CLUSTER_ANNOUNCE").unwrap_or_else(|_| {
+            let bind = std::env::var("LOCUS_BIND").unwrap_or_else(|_| "127.0.0.1".to_string());
+            let port = std::env::var("LOCUS_PORT").unwrap_or_else(|_| "6379".to_string());
+            format!("{bind}:{port}")
+        });
+        let mut owner = vec![None; 16384];
+        match std::env::var("LOCUS_CLUSTER_NODES") {
+            Ok(spec) if !spec.trim().is_empty() => {
+                for node in spec.split(';').map(str::trim).filter(|s| !s.is_empty()) {
+                    let mut parts = node.split_whitespace();
+                    let Some(addr) = parts.next() else { continue };
+                    for rangespec in parts {
+                        for r in rangespec.split(',') {
+                            if let Some((lo, hi)) = parse_slot_range(r) {
+                                for s in lo..=hi {
+                                    owner[s as usize] = Some(addr.to_string());
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+            // No topology -> single-node cluster owning every slot.
+            _ => owner.iter_mut().for_each(|o| *o = Some(my_addr.clone())),
+        }
+        Some(Cluster { my_addr, owner })
+    }
+
+    /// Contiguous (start, end, owner) slot ranges, for CLUSTER SLOTS/INFO.
+    fn ranges(&self) -> Vec<(u16, u16, String)> {
+        let mut out = Vec::new();
+        let mut i = 0usize;
+        while i < self.owner.len() {
+            match &self.owner[i] {
+                Some(a) => {
+                    let start = i;
+                    let owner = a.clone();
+                    while i < self.owner.len() && self.owner[i].as_deref() == Some(&owner) {
+                        i += 1;
+                    }
+                    out.push((start as u16, (i - 1) as u16, owner));
+                }
+                None => i += 1,
+            }
+        }
+        out
+    }
+}
+
+fn parse_slot_range(s: &str) -> Option<(u16, u16)> {
+    let s = s.trim();
+    match s.split_once('-') {
+        Some((a, b)) => Some((a.trim().parse().ok()?, b.trim().parse().ok()?)),
+        None => {
+            let n: u16 = s.parse().ok()?;
+            Some((n, n))
+        }
+    }
+}
+
 // === the hub ================================================================
 
 struct Hub {
     db: Db,
+    // cluster routing topology (None = cluster mode off)
+    cluster: Option<Cluster>,
     aof: Option<aof::Aof>,
     aof_path: Option<String>,
     // Some(buf) while an async BGREWRITEAOF runs: captures writes that land
@@ -397,6 +482,7 @@ impl Hub {
         };
         let mut hub = Hub {
             db,
+            cluster: Cluster::from_env(),
             aof,
             aof_path,
             aof_rewrite_buf: None,
@@ -626,33 +712,114 @@ impl Hub {
         ]
     }
 
-    /// CLUSTER introspection for a standalone node. We report cluster_enabled:0 so
-    /// cluster-aware clients fall back to standalone, but answer KEYSLOT/MYID/SLOTS
-    /// usefully. This is the routing seam (the slot model) that P6 builds on.
+    /// Should `tokens` be redirected to another node? Returns the MOVED/CROSSSLOT
+    /// reply, or None to serve locally. None when cluster mode is off.
+    fn cluster_redirect(&self, tokens: &[Vec<u8>]) -> Option<Vec<u8>> {
+        let cluster = self.cluster.as_ref()?;
+        let keys = commands::command_keys(tokens);
+        if keys.is_empty() {
+            return None; // not a single-slot key command
+        }
+        let mut slot: Option<u16> = None;
+        for k in &keys {
+            let s = commands::hash_slot(k);
+            match slot {
+                None => slot = Some(s),
+                Some(p) if p != s => {
+                    return Some(resp::error(
+                        "CROSSSLOT Keys in request don't hash to the same slot",
+                    ));
+                }
+                _ => {}
+            }
+        }
+        match &cluster.owner[slot.unwrap() as usize] {
+            Some(a) if a == &cluster.my_addr => None, // ours
+            Some(a) => Some(resp::error(&format!("MOVED {} {a}", slot.unwrap()))),
+            None => None, // unassigned slot: serve locally for now
+        }
+    }
+
+    /// CLUSTER introspection. With cluster mode off we report cluster_enabled:0 so
+    /// clients fall back to standalone; with it on we report the real slot
+    /// ownership. KEYSLOT/MYID work in both modes.
     fn handle_cluster(&mut self, id: u64, tokens: &[Vec<u8>]) {
         match tokens.get(1).map(|t| t.to_ascii_uppercase()).as_deref() {
             Some(b"INFO") => {
-                let body = "cluster_enabled:0\r\ncluster_state:ok\r\n\
-                    cluster_slots_assigned:0\r\ncluster_slots_ok:0\r\n\
-                    cluster_slots_pfail:0\r\ncluster_slots_fail:0\r\n\
-                    cluster_known_nodes:1\r\ncluster_size:0\r\n\
-                    cluster_current_epoch:0\r\ncluster_my_epoch:0\r\n\
-                    cluster_stats_messages_sent:0\r\ncluster_stats_messages_received:0\r\n";
+                let (enabled, assigned, nodes, size) = match &self.cluster {
+                    None => (0, 0, 1, 0),
+                    Some(c) => {
+                        let assigned = c.owner.iter().filter(|o| o.is_some()).count();
+                        let mut addrs: Vec<&String> = c.owner.iter().flatten().collect();
+                        addrs.sort();
+                        addrs.dedup();
+                        (1, assigned, addrs.len().max(1), addrs.len())
+                    }
+                };
+                // Step 1 always reports state ok (a partial slot assignment still
+                // serves its own keys); CLUSTERDOWN gating comes in a later step.
+                let body = format!(
+                    "cluster_enabled:{enabled}\r\ncluster_state:ok\r\n\
+                     cluster_slots_assigned:{assigned}\r\ncluster_slots_ok:{assigned}\r\n\
+                     cluster_slots_pfail:0\r\ncluster_slots_fail:0\r\n\
+                     cluster_known_nodes:{nodes}\r\ncluster_size:{size}\r\n\
+                     cluster_current_epoch:0\r\ncluster_my_epoch:0\r\n\
+                     cluster_stats_messages_sent:0\r\ncluster_stats_messages_received:0\r\n"
+                );
                 self.send(id, resp::bulk_string(body.as_bytes()));
             }
             Some(b"MYID") => {
                 let myid = self.replid.clone();
                 self.send(id, resp::bulk_string(myid.as_bytes()));
             }
-            // Not clustered: no slots/shards assigned.
-            Some(b"SLOTS") | Some(b"SHARDS") | Some(b"LINKS") => self.send(id, resp::array(&[])),
+            Some(b"SLOTS") => {
+                // [start, end, [host, port]] per contiguous owned range.
+                let ranges = self
+                    .cluster
+                    .as_ref()
+                    .map(|c| c.ranges())
+                    .unwrap_or_default();
+                let mut out = Vec::new();
+                for (start, end, addr) in ranges {
+                    let (host, port) = addr.rsplit_once(':').unwrap_or((addr.as_str(), "0"));
+                    let mut entry = format!("*3\r\n:{start}\r\n:{end}\r\n").into_bytes();
+                    entry.extend_from_slice(b"*2\r\n");
+                    entry.extend_from_slice(&resp::bulk_string(host.as_bytes()));
+                    entry.extend_from_slice(&resp::bulk_string(port.as_bytes()));
+                    out.push(entry);
+                }
+                let mut reply = format!("*{}\r\n", out.len()).into_bytes();
+                out.iter().for_each(|e| reply.extend_from_slice(e));
+                self.send(id, reply);
+            }
+            Some(b"SHARDS") | Some(b"LINKS") => self.send(id, resp::array(&[])),
             Some(b"NODES") => {
-                // One line for ourselves (myself,master), no slots — matches the
-                // shape cluster-aware clients parse.
-                let line = format!(
-                    "{} 127.0.0.1:0@0 myself,master - 0 0 0 connected\n",
-                    self.replid
-                );
+                let line = match &self.cluster {
+                    None => format!(
+                        "{} 127.0.0.1:0@0 myself,master - 0 0 0 connected\n",
+                        self.replid
+                    ),
+                    Some(c) => {
+                        let mine: Vec<String> = c
+                            .ranges()
+                            .into_iter()
+                            .filter(|(_, _, a)| a == &c.my_addr)
+                            .map(|(s, e, _)| {
+                                if s == e {
+                                    s.to_string()
+                                } else {
+                                    format!("{s}-{e}")
+                                }
+                            })
+                            .collect();
+                        format!(
+                            "{} {}@0 myself,master - 0 0 0 connected {}\n",
+                            self.replid,
+                            c.my_addr,
+                            mine.join(" ")
+                        )
+                    }
+                };
                 self.send(id, resp::bulk_string(line.as_bytes()));
             }
             Some(b"KEYSLOT") if tokens.len() == 3 => {
@@ -2276,6 +2443,14 @@ impl Hub {
     fn exec_one(&mut self, id: u64, tokens: Vec<Vec<u8>>) -> Vec<u8> {
         let cmd = tokens[0].to_ascii_uppercase();
         let is_write = aof::is_write(&cmd);
+        // Cluster routing: a key that belongs to another node gets a MOVED; keys
+        // spanning slots get CROSSSLOT. Replication-applied commands (MASTER_ID)
+        // bypass routing — a replica applies its master's stream verbatim.
+        if id != MASTER_ID
+            && let Some(redirect) = self.cluster_redirect(&tokens)
+        {
+            return redirect;
+        }
         if self.master.is_some() && id != MASTER_ID && is_write {
             return resp::error("READONLY You can't write against a read only replica.");
         }

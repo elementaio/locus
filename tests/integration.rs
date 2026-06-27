@@ -1582,6 +1582,43 @@ fn cluster_introspection_standalone() {
 }
 
 #[test]
+fn cluster_routing_moved_and_crossslot() {
+    // This node owns slots 0-8191; a peer owns the rest.
+    let s = Server::start_inner(&[
+        ("LOCUS_CLUSTER_ENABLED", "1"),
+        ("LOCUS_CLUSTER_ANNOUNCE", "127.0.0.1:7000"),
+        (
+            "LOCUS_CLUSTER_NODES",
+            "127.0.0.1:7000 0-8191;127.0.0.1:7001 8192-16383",
+        ),
+    ]);
+    let mut c = s.connect();
+    assert!(c.cmd(&["CLUSTER", "INFO"]).contains("cluster_enabled:1"));
+    assert!(c.cmd(&["CLUSTER", "SLOTS"]).contains("7000")); // reports ownership
+
+    // Classify keys by slot, then check routing matches ownership.
+    let slot =
+        |c: &mut Conn, k: &str| -> i64 { c.cmd(&["CLUSTER", "KEYSLOT", k]).parse().unwrap() };
+    let (mut ours, mut theirs) = (None, None);
+    for k in ["a", "b", "c", "d", "e", "f", "g", "foo", "bar", "baz"] {
+        if slot(&mut c, k) <= 8191 {
+            ours.get_or_insert(k);
+        } else {
+            theirs.get_or_insert(k);
+        }
+    }
+    let (ours, theirs) = (ours.unwrap(), theirs.unwrap());
+
+    assert_eq!(c.cmd(&["SET", ours, "v"]), "OK"); // our slot -> served
+    let moved = c.cmd(&["SET", theirs, "v"]); // peer's slot -> MOVED
+    assert!(moved.starts_with("-MOVED"), "{moved}");
+    assert!(moved.contains("127.0.0.1:7001"));
+    // Keys spanning two slots -> CROSSSLOT.
+    let cs = c.cmd(&["MGET", ours, theirs]);
+    assert!(cs.starts_with("-CROSSSLOT"), "{cs}");
+}
+
+#[test]
 fn resp3_pubsub_uses_push_frames() {
     fn drain(s: &mut TcpStream) -> Vec<u8> {
         s.set_read_timeout(Some(Duration::from_millis(300)))

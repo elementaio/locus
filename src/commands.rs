@@ -58,6 +58,51 @@ pub fn crc16(data: &[u8]) -> u16 {
     crc
 }
 
+/// The key(s) a command addresses, for cluster routing. Empty = not routed
+/// (connection/admin/pubsub commands, and cluster-wide data commands like KEYS /
+/// SCAN / GEOSEARCH that aren't pinned to one slot). Complex store commands route
+/// on their first key (use a `{hashtag}` to co-locate sources in a cluster).
+pub fn command_keys(tokens: &[Vec<u8>]) -> Vec<&[u8]> {
+    if tokens.len() < 2 {
+        return vec![];
+    }
+    let cmd = tokens[0].to_ascii_uppercase();
+    match cmd.as_slice() {
+        b"DEL" | b"UNLINK" | b"EXISTS" | b"TOUCH" | b"MGET" | b"SINTER" | b"SUNION" | b"SDIFF"
+        | b"PFCOUNT" => return tokens[1..].iter().map(|k| k.as_slice()).collect(),
+        b"MSET" | b"MSETNX" => {
+            return tokens[1..]
+                .iter()
+                .step_by(2)
+                .map(|k| k.as_slice())
+                .collect();
+        }
+        b"RENAME" | b"RENAMENX" | b"RPOPLPUSH" | b"LMOVE" | b"SMOVE" => {
+            return tokens[1..3.min(tokens.len())]
+                .iter()
+                .map(|k| k.as_slice())
+                .collect();
+        }
+        b"BITOP" => {
+            return tokens
+                .get(2)
+                .map(|k| vec![k.as_slice()])
+                .unwrap_or_default();
+        }
+        // Cluster-wide / cross-key data commands: not addressed to a single slot.
+        b"KEYS" | b"SCAN" | b"RANDOMKEY" | b"WAIT" | b"GEOSEARCH" | b"IDXGET" | b"IDXRANGE" => {
+            return vec![];
+        }
+        _ => {}
+    }
+    // Otherwise a single-key data command keys on tokens[1]; non-data commands
+    // (connection/admin/pubsub) don't route.
+    match command_class(&cmd) {
+        crate::acl::CLASS_READ | crate::acl::CLASS_WRITE => vec![tokens[1].as_slice()],
+        _ => vec![],
+    }
+}
+
 /// Map a key to one of 16384 hash slots, honoring a `{hashtag}` (the first
 /// non-empty `{...}` is hashed instead of the whole key) — Redis Cluster's rule.
 pub fn hash_slot(key: &[u8]) -> u16 {
@@ -4793,6 +4838,33 @@ mod tests {
         // An empty tag falls back to hashing the whole key.
         assert_eq!(hash_slot(b"foo{}bar"), crc16(b"foo{}bar") % 16384);
         assert!(hash_slot(b"anything") < 16384);
+    }
+
+    #[test]
+    fn command_keys_for_routing() {
+        let to = |p: &[&[u8]]| -> Vec<Vec<u8>> { p.iter().map(|x| x.to_vec()).collect() };
+        assert_eq!(command_keys(&to(&[b"GET", b"k"])), vec![b"k".as_slice()]);
+        assert_eq!(
+            command_keys(&to(&[b"SET", b"k", b"v"])),
+            vec![b"k".as_slice()]
+        );
+        assert_eq!(
+            command_keys(&to(&[b"MGET", b"a", b"b"])),
+            vec![b"a".as_slice(), b"b"]
+        );
+        assert_eq!(
+            command_keys(&to(&[b"MSET", b"a", b"1", b"b", b"2"])),
+            vec![b"a".as_slice(), b"b"]
+        );
+        assert_eq!(
+            command_keys(&to(&[b"DEL", b"a", b"b"])),
+            vec![b"a".as_slice(), b"b"]
+        );
+        // Non-key / cluster-wide commands don't route.
+        assert!(command_keys(&to(&[b"PING"])).is_empty());
+        assert!(command_keys(&to(&[b"KEYS", b"*"])).is_empty());
+        assert!(command_keys(&to(&[b"SUBSCRIBE", b"ch"])).is_empty());
+        assert!(command_keys(&to(&[b"GEOSEARCH", b"FROMLONLAT"])).is_empty());
     }
 
     #[test]
