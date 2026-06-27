@@ -1881,6 +1881,96 @@ fn cluster_migrateslot_moves_keys_zero_loss() {
 }
 
 #[test]
+fn cluster_reassign_repoints_a_nodes_slots() {
+    let (p1, p2) = (free_port(), free_port());
+    // node1 owns 0-8191, node2 owns 8192-16383. Only node1 is run here; REASSIGN
+    // edits node1's own owner map (the per-shard-failover primitive).
+    let nodes = format!("127.0.0.1:{p1} 0-8191;127.0.0.1:{p2} 8192-16383");
+    let mut n1 = spawn_cluster_node(p1, &nodes);
+    let mut c1 = conn_to(p1);
+
+    // A node2-owned key currently redirects there.
+    let mut k2 = None;
+    for i in 0..300 {
+        let k = format!("k{i}");
+        let s: i64 = c1.cmd(&["CLUSTER", "KEYSLOT", &k]).parse().unwrap();
+        if s > 8191 {
+            k2 = Some(k);
+            break;
+        }
+    }
+    let k = k2.expect("need a node2-owned key");
+    let dst2 = format!("127.0.0.1:{p2}");
+    assert!(c1.cmd(&["GET", &k]).contains(&dst2));
+
+    // Reassign all of node2's slots to node1 -> node1 now serves them.
+    let me = format!("127.0.0.1:{p1}");
+    let moved: i64 = c1
+        .cmd(&["CLUSTER", "REASSIGN", &dst2, &me])
+        .parse()
+        .unwrap();
+    assert!(moved > 0, "expected slots reassigned, got {moved}");
+    assert_eq!(c1.cmd(&["SET", &k, "v"]), "OK");
+    assert_eq!(c1.cmd(&["GET", &k]), "v");
+
+    let _ = n1.kill();
+    let _ = n1.wait();
+}
+
+#[test]
+fn cluster_per_shard_failover_reassigns_slots() {
+    let (pm, pr) = (free_port(), free_port());
+    // A single shard: master M owns all slots; R is M's cluster-enabled replica.
+    let topo = format!("127.0.0.1:{pm} 0-16383");
+    let mut m = spawn_cluster_node(pm, &topo);
+    let mut r = spawn_cluster_node(pr, &topo);
+    conn_to(pr).cmd(&["REPLICAOF", "127.0.0.1", &pm.to_string()]);
+    sleep(Duration::from_millis(500)); // initial sync
+    conn_to(pm).cmd(&["SET", "k", "v"]); // M owns k; replicates to R
+    sleep(Duration::from_millis(400));
+
+    // Sentinel monitors the shard and knows the cluster nodes to reassign.
+    let mut sentinel = Command::new(env!("CARGO_BIN_EXE_locus"))
+        .env("LOCUS_SENTINEL", format!("127.0.0.1:{pm}"))
+        .env("LOCUS_SENTINEL_REPLICAS", format!("127.0.0.1:{pr}"))
+        .env(
+            "LOCUS_SENTINEL_CLUSTER_NODES",
+            format!("127.0.0.1:{pm},127.0.0.1:{pr}"),
+        )
+        .env("LOCUS_SENTINEL_DOWN_AFTER_MS", "700")
+        .env("LOCUS_SENTINEL_INTERVAL_MS", "200")
+        .env("LOCUS_SENTINEL_QUORUM", "1")
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .expect("spawn sentinel");
+
+    let _ = m.kill(); // master dies
+    let _ = m.wait();
+
+    // After promotion + REASSIGN, R owns the shard's slots and serves the data
+    // directly (no MOVED) — a per-shard failover with the routing updated.
+    let deadline = Instant::now() + Duration::from_secs(12);
+    let took_over = loop {
+        if conn_to(pr).cmd(&["GET", "k"]) == "v" {
+            break true;
+        }
+        if Instant::now() > deadline {
+            break false;
+        }
+        sleep(Duration::from_millis(200));
+    };
+    let _ = sentinel.kill();
+    let _ = sentinel.wait();
+    let _ = r.kill();
+    let _ = r.wait();
+    assert!(
+        took_over,
+        "R did not take over the shard's slots after failover"
+    );
+}
+
+#[test]
 fn resp3_pubsub_uses_push_frames() {
     fn drain(s: &mut TcpStream) -> Vec<u8> {
         s.set_read_timeout(Some(Duration::from_millis(300)))

@@ -294,9 +294,11 @@ global result merged by distance), and **cell-in-key spatial sharding** — name
 **bounded** scatter that only consults the shards whose cells the query covers — the Tile38-beating lane.
 Resharding is **live and zero-loss**: `CLUSTER MIGRATESLOT slot dst` copies a slot's keys to another node
 (two-phase — copy-all then commit), and `CLUSTER SETSLOT slot NODE addr` repoints ownership at runtime
-(`CLUSTERDOWN` covers an unowned slot). Next: per-shard failover (reuse the sentinel) and cross-shard
-changefeed ordering. Thread-per-core, replica chaining, and numbered multi-DB are explicit non-goals (the
-first two fold into clustering; prefer key-prefix namespacing over multi-DB).
+(`CLUSTERDOWN` covers an unowned slot). **Per-shard failover** reuses the built-in sentinel: set
+`LOCUS_SENTINEL_CLUSTER_NODES` and, when a shard's master dies, the sentinel promotes its replica and
+broadcasts `CLUSTER REASSIGN old new` so the cluster routes the dead master's slots to the successor. Next:
+cross-shard changefeed ordering. Thread-per-core, replica chaining, and numbered multi-DB are explicit
+non-goals (the first two fold into clustering; prefer key-prefix namespacing over multi-DB).
 
 **Explicit non-goals:** scripting/`EVAL`, an embedded HTTP `/metrics` endpoint (`INFO` + `redis_exporter`
 instead), and active-active replication.

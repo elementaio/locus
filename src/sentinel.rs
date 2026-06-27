@@ -81,6 +81,16 @@ pub fn run() -> io::Result<()> {
         thread::spawn(move || serve_peers(&port, flag));
     }
 
+    // Cluster nodes to notify on failover: after promoting a replica we broadcast
+    // CLUSTER REASSIGN <old> <new> to each so the cluster routes the dead master's
+    // slots to its successor (per-shard failover). Empty = plain (non-cluster) HA.
+    let cluster_nodes: Vec<String> = std::env::var("LOCUS_SENTINEL_CLUSTER_NODES")
+        .unwrap_or_default()
+        .split(',')
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+        .collect();
+
     // The full node set is the master plus every configured replica.
     let mut nodes: Vec<String> = vec![master0.clone()];
     for r in std::env::var("LOCUS_SENTINEL_REPLICAS")
@@ -127,6 +137,10 @@ pub fn run() -> io::Result<()> {
                     log::info(&format!(
                         "sentinel: +switch-master {master} -> {new_master}"
                     ));
+                    // Cluster mode: repoint the dead master's slots to its successor.
+                    if !cluster_nodes.is_empty() {
+                        reassign_cluster(&cluster_nodes, &master, &new_master, auth);
+                    }
                     master = new_master;
                     down_since = None;
                     master_down.store(false, Ordering::Relaxed);
@@ -179,6 +193,18 @@ fn failover(nodes: &[String], old_master: &str, auth: Option<&str>) -> Option<St
         let _ = command(n, auth, &["REPLICAOF", wh, wp]); // best-effort
     }
     Some(winner)
+}
+
+/// Broadcast `CLUSTER REASSIGN <old> <new>` to every cluster node so each repoints
+/// the dead master's slots to the promoted replica (best-effort; the dead node and
+/// any partitioned node just fail and are reconciled when they return).
+fn reassign_cluster(cluster_nodes: &[String], old: &str, new: &str, auth: Option<&str>) {
+    for n in cluster_nodes {
+        match command(n, auth, &["CLUSTER", "REASSIGN", old, new]) {
+            Ok(_) => log::info(&format!("sentinel: reassigned {old} slots -> {new} on {n}")),
+            Err(_) => log::warn(&format!("sentinel: REASSIGN on {n} failed (unreachable)")),
+        }
+    }
 }
 
 /// Corroborate that the master is really down (not just unreachable from this

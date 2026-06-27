@@ -245,6 +245,21 @@ prevents two sentinels promoting different replicas. Use an odd number (3 or 5) 
 a majority is well-defined. This is a bully-style election over a small line
 protocol, not full Raft (epoch consensus is a later step).
 
+**Per-shard failover (cluster mode).** Each shard is a master that owns slots plus
+its replicas. Give the sentinel the cluster's node list and it repoints the dead
+master's slots to the promoted replica automatically — no client-side reconfig:
+
+```bash
+LOCUS_SENTINEL=shard1-master:6379 \
+LOCUS_SENTINEL_REPLICAS=shard1-replica:6379 \
+LOCUS_SENTINEL_CLUSTER_NODES=shard1-master:6379,shard2-master:6379,shard1-replica:6379 \
+  locus
+```
+
+On promotion the sentinel broadcasts `CLUSTER REASSIGN <old-master> <new-master>`
+to every node, so the cluster routes the dead master's slots to its successor (the
+replica already holds the data). Run one sentinel set per shard.
+
 ### Manual failover (runbook / fallback)
 
 1. Detect master loss (health checks / your supervisor).

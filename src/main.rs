@@ -1049,6 +1049,30 @@ impl Hub {
                     }
                 }
             }
+            // CLUSTER REASSIGN <old-addr> <new-addr> — repoint every slot owned by
+            // old to new in one shot. The sentinel broadcasts this after promoting a
+            // replica, so the cluster routes a dead master's slots to its successor.
+            // Replies with the number of slots moved.
+            Some(b"REASSIGN") if tokens.len() == 4 => {
+                let old = String::from_utf8_lossy(&tokens[2]).into_owned();
+                let new = String::from_utf8_lossy(&tokens[3]).into_owned();
+                match self.cluster.as_mut() {
+                    Some(c) => {
+                        let mut n = 0i64;
+                        for o in c.owner.iter_mut() {
+                            if o.as_deref() == Some(old.as_str()) {
+                                *o = Some(new.clone());
+                                n += 1;
+                            }
+                        }
+                        self.send(id, resp::integer(n));
+                    }
+                    None => self.send(
+                        id,
+                        resp::error("ERR This instance has cluster support disabled"),
+                    ),
+                }
+            }
             Some(b"COUNTKEYSINSLOT") => self.send(id, resp::integer(0)),
             Some(b"RESET") => self.send(id, resp::simple_string("OK")),
             _ => self.send(
