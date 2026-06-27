@@ -19,6 +19,7 @@ mod log;
 mod pubsub;
 mod rdb;
 mod resp;
+mod sentinel;
 mod sketch;
 mod streams;
 
@@ -91,6 +92,11 @@ fn install_signal_handlers() {
 
 fn main() -> io::Result<()> {
     log::init();
+    // Sentinel mode: run as a failover monitor instead of a data node (never
+    // returns). Enabled by pointing LOCUS_SENTINEL at a master's host:port.
+    if std::env::var("LOCUS_SENTINEL").is_ok_and(|v| !v.is_empty()) {
+        return sentinel::run();
+    }
     let (tx, rx) = mpsc::channel::<Msg>();
     let hub_tx = tx.clone();
     thread::spawn(move || run_hub(rx, hub_tx));
