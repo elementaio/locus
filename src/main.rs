@@ -1460,7 +1460,7 @@ impl Hub {
         let mut n = 0;
         for k in self.db.geo_keys() {
             let point = match self.db.get(&k) {
-                Some(Value::Geo(klon, klat)) => Some((*klon, *klat)),
+                Some(Value::Geo(klon, klat, _)) => Some((*klon, *klat)),
                 _ => None,
             };
             if let Some((klon, klat)) = point
@@ -1561,7 +1561,7 @@ impl Hub {
     /// the circle (moved out, deleted, or expired) -> `del`.
     fn push_region_changes(&mut self, key: &[u8], offset: u64) {
         let point = match self.db.get(key) {
-            Some(Value::Geo(lon, lat)) => Some((*lon, *lat)),
+            Some(Value::Geo(lon, lat, _)) => Some((*lon, *lat)),
             _ => None,
         };
         let ids: Vec<u64> = self

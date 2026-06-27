@@ -375,12 +375,19 @@ fn reconstruct(key: &[u8], value: &Value) -> Vec<Vec<Vec<u8>>> {
                 c
             })
             .collect(),
-        Value::Geo(lon, lat) => vec![vec![
-            b"GEOSET".to_vec(),
-            k,
-            format!("{lon}").into_bytes(),
-            format!("{lat}").into_bytes(),
-        ]],
+        Value::Geo(lon, lat, attrs) => {
+            let mut c = vec![
+                b"GEOSET".to_vec(),
+                k,
+                format!("{lon}").into_bytes(),
+                format!("{lat}").into_bytes(),
+            ];
+            for (f, v) in attrs {
+                c.push(f.clone());
+                c.push(v.clone());
+            }
+            vec![c]
+        }
         // A sketch can't be rebuilt from its add-history; restore raw state.
         Value::Bloom(b) => vec![vec![
             b"BFLOAD".to_vec(),

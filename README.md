@@ -88,7 +88,8 @@ $ redis-cli -p 6379 GEOSEARCH fleet FROMLONLAT 55.27 25.2 BYRADIUS 5 km ASC   # 
 - **[Changefeed](docs/CHANGEFEED.md):** `CDCSUBSCRIBE` (snapshot + live deltas, no gap/dup), offsets +
   `CDCREAD` catch-up, and consumer groups — a reliable, ordered keyspace feed (persisted + replicated).
 - **[Geo-first](docs/GEO.md):** `GEOSET`/`GEOPOS`/`GEODIST`/`GEOSEARCH` (backed by a **geohash spatial
-  index** → sub-linear radius/box queries), plus **live geofencing** via `CDCSUBSCRIBE REGION`.
+  index** → sub-linear radius/box queries) with **combined attribute filters** (`GEOSEARCH … WHERE
+  status active`), plus **live geofencing** via `CDCSUBSCRIBE REGION`.
 - **[Sketches](docs/SKETCHES.md):** Bloom (dedup), Count-Min (trending), Top-K (heavy hitters),
   t-digest (live percentiles).
 - **CAS verbs:** `CAS`/`CADEL`/`SETMAX`/`INCRCAP` — atomic check-and-write.
@@ -278,8 +279,8 @@ sharding** (each shard its own single-threaded hub), on the roadmap rather than 
 replication (real offsets, `WAIT`, no expiry divergence) and **automatic failover** (built-in sentinel)
 — plus the full reactive/geo differentiator set.
 
-**Next:** combined attribute filters + a finer S2/R-tree geo index (a geohash spatial index already makes
-`GEOSEARCH` sub-linear); O(log n) sorted sets; thread-per-core; then the horizontal **spatial
+**Next:** a finer S2/R-tree geo index (a geohash index already makes `GEOSEARCH` sub-linear, with
+combined `WHERE` attribute filters); O(log n) sorted sets; thread-per-core; then the horizontal **spatial
 clustering** that nobody in the in-memory-geo space has packaged simply — Locus's flagship lane, done last.
 
 **Explicit non-goals:** scripting/`EVAL`, an embedded HTTP `/metrics` endpoint (`INFO` + `redis_exporter`

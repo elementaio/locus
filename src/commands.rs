@@ -3608,16 +3608,31 @@ fn fmt_coord(x: f64) -> Vec<u8> {
 }
 
 /// Fetch a key's geo point. `Err(())` = the key holds a non-geo value.
+/// True if the key's geo attributes satisfy every `WHERE field value` clause (AND).
+/// Empty `wheres` → always true.
+fn geo_attr_match(db: &mut Db, key: &[u8], wheres: &[(Vec<u8>, Vec<u8>)]) -> bool {
+    if wheres.is_empty() {
+        return true;
+    }
+    match db.get(key) {
+        Some(Value::Geo(_, _, attrs)) => wheres
+            .iter()
+            .all(|(f, v)| attrs.iter().any(|(af, av)| af == f && av == v)),
+        _ => false,
+    }
+}
+
 fn geo_point(db: &mut Db, key: &[u8]) -> Result<Option<(f64, f64)>, ()> {
     match db.get(key) {
         None => Ok(None),
-        Some(Value::Geo(lon, lat)) => Ok(Some((*lon, *lat))),
+        Some(Value::Geo(lon, lat, _)) => Ok(Some((*lon, *lat))),
         Some(_) => Err(()),
     }
 }
 
 fn geoset_cmd(db: &mut Db, tokens: &[Vec<u8>]) -> Vec<u8> {
-    if tokens.len() != 4 {
+    // GEOSET key lon lat [field value ...]  — trailing pairs are inline attributes.
+    if tokens.len() < 4 || !tokens.len().is_multiple_of(2) {
         return wrong_args("geoset");
     }
     let (lon, lat) = match (
@@ -3630,7 +3645,11 @@ fn geoset_cmd(db: &mut Db, tokens: &[Vec<u8>]) -> Vec<u8> {
     if !(-180.0..=180.0).contains(&lon) || !(-85.051_128_78..=85.051_128_78).contains(&lat) {
         return error("ERR invalid longitude,latitude pair");
     }
-    db.insert(tokens[1].clone(), Value::Geo(lon, lat));
+    let attrs: crate::db::GeoAttrs = tokens[4..]
+        .chunks_exact(2)
+        .map(|p| (p[0].clone(), p[1].clone()))
+        .collect();
+    db.insert(tokens[1].clone(), Value::Geo(lon, lat, attrs));
     simple_string("OK")
 }
 
@@ -3719,6 +3738,7 @@ fn geosearch_cmd(db: &mut Db, tokens: &[Vec<u8>]) -> Vec<u8> {
     let mut order: Option<bool> = None; // Some(true)=ASC, Some(false)=DESC
     let mut count: Option<usize> = None;
     let (mut withcoord, mut withdist) = (false, false);
+    let mut wheres: Vec<(Vec<u8>, Vec<u8>)> = Vec::new(); // attribute filters (AND)
     let mut i = 1;
     while i < tokens.len() {
         match tokens[i].to_ascii_uppercase().as_slice() {
@@ -3792,6 +3812,14 @@ fn geosearch_cmd(db: &mut Db, tokens: &[Vec<u8>]) -> Vec<u8> {
                 withdist = true;
                 i += 1;
             }
+            b"WHERE" => {
+                // WHERE field value — repeatable; all must match (AND).
+                match (tokens.get(i + 1), tokens.get(i + 2)) {
+                    (Some(f), Some(v)) => wheres.push((f.clone(), v.clone())),
+                    _ => return bad(),
+                }
+                i += 3;
+            }
             _ => return bad(),
         }
     }
@@ -3827,7 +3855,7 @@ fn geosearch_cmd(db: &mut Db, tokens: &[Vec<u8>]) -> Vec<u8> {
                     ew <= w / 2.0 && ns <= h / 2.0
                 }
             };
-            if matches {
+            if matches && geo_attr_match(db, &key, &wheres) {
                 hits.push((key, d, lon, lat));
             }
         }
@@ -4702,6 +4730,62 @@ mod tests {
             .parse()
             .unwrap();
         assert_eq!(n, expected, "indexed GEOSEARCH count != brute force");
+    }
+
+    #[test]
+    fn geosearch_where_filters_by_attribute() {
+        let mut db = Db::new();
+        // Three points within radius, with attributes.
+        cmd(
+            &mut db,
+            &[
+                b"GEOSET", b"a", b"10", b"50", b"status", b"active", b"kind", b"car",
+            ],
+        );
+        cmd(
+            &mut db,
+            &[
+                b"GEOSET", b"b", b"10.001", b"50.001", b"status", b"idle", b"kind", b"car",
+            ],
+        );
+        cmd(
+            &mut db,
+            &[
+                b"GEOSET", b"c", b"10.002", b"50.002", b"status", b"active", b"kind", b"truck",
+            ],
+        );
+        let search = |db: &mut Db, extra: &[&[u8]]| -> Vec<u8> {
+            let mut a: Vec<&[u8]> = vec![
+                b"GEOSEARCH",
+                b"FROMLONLAT",
+                b"10",
+                b"50",
+                b"BYRADIUS",
+                b"5",
+                b"km",
+            ];
+            a.extend_from_slice(extra);
+            cmd(db, &a)
+        };
+        // No filter -> all 3.
+        assert!(search(&mut db, &[]).starts_with(b"*3\r\n"));
+        // WHERE status active -> a, c.
+        assert!(search(&mut db, &[b"WHERE", b"status", b"active"]).starts_with(b"*2\r\n"));
+        // AND across two WHEREs: status active AND kind truck -> only c.
+        let one = search(
+            &mut db,
+            &[b"WHERE", b"status", b"active", b"WHERE", b"kind", b"truck"],
+        );
+        assert!(one.starts_with(b"*1\r\n"));
+        assert!(one.windows(1).count() > 0 && String::from_utf8_lossy(&one).contains('c'));
+        // No match.
+        assert!(search(&mut db, &[b"WHERE", b"status", b"gone"]).starts_with(b"*0\r\n"));
+        // Updating a point's attrs is reflected (insert replaces the whole value).
+        cmd(
+            &mut db,
+            &[b"GEOSET", b"a", b"10", b"50", b"status", b"idle"],
+        );
+        assert!(search(&mut db, &[b"WHERE", b"status", b"active"]).starts_with(b"*1\r\n"));
     }
 
     #[test]

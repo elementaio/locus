@@ -18,6 +18,10 @@ pub fn now_ms() -> u64 {
         .unwrap_or(0)
 }
 
+/// Inline attributes on a geo object (`field -> value`), insertion-ordered and
+/// typically tiny, so a `Vec` of pairs beats a map here.
+pub type GeoAttrs = Vec<(Vec<u8>, Vec<u8>)>;
+
 /// A stored value. Each variant is a distinct Redis type.
 pub enum Value {
     Str(Vec<u8>),
@@ -28,10 +32,11 @@ pub enum Value {
     /// a skiplist for O(log n) rank/range is the documented later optimization.
     ZSet(HashMap<Vec<u8>, f64>),
     Stream(Stream),
-    /// A geo point `(lon, lat)`. Each geo object is its own key (the geo-first
-    /// model): a spatial index over these keys powers GEOSEARCH and, later, the
-    /// region changefeed.
-    Geo(f64, f64),
+    /// A geo point `(lon, lat)` plus optional inline attributes (`field -> value`,
+    /// insertion-ordered). Each geo object is its own key (the geo-first model): a
+    /// spatial index over these keys powers GEOSEARCH, the attributes power
+    /// combined `WHERE field=value` filters, and the region changefeed tracks them.
+    Geo(f64, f64, GeoAttrs),
     /// A Bloom filter (probabilistic set membership / dedup).
     Bloom(crate::sketch::Bloom),
     /// A Count-Min sketch (probabilistic frequency / "trending").
@@ -250,7 +255,7 @@ impl Db {
 
     pub fn insert(&mut self, key: Vec<u8>, value: Value) {
         self.geo_unindex(&key); // drop any prior geo entry (overwrite/retype)
-        if let Value::Geo(lon, lat) = &value {
+        if let Value::Geo(lon, lat, _) = &value {
             self.geo_reindex(key.clone(), *lon, *lat);
         }
         self.data.insert(key, value);
@@ -378,7 +383,7 @@ impl Db {
         if let Some(deadline) = expire {
             self.expires.insert(key.clone(), deadline);
         }
-        if let Value::Geo(lon, lat) = &value {
+        if let Value::Geo(lon, lat, _) = &value {
             self.geo_reindex(key.clone(), *lon, *lat);
         }
         self.data.insert(key.clone(), value);
@@ -410,7 +415,7 @@ fn estimate_size(key_len: usize, v: &Value) -> usize {
                     + 24
             })
             .sum(),
-        Value::Geo(..) => 16, // two f64
+        Value::Geo(_, _, attrs) => 16 + attrs.iter().map(|(f, v)| f.len() + v.len()).sum::<usize>(),
         Value::Bloom(b) => b.bits.len(),
         Value::Cms(c) => c.counters.len() * 4,
         Value::TopK(t) => {

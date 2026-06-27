@@ -109,10 +109,10 @@ A spatial index over geo keys powers search; persists via RDB/AOF.
 
 | Command | Notes |
 |---|---|
-| `GEOSET key <lon> <lat>` | set/overwrite a key's point (lon ∈ ±180, lat ∈ ±85.05) |
+| `GEOSET key <lon> <lat> [field value ...]` | set/overwrite a key's point (lon ∈ ±180, lat ∈ ±85.05) + optional inline attributes |
 | `GEOPOS key [key ...]` | `[lon, lat]` per key (nil if missing / not geo) |
 | `GEODIST key1 key2 [m\|km\|mi\|ft]` | great-circle (haversine) distance |
-| `GEOSEARCH FROMLONLAT lon lat \| FROMKEY key  BYRADIUS r unit \| BYBOX w h unit  [ASC\|DESC] [COUNT n] [WITHCOORD] [WITHDIST]` | keys within a radius/box, optionally sorted by distance |
+| `GEOSEARCH FROMLONLAT lon lat \| FROMKEY key  BYRADIUS r unit \| BYBOX w h unit  [ASC\|DESC] [COUNT n] [WITHCOORD] [WITHDIST] [WHERE field value ...]` | keys within a radius/box (geohash-indexed), optionally sorted, and filtered by attribute (`WHERE`, AND'd) |
 
 (Live geofencing — `CDCSUBSCRIBE REGION …` over the changefeed — and a real S2/R-tree index with
 combined attribute filters are the next phases.)

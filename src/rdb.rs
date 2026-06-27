@@ -78,7 +78,8 @@ fn write_value<W: Write>(w: &mut W, key: &[u8], v: &Value) -> io::Result<()> {
         Value::Set(_) => 3,
         Value::ZSet(_) => 4,
         Value::Stream(_) => 5,
-        Value::Geo(..) => 6,
+        Value::Geo(_, _, a) if a.is_empty() => 6, // back-compat: bare point
+        Value::Geo(..) => 11,                     // geo point + inline attributes
         Value::Bloom(_) => 7,
         Value::Cms(_) => 8,
         Value::TopK(_) => 9,
@@ -128,9 +129,18 @@ fn write_value<W: Write>(w: &mut W, key: &[u8], v: &Value) -> io::Result<()> {
                 }
             }
         }
-        Value::Geo(lon, lat) => {
+        Value::Geo(lon, lat, attrs) => {
             w.write_all(&lon.to_le_bytes())?;
             w.write_all(&lat.to_le_bytes())?;
+            // Tag 11 (non-empty attrs) carries a count + field/value pairs; tag 6
+            // (empty) stops after the two coordinates, matching old snapshots.
+            if !attrs.is_empty() {
+                w.write_all(&(attrs.len() as u32).to_le_bytes())?;
+                for (f, v) in attrs {
+                    write_bytes(w, f)?;
+                    write_bytes(w, v)?;
+                }
+            }
         }
         Value::Bloom(b) => {
             w.write_all(&[b.k])?;
@@ -406,7 +416,7 @@ fn read_value<R: Read>(r: &mut R, tag: u8) -> io::Result<Value> {
             }
             Value::Stream(Stream { entries, last_id })
         }
-        6 => Value::Geo(read_f64(r)?, read_f64(r)?),
+        6 => Value::Geo(read_f64(r)?, read_f64(r)?, Vec::new()),
         7 => {
             let k = read_u8(r)?;
             let nbits = read_u64(r)?;
@@ -432,6 +442,18 @@ fn read_value<R: Read>(r: &mut R, tag: u8) -> io::Result<Value> {
             let td = crate::sketch::TDigest::from_bytes(&bytes)
                 .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "bad TDigest"))?;
             Value::TDigest(td)
+        }
+        11 => {
+            let lon = read_f64(r)?;
+            let lat = read_f64(r)?;
+            let n = read_u32(r)?;
+            let mut attrs = Vec::with_capacity(n.min(READ_ALLOC_CAP));
+            for _ in 0..n {
+                let f = read_bytes(r)?;
+                let v = read_bytes(r)?;
+                attrs.push((f, v));
+            }
+            Value::Geo(lon, lat, attrs)
         }
         _ => {
             return Err(io::Error::new(
@@ -563,6 +585,54 @@ mod tests {
 
     fn to(parts: &[&[u8]]) -> Vec<Vec<u8>> {
         parts.iter().map(|p| p.to_vec()).collect()
+    }
+
+    #[test]
+    fn geo_attributes_survive_snapshot() {
+        let path = "/tmp/locus_rdb_geoattr.rdb";
+        let _ = fs::remove_file(path);
+        let mut db = Db::new();
+        // One geo point with attrs (tag 11) and one without (tag 6, back-compat).
+        execute(
+            &to(&[b"GEOSET", b"a", b"10", b"50", b"status", b"active"]),
+            &mut db,
+        );
+        execute(&to(&[b"GEOSET", b"b", b"10", b"50"]), &mut db);
+        save_with_extras(&db, &Extras::default(), path).unwrap();
+        let mut loaded = load_with_extras(path).unwrap().0;
+
+        // The attribute filter still works after reload -> attrs persisted.
+        let hit = execute(
+            &to(&[
+                b"GEOSEARCH",
+                b"FROMLONLAT",
+                b"10",
+                b"50",
+                b"BYRADIUS",
+                b"5",
+                b"km",
+                b"WHERE",
+                b"status",
+                b"active",
+            ]),
+            &mut loaded,
+        );
+        assert!(hit.starts_with(b"*1\r\n"), "attr filter lost: {hit:?}");
+        // Both points still searchable without a filter.
+        let all = execute(
+            &to(&[
+                b"GEOSEARCH",
+                b"FROMLONLAT",
+                b"10",
+                b"50",
+                b"BYRADIUS",
+                b"5",
+                b"km",
+            ]),
+            &mut loaded,
+        );
+        assert!(all.starts_with(b"*2\r\n"));
+        let _ = fs::remove_file(path);
     }
 
     #[test]

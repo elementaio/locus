@@ -8,10 +8,12 @@ changefeed is **live geofencing**, for free.
 ## Storing points
 
 ```
-GEOSET key <lon> <lat>          # set/overwrite this key's point (like SET, but a geo value)
+GEOSET key <lon> <lat> [field value ...]   # set/overwrite this key's point + inline attributes
 ```
-`lon ∈ [-180, 180]`, `lat ∈ [-85.05, 85.05]`. The key's `TYPE` is `geo`. Points persist in RDB/AOF and
-are stored exactly (no geohash quantization), so `GEOPOS` round-trips what you set.
+`lon ∈ [-180, 180]`, `lat ∈ [-85.05, 85.05]`. The key's `TYPE` is `geo`. Optional trailing `field value`
+pairs attach **attributes** to the point (e.g. `status active kind truck`) — they travel with the object
+and power `GEOSEARCH … WHERE` filters. Points + attributes persist in RDB/AOF; coordinates are stored
+exactly (no geohash quantization), so `GEOPOS` round-trips what you set.
 
 ## Querying
 
@@ -20,11 +22,12 @@ GEOPOS  key [key ...]                       # -> [lon, lat] per key (nil if miss
 GEODIST key1 key2 [m|km|mi|ft]              # great-circle (haversine) distance
 GEOSEARCH FROMLONLAT <lon> <lat> | FROMKEY <key>
           BYRADIUS <r> <unit> | BYBOX <w> <h> <unit>
-          [ASC|DESC] [COUNT n] [WITHCOORD] [WITHDIST]
+          [ASC|DESC] [COUNT n] [WITHCOORD] [WITHDIST] [WHERE field value ...]
 ```
 
 `GEOSEARCH` returns the keys within a radius or box of a center (given as a literal point or another
-key), optionally sorted by distance and annotated:
+key), optionally sorted by distance and annotated. Each `WHERE field value` keeps only points whose
+attribute matches; repeat `WHERE` to AND several conditions (`nearby AND status=active AND kind=truck`):
 
 ```console
 redis-cli GEOSET Palermo 13.361389 38.115556
@@ -32,6 +35,8 @@ redis-cli GEOSET Catania 15.087269 37.502669
 redis-cli GEODIST  Palermo Catania km                       # -> "166.2742"
 redis-cli GEOSEARCH FROMKEY Palermo BYRADIUS 200 km ASC     # -> Palermo, Catania
 redis-cli GEOSEARCH FROMLONLAT 15 37 BYBOX 400 400 km WITHDIST WITHCOORD
+redis-cli GEOSET car:1 13.36 38.11 status active
+redis-cli GEOSEARCH FROMLONLAT 13 38 BYRADIUS 200 km WHERE status active   # nearby AND status=active
 ```
 
 ## Live geofencing
@@ -59,10 +64,13 @@ redis-cli GEOSET driver:7 30 30             # moves out      -> cdc-change del  
   covering the query box and then refines those candidates by true haversine distance. This makes the
   common case (small radius) **sub-linear** instead of scanning every geo key. A box that straddles a pole
   or the ±180° meridian safely falls back to a full scan. The 52-bit cell id is also the future shard key
-  for spatial clustering. *(A finer S2-cell / R-tree index and combined attribute filters are the next
-  step; the query interface won't change.)*
+  for spatial clustering. *(A finer S2-cell / R-tree index is the next step; combined attribute filters
+  are implemented — see `WHERE`; the query interface won't change.)*
+- **Attribute filter (`WHERE`):** evaluated on each spatial candidate after the shape test, so it composes
+  with the index for free. Attributes are stored inline on the point (`Vec` of pairs — geo objects are
+  small); a dedicated attribute index is a later optimization if filters get heavy.
 - **Distance:** haversine with Redis's earth radius (6 372 797.560856 m); units `m`/`km`/`mi`/`ft`.
 - **`BYBOX`** uses east-west and north-south distance from the center (an approximation that's good for
   modest boxes).
-- **Roadmap:** combined attribute filters (`nearby AND status=…`), keyset pagination, and **spatial
-  clustering** (the Tile38-beating part — horizontal sharding that preserves locality).
+- **Roadmap:** keyset pagination, a finer S2/R-tree index, and **spatial clustering** (the Tile38-beating
+  part — horizontal sharding that preserves locality).
