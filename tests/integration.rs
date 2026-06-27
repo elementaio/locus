@@ -2062,6 +2062,52 @@ fn cluster_cdcmerge_orders_changes_across_shards() {
 }
 
 #[test]
+fn cluster_cdcmerge_holds_watermark_for_downed_shard() {
+    let (p1, p2) = (free_port(), free_port());
+    let nodes = format!("127.0.0.1:{p1} 0-8191;127.0.0.1:{p2} 8192-16383");
+    let mut n1 = spawn_cluster_node(p1, &nodes);
+    let mut n2 = spawn_cluster_node(p2, &nodes);
+    let mut c1 = conn_to(p1);
+
+    // Two node1-owned keys (node2 is killed below, so writes must go to node1).
+    let mut keys = Vec::new();
+    for i in 0..400 {
+        let k = format!("w{i}");
+        let s: i64 = c1.cmd(&["CLUSTER", "KEYSLOT", &k]).parse().unwrap();
+        if s <= 8191 {
+            keys.push(k);
+        }
+        if keys.len() == 2 {
+            break;
+        }
+    }
+    let (early, late) = (&keys[0], &keys[1]);
+
+    // Write `early`, then merge once so node1 learns node2's floor (both up).
+    c1.cmd(&["SET", early, "1"]);
+    let r0 = c1.cmd(&["CLUSTER", "CDCMERGE", "0", "COUNT", "10"]);
+    assert!(r0.contains(early.as_str()), "early not merged while up: {r0}");
+
+    // node2 dies, then a later write lands above node2's last-known floor.
+    let _ = n2.kill();
+    let _ = n2.wait();
+    sleep(Duration::from_millis(25));
+    c1.cmd(&["SET", late, "2"]);
+
+    // node2 is down but was seen, so the watermark is held at its last floor:
+    // `late` (stamped after) is withheld, while `early` still delivers.
+    let r1 = c1.cmd(&["CLUSTER", "CDCMERGE", "0", "COUNT", "10"]);
+    assert!(r1.contains(early.as_str()), "early should still deliver: {r1}");
+    assert!(
+        !r1.contains(late.as_str()),
+        "late write must be held below the downed shard's watermark: {r1}"
+    );
+
+    let _ = n1.kill();
+    let _ = n1.wait();
+}
+
+#[test]
 fn resp3_pubsub_uses_push_frames() {
     fn drain(s: &mut TcpStream) -> Vec<u8> {
         s.set_read_timeout(Some(Duration::from_millis(300)))

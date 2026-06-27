@@ -349,6 +349,10 @@ struct Hub {
     cdc_log: VecDeque<ChangeRecord>,
     cdc_next_offset: u64,
     hlc_last: u64, // last hybrid-logical-clock stamp issued (cross-shard CDC order)
+    // Last HLC floor we heard from each peer shard during CLUSTER CDCMERGE. A peer
+    // that was seen then goes unreachable holds the merge watermark here, so the
+    // global feed never advances past a change it might still be ahead of.
+    cdc_peer_floors: HashMap<String, u64>,
     cdc_maxlen: usize,
     // changefeed consumer groups (load-balanced read mode), by group name
     cdc_groups: HashMap<Vec<u8>, CdcGroup>,
@@ -523,6 +527,7 @@ impl Hub {
             cdc_log: VecDeque::new(),
             cdc_next_offset: 1, // offset 0 means "nothing yet"
             hlc_last: 0,
+            cdc_peer_floors: HashMap::new(),
             cdc_maxlen: std::env::var("LOCUS_CDC_MAXLEN")
                 .ok()
                 .and_then(|s| s.trim().parse::<usize>().ok())
@@ -910,13 +915,21 @@ impl Hub {
                 &addr,
                 &[b"XCDCSINCE", since_s.as_bytes(), b"COUNT", b"10000"],
             ) else {
-                continue; // unreachable shard: excluded from the watermark this round
+                // Unreachable: if we've heard from this shard before, hold the
+                // watermark at its last floor so we don't emit past it. A shard
+                // never yet seen is skipped, so a boot-time outage can't stall the
+                // whole merge; its changes join once it's first reached.
+                if let Some(&known) = self.cdc_peer_floors.get(&addr) {
+                    watermark = watermark.min(known);
+                }
+                continue;
             };
             let Some(first) = flat.first() else { continue };
             if let Some(pf) = std::str::from_utf8(first)
                 .ok()
                 .and_then(|s| s.parse::<u64>().ok())
             {
+                self.cdc_peer_floors.insert(addr.clone(), pf);
                 watermark = watermark.min(pf);
             }
             for g in flat[1..].chunks_exact(4) {
