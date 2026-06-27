@@ -296,9 +296,11 @@ Resharding is **live and zero-loss**: `CLUSTER MIGRATESLOT slot dst` copies a sl
 (two-phase — copy-all then commit), and `CLUSTER SETSLOT slot NODE addr` repoints ownership at runtime
 (`CLUSTERDOWN` covers an unowned slot). **Per-shard failover** reuses the built-in sentinel: set
 `LOCUS_SENTINEL_CLUSTER_NODES` and, when a shard's master dies, the sentinel promotes its replica and
-broadcasts `CLUSTER REASSIGN old new` so the cluster routes the dead master's slots to the successor. Next:
-cross-shard changefeed ordering. Thread-per-core, replica chaining, and numbered multi-DB are explicit
-non-goals (the first two fold into clustering; prefer key-prefix namespacing over multi-DB).
+broadcasts `CLUSTER REASSIGN old new` so the cluster routes the dead master's slots to the successor. And
+the changefeed goes **cross-shard**: every change is stamped with a hybrid logical clock, and `CLUSTER
+CDCMERGE` merges all shards' feeds into one **global, HLC-ordered** stream with a watermark that bounds
+staleness. Thread-per-core, replica chaining, and numbered multi-DB are explicit non-goals (the first two
+fold into clustering; prefer key-prefix namespacing over multi-DB).
 
 **Explicit non-goals:** scripting/`EVAL`, an embedded HTTP `/metrics` endpoint (`INFO` + `redis_exporter`
 instead), and active-active replication.

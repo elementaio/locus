@@ -91,11 +91,30 @@ choke points** as WATCH / AOF / replication (writes, expiry, eviction). So the f
 - is totally ordered (single thread assigns offsets);
 - costs nothing when unused (no subscribers and `LOCUS_CDC_MAXLEN=0` → the hook returns immediately).
 
+## Cross-shard (clustered) — `CLUSTER CDCMERGE`
+
+In a cluster each shard has its own ordered feed. To get **one global feed**, every change is also stamped
+with a **hybrid logical clock** (HLC: wall-clock ms in the high bits, a logical counter in the low bits, so
+the `u64` sorts as `(physical, logical)` and stays close to real time). `CLUSTER CDCMERGE <since-hlc>
+[COUNT n]` — sent to any node — gathers that node's changes plus every peer's (since `since-hlc`) and
+returns `[hlc, event, key, value]` in **global HLC order**:
+
+```
+CLUSTER CDCMERGE 0 COUNT 100     # from the start
+CLUSTER CDCMERGE 7493020168192   # continue past the last hlc you saw
+```
+
+It only emits changes at or below a **watermark** — the minimum HLC floor across reachable shards — so a
+later read can never surface an earlier-stamped change (bounded staleness; an idle shard still advances its
+floor to the wall clock, so it doesn't stall the merge). Each shard keeps its own total order; the merge
+adds the HLC-monotone global order. Retention (`LOCUS_CDC_MAXLEN`) must be on. (HLC stamps are in-memory:
+records reloaded from a snapshot sort before live ones until re-stamped.)
+
 ## Configuration
 
 | Variable | Meaning |
 |---|---|
-| `LOCUS_CDC_MAXLEN` | retained change-log size (records) for `CDCREAD` / consumer groups; `0`/unset = off (push still works) |
+| `LOCUS_CDC_MAXLEN` | retained change-log size (records) for `CDCREAD` / consumer groups / `CLUSTER CDCMERGE`; `0`/unset = off (push still works) |
 
 ## Not goals
 

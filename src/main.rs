@@ -16,6 +16,7 @@ mod aof;
 mod commands;
 mod db;
 mod geohash;
+mod hlc;
 mod log;
 mod pubsub;
 mod rdb;
@@ -347,6 +348,7 @@ struct Hub {
     // retained change-log (for CDCREAD catch-up); empty/unused when maxlen == 0
     cdc_log: VecDeque<ChangeRecord>,
     cdc_next_offset: u64,
+    hlc_last: u64, // last hybrid-logical-clock stamp issued (cross-shard CDC order)
     cdc_maxlen: usize,
     // changefeed consumer groups (load-balanced read mode), by group name
     cdc_groups: HashMap<Vec<u8>, CdcGroup>,
@@ -412,10 +414,15 @@ struct SecondaryIndex {
 /// One retained keyspace change, addressable by a monotonic offset.
 struct ChangeRecord {
     offset: u64,
+    hlc: u64,       // hybrid logical clock stamp, for cross-shard merge ordering
     event: Vec<u8>, // "write" | "del" | "expire"
     key: Vec<u8>,
     value: Option<Vec<u8>>, // new value for string writes; None otherwise
 }
+
+/// One changefeed record for the cross-shard merge: `(hlc, event, key, value)`
+/// (value is empty for non-write events).
+type CdcMergeRec = (u64, Vec<u8>, Vec<u8>, Vec<u8>);
 
 /// What a changefeed subscriber wants: keys under a prefix, or geo keys inside a
 /// circular region (live geofencing). A region tracks its current members so it
@@ -515,6 +522,7 @@ impl Hub {
             changefeeds: HashMap::new(),
             cdc_log: VecDeque::new(),
             cdc_next_offset: 1, // offset 0 means "nothing yet"
+            hlc_last: 0,
             cdc_maxlen: std::env::var("LOCUS_CDC_MAXLEN")
                 .ok()
                 .and_then(|s| s.trim().parse::<usize>().ok())
@@ -579,6 +587,7 @@ impl Hub {
             .into_iter()
             .map(|r| ChangeRecord {
                 offset: r.offset,
+                hlc: 0, // not persisted; reloaded history sorts before live events
                 event: r.event,
                 key: r.key,
                 value: r.value,
@@ -838,6 +847,104 @@ impl Hub {
         q.format(hits)
     }
 
+    /// Local changefeed records stamped after `since` (HLC), as
+    /// `(hlc, event, key, value)`. Shared by XCDCSINCE and the merge coordinator.
+    fn cdc_since(&self, since: u64) -> Vec<CdcMergeRec> {
+        self.cdc_log
+            .iter()
+            .filter(|r| r.hlc > since)
+            .map(|r| {
+                (
+                    r.hlc,
+                    r.event.clone(),
+                    r.key.clone(),
+                    r.value.clone().unwrap_or_default(),
+                )
+            })
+            .collect()
+    }
+
+    /// Internal: this shard's changefeed since `since`, for the merge coordinator.
+    /// Flat reply: bulk[0] = our HLC floor (watermark — advances even when idle),
+    /// then 4 bulks per record (hlc, event, key, value; value empty for non-writes).
+    fn handle_xcdcsince(&mut self, id: u64, tokens: &[Vec<u8>]) {
+        let since = tokens
+            .get(1)
+            .and_then(|t| std::str::from_utf8(t).ok())
+            .and_then(|s| s.parse::<u64>().ok())
+            .unwrap_or(0);
+        let count = cdc_count_arg(tokens);
+        let mut out = vec![resp::bulk_string(
+            hlc::floor(self.hlc_last).to_string().as_bytes(),
+        )];
+        for (h, e, k, v) in self.cdc_since(since) {
+            out.push(resp::bulk_string(h.to_string().as_bytes()));
+            out.push(resp::bulk_string(&e));
+            out.push(resp::bulk_string(&k));
+            out.push(resp::bulk_string(&v));
+            if count.is_some_and(|c| c > 0 && (out.len() - 1) / 4 >= c) {
+                break;
+            }
+        }
+        self.send(id, resp::array(&out));
+    }
+
+    /// Coordinate a cross-shard changefeed merge: gather local records and every
+    /// peer's (XCDCSINCE) since `since`, then emit those at or below the watermark
+    /// (the min HLC floor across reachable shards) in global HLC order. Holding
+    /// back records above the watermark is what bounds staleness — no later read
+    /// can surface an earlier-stamped change. Returns `[hlc, event, key, value]`*.
+    fn cluster_cdcmerge(&mut self, since: u64, count: Option<usize>) -> Vec<u8> {
+        let mut watermark = hlc::floor(self.hlc_last);
+        let mut recs = self.cdc_since(since);
+        let peers = match &self.cluster {
+            Some(_) => self.cluster_peers(),
+            None => vec![],
+        };
+        let since_s = since.to_string();
+        for addr in peers {
+            let Some(flat) = cluster_call_array(
+                &addr,
+                &[b"XCDCSINCE", since_s.as_bytes(), b"COUNT", b"10000"],
+            ) else {
+                continue; // unreachable shard: excluded from the watermark this round
+            };
+            let Some(first) = flat.first() else { continue };
+            if let Some(pf) = std::str::from_utf8(first)
+                .ok()
+                .and_then(|s| s.parse::<u64>().ok())
+            {
+                watermark = watermark.min(pf);
+            }
+            for g in flat[1..].chunks_exact(4) {
+                let h = std::str::from_utf8(&g[0])
+                    .ok()
+                    .and_then(|s| s.parse().ok())
+                    .unwrap_or(0);
+                recs.push((h, g[1].clone(), g[2].clone(), g[3].clone()));
+            }
+        }
+        recs.retain(|(h, ..)| *h > since && *h <= watermark);
+        recs.sort_by_key(|(h, ..)| *h);
+        if let Some(c) = count
+            && c > 0
+        {
+            recs.truncate(c);
+        }
+        let out: Vec<Vec<u8>> = recs
+            .into_iter()
+            .map(|(h, e, k, v)| {
+                resp::array(&[
+                    resp::integer(h as i64),
+                    resp::bulk_string(&e),
+                    resp::bulk_string(&k),
+                    resp::bulk_string(&v),
+                ])
+            })
+            .collect();
+        resp::array(&out)
+    }
+
     /// Should `tokens` be redirected to another node? Returns the MOVED/CROSSSLOT
     /// reply, or None to serve locally. None when cluster mode is off.
     fn cluster_redirect(&self, tokens: &[Vec<u8>]) -> Option<Vec<u8>> {
@@ -1070,6 +1177,26 @@ impl Hub {
                     None => self.send(
                         id,
                         resp::error("ERR This instance has cluster support disabled"),
+                    ),
+                }
+            }
+            // CLUSTER CDCMERGE <since-hlc> [COUNT n] — global changefeed: merge this
+            // node's changes with every peer's, delivered in HLC order up to the
+            // cross-shard watermark. Pass 0 to start; advance <since> to the last
+            // returned hlc. Works single-node too (just the local feed, HLC-ordered).
+            Some(b"CDCMERGE") if tokens.len() >= 3 => {
+                match std::str::from_utf8(&tokens[2])
+                    .ok()
+                    .and_then(|s| s.parse::<u64>().ok())
+                {
+                    Some(since) => {
+                        let count = cdc_count_arg(tokens);
+                        let reply = self.cluster_cdcmerge(since, count);
+                        self.send(id, reply);
+                    }
+                    None => self.send(
+                        id,
+                        resp::error("ERR value is not an integer or out of range"),
                     ),
                 }
             }
@@ -1743,6 +1870,7 @@ impl Hub {
             b"XDBSIZE" => self.send(id, resp::integer(self.db.dbsize() as i64)),
             b"GEOSEARCHSHARD" => self.handle_geosearch_shard(id, &tokens),
             b"XRESTORE" => self.handle_xrestore(id, &tokens),
+            b"XCDCSINCE" => self.handle_xcdcsince(id, &tokens),
             b"CONFIG" => self.handle_config(id, &tokens),
             b"CLUSTER" => self.handle_cluster(id, &tokens),
             b"CLIENT" => self.handle_client(id, &tokens),
@@ -1988,6 +2116,8 @@ impl Hub {
         }
         let offset = self.cdc_next_offset;
         self.cdc_next_offset += 1;
+        self.hlc_last = hlc::tick(self.hlc_last); // monotonic stamp for global merge
+        let hlc = self.hlc_last;
         if !self.changefeeds.is_empty() {
             let val = match &value {
                 Some(v) => resp::bulk_string(v),
@@ -2015,6 +2145,7 @@ impl Hub {
         if self.cdc_maxlen > 0 {
             self.cdc_log.push_back(ChangeRecord {
                 offset,
+                hlc,
                 event: event.to_vec(),
                 key: key.to_vec(),
                 value,
@@ -3362,6 +3493,22 @@ fn cluster_call_int(addr: &str, args: &[&[u8]]) -> Option<i64> {
         }
     };
     go().ok()
+}
+
+/// Parse an optional `COUNT <n>` argument anywhere from index 2 (case-insensitive).
+/// Shared by XCDCSINCE and CLUSTER CDCMERGE. None if absent or unparseable.
+fn cdc_count_arg(tokens: &[Vec<u8>]) -> Option<usize> {
+    let mut i = 2;
+    while i < tokens.len() {
+        if tokens[i].eq_ignore_ascii_case(b"COUNT") {
+            return tokens
+                .get(i + 1)
+                .and_then(|t| std::str::from_utf8(t).ok())
+                .and_then(|s| s.parse::<usize>().ok());
+        }
+        i += 1;
+    }
+    None
 }
 
 /// Node-to-node call returning a flat array-of-bulks reply (`*N` then N bulks) —

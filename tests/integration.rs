@@ -1639,6 +1639,7 @@ fn spawn_cluster_node_cells(port: u16, nodes: &str, cell_bits: u32) -> Child {
         .env("LOCUS_CLUSTER_ENABLED", "1")
         .env("LOCUS_CLUSTER_ANNOUNCE", format!("127.0.0.1:{port}"))
         .env("LOCUS_CLUSTER_NODES", nodes)
+        .env("LOCUS_CDC_MAXLEN", "1000") // retain changes for CLUSTER CDCMERGE
         .stdout(Stdio::piped())
         .stderr(Stdio::null());
     if cell_bits > 0 {
@@ -1968,6 +1969,62 @@ fn cluster_per_shard_failover_reassigns_slots() {
         took_over,
         "R did not take over the shard's slots after failover"
     );
+}
+
+#[test]
+fn cluster_cdcmerge_orders_changes_across_shards() {
+    let (p1, p2) = (free_port(), free_port());
+    let nodes = format!("127.0.0.1:{p1} 0-8191;127.0.0.1:{p2} 8192-16383");
+    let mut n1 = spawn_cluster_node(p1, &nodes); // CDC retention is on by default here
+    let mut n2 = spawn_cluster_node(p2, &nodes);
+    let mut c1 = conn_to(p1);
+    let mut c2 = conn_to(p2);
+
+    // Two keys per node, by slot ownership.
+    let (mut a, mut b) = (Vec::new(), Vec::new());
+    for i in 0..600 {
+        let k = format!("e{i}");
+        let s: i64 = c1.cmd(&["CLUSTER", "KEYSLOT", &k]).parse().unwrap();
+        if s <= 8191 && a.len() < 2 {
+            a.push(k);
+        } else if s > 8191 && b.len() < 2 {
+            b.push(k);
+        }
+        if a.len() == 2 && b.len() == 2 {
+            break;
+        }
+    }
+    assert!(a.len() == 2 && b.len() == 2, "need 2 keys per node");
+
+    // Write interleaved across shards, spaced >1ms so the HLC physical part orders
+    // them deterministically: a0(n1), b0(n2), a1(n1), b1(n2).
+    let order = [&a[0], &b[0], &a[1], &b[1]];
+    c1.cmd(&["SET", &a[0], "1"]);
+    sleep(Duration::from_millis(8));
+    c2.cmd(&["SET", &b[0], "2"]);
+    sleep(Duration::from_millis(8));
+    c1.cmd(&["SET", &a[1], "3"]);
+    sleep(Duration::from_millis(8));
+    c2.cmd(&["SET", &b[1], "4"]);
+    sleep(Duration::from_millis(8)); // let the watermark advance past the last write
+
+    // The merged feed from node1 includes both shards' changes in global HLC order.
+    let r = c1.cmd(&["CLUSTER", "CDCMERGE", "0", "COUNT", "100"]);
+    let pos: Vec<usize> = order
+        .iter()
+        .map(|k| {
+            r.find(k.as_str())
+                .unwrap_or_else(|| panic!("missing {k} in {r}"))
+        })
+        .collect();
+    for w in pos.windows(2) {
+        assert!(w[0] < w[1], "cross-shard changes out of HLC order: {r}");
+    }
+
+    let _ = n1.kill();
+    let _ = n1.wait();
+    let _ = n2.kill();
+    let _ = n2.wait();
 }
 
 #[test]
