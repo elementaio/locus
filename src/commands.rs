@@ -3681,6 +3681,36 @@ enum GeoShape {
     Box(f64, f64), // width, height in meters
 }
 
+/// Bounding box (min_lon, min_lat, max_lon, max_lat) that fully contains the search
+/// shape, for the spatial-index prefilter. Returns None near a pole or the ±180
+/// meridian, where a simple box would wrap — the caller then does a full scan
+/// (correctness over speed for that rare case).
+fn geo_bbox(center: (f64, f64), shape: &GeoShape) -> Option<(f64, f64, f64, f64)> {
+    let (clon, clat) = center;
+    let (half_ns_m, half_ew_m) = match shape {
+        GeoShape::Radius(r) => (*r, *r),
+        GeoShape::Box(w, h) => (h / 2.0, w / 2.0),
+    };
+    // Generous meters-per-degree (smaller divisor -> larger box) + 20% margin, so
+    // the candidate box never under-covers the exact (haversine) matches.
+    let cosl = clat.to_radians().cos();
+    if cosl.abs() < 1e-3 {
+        return None; // near a pole: longitude scaling blows up -> full scan
+    }
+    let lat_delta = (half_ns_m / 110_000.0) * 1.2;
+    let lon_delta = (half_ew_m / (110_000.0 * cosl.abs())) * 1.2;
+    let (min_lat, max_lat) = (clat - lat_delta, clat + lat_delta);
+    let (min_lon, max_lon) = (clon - lon_delta, clon + lon_delta);
+    if !(-90.0..=90.0).contains(&min_lat)
+        || !(-90.0..=90.0).contains(&max_lat)
+        || !(-180.0..=180.0).contains(&min_lon)
+        || !(-180.0..=180.0).contains(&max_lon)
+    {
+        return None; // pole / antimeridian edge -> full scan
+    }
+    Some((min_lon, min_lat, max_lon, max_lat))
+}
+
 fn geosearch_cmd(db: &mut Db, tokens: &[Vec<u8>]) -> Vec<u8> {
     let bad = || error("ERR syntax error");
     let (mut center, mut from_key): (Option<(f64, f64)>, Option<Vec<u8>>) = (None, None);
@@ -3779,9 +3809,14 @@ fn geosearch_cmd(db: &mut Db, tokens: &[Vec<u8>]) -> Vec<u8> {
         (None, Some((w, h))) => GeoShape::Box(w, h),
         _ => return error("ERR exactly one of BYRADIUS and BYBOX can be specified"),
     };
-    // Scan the geo-key candidate set and keep the matches.
+    // Prefilter via the spatial index (a handful of geohash cells), then refine
+    // with the exact shape below. Pole/antimeridian boxes fall back to a full scan.
+    let candidates = match geo_bbox(center, &shape) {
+        Some((mn_lon, mn_lat, mx_lon, mx_lat)) => db.geo_candidates(mn_lon, mn_lat, mx_lon, mx_lat),
+        None => db.geo_keys(),
+    };
     let mut hits: Vec<(Vec<u8>, f64, f64, f64)> = Vec::new(); // (key, dist_m, lon, lat)
-    for key in db.geo_keys() {
+    for key in candidates {
         if let Ok(Some((lon, lat))) = geo_point(db, &key) {
             let d = haversine_m(center.0, center.1, lon, lat);
             let matches = match shape {
@@ -4613,6 +4648,60 @@ mod tests {
             ),
             b"*0\r\n".to_vec()
         );
+    }
+
+    #[test]
+    fn geosearch_index_matches_brute_force() {
+        // Scatter a grid of points and confirm the indexed GEOSEARCH returns the
+        // exact same count as a brute-force haversine scan — equal count proves no
+        // false negatives (the refine step already rules out false positives).
+        let mut db = Db::new();
+        let (clon, clat) = (10.0_f64, 50.0_f64);
+        let radius_m = 5000.0;
+        let mut expected = 0usize;
+        let mut idx = 0;
+        for a in -12..=12 {
+            for b in -12..=12 {
+                let lon = clon + a as f64 * 0.04;
+                let lat = clat + b as f64 * 0.04;
+                cmd(
+                    &mut db,
+                    &[
+                        b"GEOSET",
+                        format!("p{idx}").as_bytes(),
+                        lon.to_string().as_bytes(),
+                        lat.to_string().as_bytes(),
+                    ],
+                );
+                if haversine_m(clon, clat, lon, lat) <= radius_m {
+                    expected += 1;
+                }
+                idx += 1;
+            }
+        }
+        assert!(expected > 1, "test should have several in-radius points");
+        let reply = cmd(
+            &mut db,
+            &[
+                b"GEOSEARCH",
+                b"FROMLONLAT",
+                b"10",
+                b"50",
+                b"BYRADIUS",
+                b"5",
+                b"km",
+            ],
+        );
+        // Reply is a RESP array `*N\r\n…`; N is the match count.
+        let n: usize = reply
+            .iter()
+            .skip(1)
+            .take_while(|&&c| c != b'\r')
+            .map(|&c| c as char)
+            .collect::<String>()
+            .parse()
+            .unwrap();
+        assert_eq!(n, expected, "indexed GEOSEARCH count != brute force");
     }
 
     #[test]

@@ -6,8 +6,10 @@
 //! Expiry (key -> deadline) is kept in a separate map, with PASSIVE checking on
 //! access and an ACTIVE sampling reaper (see `active_expire`).
 
-use std::collections::{HashMap, HashSet, VecDeque};
+use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 use std::time::{SystemTime, UNIX_EPOCH};
+
+use crate::geohash;
 
 pub fn now_ms() -> u64 {
     SystemTime::now()
@@ -108,9 +110,12 @@ pub struct Db {
     /// `estimate_size`) — enough to bound growth, not byte-exact like Redis.
     mem_used: usize,
     sizes: HashMap<Vec<u8>, usize>,
-    /// The set of keys holding a geo point — the candidate set for GEOSEARCH.
-    /// Maintained on insert and on every removal (via `forget_size`).
-    geo_keys: HashSet<Vec<u8>>,
+    /// Spatial index for geo points: geohash cell id -> the keys in that cell,
+    /// plus a key -> cell reverse map so updates/removals are exact. Maintained on
+    /// insert and on every removal (via `forget_size`). GEOSEARCH range-scans only
+    /// the cells covering the query box instead of every geo key.
+    geo_index: BTreeMap<u64, HashSet<Vec<u8>>>,
+    geo_cell: HashMap<Vec<u8>, u64>,
 }
 
 impl Db {
@@ -121,8 +126,47 @@ impl Db {
             expired: Vec::new(),
             mem_used: 0,
             sizes: HashMap::new(),
-            geo_keys: HashSet::new(),
+            geo_index: BTreeMap::new(),
+            geo_cell: HashMap::new(),
         }
+    }
+
+    /// Add a geo point to the spatial index (caller has unindexed any prior entry).
+    fn geo_reindex(&mut self, key: Vec<u8>, lon: f64, lat: f64) {
+        let cell = geohash::encode(lon, lat);
+        self.geo_index.entry(cell).or_default().insert(key.clone());
+        self.geo_cell.insert(key, cell);
+    }
+
+    /// Remove a key from the spatial index (no-op if it isn't a geo point).
+    fn geo_unindex(&mut self, key: &[u8]) {
+        if let Some(cell) = self.geo_cell.remove(key)
+            && let Some(set) = self.geo_index.get_mut(&cell)
+        {
+            set.remove(key);
+            if set.is_empty() {
+                self.geo_index.remove(&cell);
+            }
+        }
+    }
+
+    /// Candidate geo keys whose cell overlaps the lon/lat box — the GEOSEARCH
+    /// fast path. The caller refines with the exact shape, so a few just-outside
+    /// points are fine; there are never false negatives for an in-box point.
+    pub fn geo_candidates(
+        &self,
+        min_lon: f64,
+        min_lat: f64,
+        max_lon: f64,
+        max_lat: f64,
+    ) -> Vec<Vec<u8>> {
+        let mut out = Vec::new();
+        for (lo, hi) in geohash::ranges_for_box(min_lon, min_lat, max_lon, max_lat) {
+            for keys in self.geo_index.range(lo..=hi).map(|(_, v)| v) {
+                out.extend(keys.iter().cloned());
+            }
+        }
+        out
     }
 
     fn check_expiry(&mut self, key: &[u8]) {
@@ -174,13 +218,13 @@ impl Db {
         if let Some(sz) = self.sizes.remove(key) {
             self.mem_used = self.mem_used.saturating_sub(sz);
         }
-        self.geo_keys.remove(key);
+        self.geo_unindex(key);
     }
 
     /// Candidate keys for GEOSEARCH (those holding a geo point). The caller
     /// re-reads each via `get` (which skips expired keys).
     pub fn geo_keys(&self) -> Vec<Vec<u8>> {
-        self.geo_keys.iter().cloned().collect()
+        self.geo_cell.keys().cloned().collect()
     }
 
     /// Evict one arbitrary key (HashMap order — not true LRU/random; that's a
@@ -205,10 +249,9 @@ impl Db {
     }
 
     pub fn insert(&mut self, key: Vec<u8>, value: Value) {
-        if matches!(value, Value::Geo(..)) {
-            self.geo_keys.insert(key.clone());
-        } else {
-            self.geo_keys.remove(&key); // overwriting a geo key with another type
+        self.geo_unindex(&key); // drop any prior geo entry (overwrite/retype)
+        if let Value::Geo(lon, lat) = &value {
+            self.geo_reindex(key.clone(), *lon, *lat);
         }
         self.data.insert(key, value);
     }
@@ -317,7 +360,8 @@ impl Db {
         self.expires.clear();
         self.sizes.clear();
         self.mem_used = 0;
-        self.geo_keys.clear();
+        self.geo_index.clear();
+        self.geo_cell.clear();
     }
 
     // --- persistence support (used by the RDB snapshot module) ---
@@ -334,8 +378,8 @@ impl Db {
         if let Some(deadline) = expire {
             self.expires.insert(key.clone(), deadline);
         }
-        if matches!(value, Value::Geo(..)) {
-            self.geo_keys.insert(key.clone());
+        if let Value::Geo(lon, lat) = &value {
+            self.geo_reindex(key.clone(), *lon, *lat);
         }
         self.data.insert(key.clone(), value);
         self.resync_size(&key); // loaded data counts toward used memory

@@ -15,6 +15,7 @@ mod acl;
 mod aof;
 mod commands;
 mod db;
+mod geohash;
 mod log;
 mod pubsub;
 mod rdb;

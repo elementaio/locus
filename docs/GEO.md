@@ -54,10 +54,13 @@ redis-cli GEOSET driver:7 30 30             # moves out      -> cdc-change del  
 
 ## Internals & limits
 
-- **Index:** a candidate set of geo keys is scanned and filtered by true haversine distance. This is the
-  "correct first, optimize the index later" path Locus took for sorted sets — a real **S2-cell / R-tree**
-  index (for sub-linear queries and combined attribute filters) is the documented next phase, and the
-  query interface won't change when it lands.
+- **Index:** geo points are kept in a **geohash spatial index** — each point's (lon, lat) is encoded to a
+  52-bit interleaved cell id held in a `BTreeMap`, so `GEOSEARCH` range-scans only the handful of cells
+  covering the query box and then refines those candidates by true haversine distance. This makes the
+  common case (small radius) **sub-linear** instead of scanning every geo key. A box that straddles a pole
+  or the ±180° meridian safely falls back to a full scan. The 52-bit cell id is also the future shard key
+  for spatial clustering. *(A finer S2-cell / R-tree index and combined attribute filters are the next
+  step; the query interface won't change.)*
 - **Distance:** haversine with Redis's earth radius (6 372 797.560856 m); units `m`/`km`/`mi`/`ft`.
 - **`BYBOX`** uses east-west and north-south distance from the center (an approximation that's good for
   modest boxes).
