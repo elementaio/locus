@@ -21,11 +21,13 @@ mod rdb;
 mod resp;
 mod sketch;
 mod streams;
+#[cfg(feature = "tls")]
+mod tls;
 
 use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 use std::io::{self, Read, Write};
 use std::net::{TcpListener, TcpStream};
-use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, mpsc};
 use std::thread;
 use std::time::{Duration, Instant};
@@ -111,8 +113,13 @@ fn main() -> io::Result<()> {
         .filter(|&n| n > 0)
         .unwrap_or(10_000);
     let conns = Arc::new(AtomicUsize::new(0));
+    // Connection ids are handed out from a shared counter (the TLS listener, when
+    // built in, pulls from the same sequence). 0 is reserved for the master.
+    let next_id = Arc::new(AtomicU64::new(1));
 
-    let mut next_id: u64 = 1; // 0 is reserved for the master
+    #[cfg(feature = "tls")]
+    spawn_tls_listener(&bind, &tx, &conns, &next_id, max_clients);
+
     for stream in listener.incoming() {
         match stream {
             Ok(mut conn) => {
@@ -124,8 +131,7 @@ fn main() -> io::Result<()> {
                     ));
                     continue;
                 }
-                let id = next_id;
-                next_id += 1;
+                let id = next_id.fetch_add(1, Ordering::Relaxed);
                 let tx = tx.clone();
                 let guard = ConnGuard(conns.clone());
                 thread::spawn(move || {
@@ -148,6 +154,56 @@ impl Drop for ConnGuard {
     fn drop(&mut self) {
         self.0.fetch_sub(1, Ordering::Relaxed);
     }
+}
+
+/// Bind the optional TLS listener (LOCUS_TLS_PORT) and accept on a background
+/// thread, sharing the connection-id counter and maxclients cap with plaintext.
+#[cfg(feature = "tls")]
+fn spawn_tls_listener(
+    bind: &str,
+    tx: &mpsc::Sender<Msg>,
+    conns: &Arc<AtomicUsize>,
+    next_id: &Arc<AtomicU64>,
+    max_clients: usize,
+) {
+    let port = match std::env::var("LOCUS_TLS_PORT") {
+        Ok(p) if !p.trim().is_empty() => p,
+        _ => return, // TLS compiled in but not enabled
+    };
+    let config = match tls::server_config() {
+        Ok(c) => c,
+        Err(e) => return log::error(&format!("TLS disabled: {e}")),
+    };
+    let listener = match TcpListener::bind(format!("{bind}:{port}")) {
+        Ok(l) => l,
+        Err(e) => return log::error(&format!("TLS bind failed: {e}")),
+    };
+    let addr = listener
+        .local_addr()
+        .map(|a| a.to_string())
+        .unwrap_or_else(|_| format!("{bind}:{port}"));
+    println!("Locus TLS listening on {addr}");
+
+    let (tx, conns, next_id) = (tx.clone(), conns.clone(), next_id.clone());
+    thread::spawn(move || {
+        for stream in listener.incoming() {
+            let Ok(conn) = stream else { continue };
+            if conns.fetch_add(1, Ordering::Relaxed) >= max_clients {
+                conns.fetch_sub(1, Ordering::Relaxed);
+                continue; // can't send a plaintext error on a TLS socket
+            }
+            let id = next_id.fetch_add(1, Ordering::Relaxed);
+            let tx = tx.clone();
+            let guard = ConnGuard(conns.clone());
+            let config = config.clone();
+            thread::spawn(move || {
+                let _guard = guard;
+                if let Err(e) = tls::handle_tls_conn(conn, id, tx, config) {
+                    log::warn(&format!("tls connection error: {e}"));
+                }
+            });
+        }
+    });
 }
 
 // === the hub ================================================================
@@ -2689,6 +2745,49 @@ fn read_bulk_header(s: &mut TcpStream) -> io::Result<usize> {
 
 // === per-connection: reader thread (here) + writer thread (spawned) =========
 
+/// Outcome of feeding a read buffer through the parser, shared by the plaintext
+/// and TLS connection handlers.
+pub(crate) enum Dispatch {
+    /// Parsed cleanly; `dispatched` is true if ≥1 command went to the hub.
+    /// (Only the TLS handler reads it — to decide whether to await replies.)
+    Ok {
+        #[cfg_attr(not(feature = "tls"), allow(dead_code))]
+        dispatched: bool,
+    },
+    /// A malformed frame — the caller should send these bytes and disconnect.
+    ProtocolError(Vec<u8>),
+    /// The hub channel is gone — disconnect.
+    HubGone,
+}
+
+/// Parse every complete command in `inbuf`, forward each to the hub, and drain
+/// what was consumed. O(batch), not O(batch^2), under heavy pipelining.
+pub(crate) fn dispatch_commands(inbuf: &mut Vec<u8>, id: u64, tx: &mpsc::Sender<Msg>) -> Dispatch {
+    let mut pos = 0;
+    let mut dispatched = false;
+    let result = loop {
+        match parse_command(&inbuf[pos..]) {
+            Parsed::Incomplete => break Dispatch::Ok { dispatched },
+            Parsed::Error(msg) => {
+                break Dispatch::ProtocolError(resp::error(&format!("ERR Protocol error: {msg}")));
+            }
+            Parsed::Complete(tokens, consumed) => {
+                pos += consumed;
+                if !tokens.is_empty() {
+                    if tx.send(Msg::Command { id, tokens }).is_err() {
+                        break Dispatch::HubGone;
+                    }
+                    dispatched = true;
+                }
+            }
+        }
+    };
+    if pos > 0 {
+        inbuf.drain(0..pos);
+    }
+    result
+}
+
 fn handle_conn(conn: TcpStream, id: u64, tx: mpsc::Sender<Msg>) -> io::Result<()> {
     let peer = conn.peer_addr()?;
     let is_loopback = peer.ip().is_loopback();
@@ -2724,32 +2823,19 @@ fn handle_conn(conn: TcpStream, id: u64, tx: mpsc::Sender<Msg>) -> io::Result<()
     let mut conn = conn;
     let mut inbuf: Vec<u8> = Vec::new();
     let mut chunk = [0u8; 4096];
-    'read: loop {
+    loop {
         let n = match conn.read(&mut chunk) {
             Ok(0) | Err(_) => break,
             Ok(n) => n,
         };
         inbuf.extend_from_slice(&chunk[..n]);
-        // Parse all complete commands in this batch from a moving offset, then
-        // drain once — O(batch) instead of O(batch^2) under heavy pipelining.
-        let mut pos = 0;
-        loop {
-            match parse_command(&inbuf[pos..]) {
-                Parsed::Incomplete => break,
-                Parsed::Error(msg) => {
-                    let _ = out_tx.send(resp::error(&format!("ERR Protocol error: {msg}")));
-                    break 'read;
-                }
-                Parsed::Complete(tokens, consumed) => {
-                    pos += consumed;
-                    if tx.send(Msg::Command { id, tokens }).is_err() {
-                        break 'read;
-                    }
-                }
+        match dispatch_commands(&mut inbuf, id, &tx) {
+            Dispatch::Ok { .. } => {}
+            Dispatch::ProtocolError(e) => {
+                let _ = out_tx.send(e);
+                break;
             }
-        }
-        if pos > 0 {
-            inbuf.drain(0..pos);
+            Dispatch::HubGone => break,
         }
     }
 

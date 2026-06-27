@@ -32,10 +32,12 @@ $ redis-cli -p 6379 GEOSEARCH fleet FROMLONLAT 55.27 25.2 BYRADIUS 5 km ASC   # 
 > just work.
 
 > **Status:** pre-1.0, actively hardening toward production. **Done:** AUTH + ACL + protected-mode,
-> durable persistence (crash-tested), the full reactive/geo differentiator set, and broad driver/ops
-> compatibility (`SCAN`, `INFO`, `redis_exporter`, RESP3). **Maturing:** replication (correct +
-> `WAIT`; partial-resync & failover next). **Not yet:** native in-process TLS (use a sidecar today)
-> and horizontal clustering. ~10k lines of `std`-only Rust.
+> durable persistence (crash-tested), the full reactive/geo differentiator set, broad driver/ops
+> compatibility (`SCAN`, `INFO`, `redis_exporter`, RESP3), and **TLS** — via a sidecar, or in-process
+> with the optional `tls` build feature. **Maturing:** replication (correct + `WAIT`; partial-resync &
+> failover next). **Not yet:** horizontal clustering. The **default build stays 100% dependency-free**;
+> the `tls` feature is the only thing that pulls a crate, and only when you ask for it. ~10k lines of
+> `std`-only Rust.
 
 ---
 
@@ -57,6 +59,8 @@ $ redis-cli -p 6379 GEOSEARCH fleet FROMLONLAT 55.27 25.2 BYRADIUS 5 km ASC   # 
 
 - **AUTH + ACL:** `requirepass`, **protected mode** (no accidental `0.0.0.0` exposure), and a simple
   **multi-user ACL** (`ACL SETUSER` with command classes + key prefixes) — least-privilege users.
+- **TLS:** a sidecar (zero-dep default), or **in-process** via the optional `tls` build feature
+  (rustls) — the default build pulls in nothing. See the TLS note below.
 - **Observability:** a full `INFO` (works with `redis_exporter`), `SLOWLOG`, `CONFIG GET/SET`,
   structured leveled logging, graceful `SIGTERM` shutdown (drain → fsync → final save).
 - **Resource safety:** per-connection read timeout, `TCP_NODELAY`, a max-connections cap.
@@ -162,9 +166,19 @@ redis-cli -p 6379 set foo bar
 redis-cli -p 6379 wait 1 1000        # -> (integer) 1
 ```
 
-> **TLS:** Locus does not (yet) terminate TLS in-process — keeping the core zero-dependency. Run it
-> behind a TLS proxy/sidecar (stunnel, ghostunnel, nginx `stream`) for encrypted client and replica
-> links; native opt-in TLS is on the roadmap.
+> **TLS:** two options. (1) The **zero-dependency default**: run Locus behind a TLS proxy/sidecar
+> (stunnel, ghostunnel, nginx `stream`) — see [docs/DEPLOYMENT.md](docs/DEPLOYMENT.md). (2) **In-process
+> TLS** via the optional build feature (keeps the default build dependency-free):
+>
+> ```console
+> cargo build --release --features tls
+> LOCUS_TLS_PORT=6380 LOCUS_TLS_CERT=server.crt LOCUS_TLS_KEY=server.key \
+>   LOCUS_REQUIREPASS=$PW target/release/locus      # plaintext on 6379 (loopback) + TLS on 6380
+> redis-cli --tls -p 6380 -a $PW ping
+> ```
+>
+> The `tls` feature uses rustls (pure-Rust, `ring` provider — no OpenSSL/C); the default build pulls in
+> nothing.
 
 ---
 
@@ -211,7 +225,7 @@ sharding** (each shard its own single-threaded hub), on the roadmap rather than 
 (`INFO`/`SLOWLOG`/`redis_exporter`), driver-compatible (`SCAN`/`COMMAND`/`CONFIG`/RESP3), with correct
 replication (real offsets, `WAIT`, no expiry divergence) — plus the full reactive/geo differentiator set.
 
-**Next:** PSYNC partial-resync & failover; native opt-in TLS; a real S2/R-tree geo index with combined
+**Next:** PSYNC partial-resync & automatic failover; a real S2/R-tree geo index with combined
 attribute filters; and the horizontal **spatial clustering** that nobody in the in-memory-geo space has
 packaged simply — Locus's flagship lane.
 
@@ -223,8 +237,10 @@ instead), and active-active replication.
 ## Building & testing
 
 ```console
-cargo build --release      # optimized binary at target/release/locus
+cargo build --release      # optimized binary at target/release/locus (zero dependencies)
+cargo build --release --features tls   # opt-in: in-process TLS via rustls
 cargo test                 # unit + integration (parser fuzz, crash-recovery, replication, ACL, …)
+cargo test --features tls  # also runs the TLS handshake / round-trip tests
 cargo clippy               # lints (clippy-clean under -D warnings)
 cargo fmt                  # formatting
 ```

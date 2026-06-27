@@ -17,7 +17,20 @@ categories = ["database-implementations", "caching"]
 name = "locus"
 path = "src/main.rs"
 
+[features]
+# OFF by default: the default build stays 100% dependency-free (pure std). Opt in
+# with `cargo build --features tls` to terminate TLS in-process via rustls (a
+# pure-Rust, memory-safe stack with the `ring` crypto provider — no OpenSSL/C).
+tls = ["dep:rustls"]
+
 [dependencies]
+# Optional, and only pulled in by the `tls` feature — see the note above. Pinned
+# to the ring provider so the tls build needs no C toolchain.
+rustls = { version = "0.23", default-features = false, features = [
+    "ring",
+    "std",
+    "tls12",
+], optional = true }
 
 [profile.release]
 opt-level = 3
