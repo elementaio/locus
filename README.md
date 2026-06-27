@@ -87,7 +87,8 @@ $ redis-cli -p 6379 GEOSEARCH fleet FROMLONLAT 55.27 25.2 BYRADIUS 5 km ASC   # 
 **Zero dependencies.** Pure `std`; one small static binary; reproducible builds.
 
 See [docs/COMMANDS.md](docs/COMMANDS.md) for the full reference, [docs/CLIENTS.md](docs/CLIENTS.md) for
-driving Locus from Node/Python (any Redis client works), the guides above for the differentiators, and
+driving Locus from Node/Python (any Redis client works), the guides above for the differentiators,
+[docs/DEPLOYMENT.md](docs/DEPLOYMENT.md) for running it in production (TLS, persistence, failover), and
 [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) for how it works inside.
 
 ---
@@ -164,7 +165,9 @@ redis-cli -p 6379 wait 1 1000        # -> (integer) 1
 
 > **TLS:** Locus does not (yet) terminate TLS in-process — keeping the core zero-dependency. Run it
 > behind a TLS proxy/sidecar (stunnel, ghostunnel, nginx `stream`) for encrypted client and replica
-> links; native opt-in TLS is on the roadmap.
+> links; native opt-in TLS is on the roadmap. See **[docs/DEPLOYMENT.md](docs/DEPLOYMENT.md)** for
+> copy-pasteable sidecar configs and the full production guide (hardening, persistence, monitoring,
+> failover).
 
 ---
 
