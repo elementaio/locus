@@ -1480,3 +1480,140 @@ fn sentinel_holds_failover_without_quorum() {
         "sentinel promoted without the configured quorum"
     );
 }
+
+// === native TLS (only built/run under `cargo test --features tls`) ===========
+
+#[cfg(feature = "tls")]
+mod tls_e2e {
+    use super::*;
+    use rustls::client::danger::{HandshakeSignatureValid, ServerCertVerified, ServerCertVerifier};
+    use rustls::pki_types::{CertificateDer, ServerName, UnixTime};
+    use rustls::{
+        ClientConfig, ClientConnection, DigitallySignedStruct, SignatureScheme, StreamOwned,
+    };
+    use std::sync::Arc;
+
+    const CERT: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/tests/fixtures/test-cert.pem");
+    const KEY: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/tests/fixtures/test-key.pem");
+
+    // Test-only: accept any server cert (we're exercising the server's TLS
+    // termination + RESP round-trip, not client-side verification).
+    #[derive(Debug)]
+    struct NoVerify;
+    impl ServerCertVerifier for NoVerify {
+        fn verify_server_cert(
+            &self,
+            _: &CertificateDer,
+            _: &[CertificateDer],
+            _: &ServerName,
+            _: &[u8],
+            _: UnixTime,
+        ) -> Result<ServerCertVerified, rustls::Error> {
+            Ok(ServerCertVerified::assertion())
+        }
+        fn verify_tls12_signature(
+            &self,
+            _: &[u8],
+            _: &CertificateDer,
+            _: &DigitallySignedStruct,
+        ) -> Result<HandshakeSignatureValid, rustls::Error> {
+            Ok(HandshakeSignatureValid::assertion())
+        }
+        fn verify_tls13_signature(
+            &self,
+            _: &[u8],
+            _: &CertificateDer,
+            _: &DigitallySignedStruct,
+        ) -> Result<HandshakeSignatureValid, rustls::Error> {
+            Ok(HandshakeSignatureValid::assertion())
+        }
+        fn supported_verify_schemes(&self) -> Vec<SignatureScheme> {
+            vec![
+                SignatureScheme::RSA_PSS_SHA256,
+                SignatureScheme::RSA_PSS_SHA384,
+                SignatureScheme::RSA_PSS_SHA512,
+                SignatureScheme::RSA_PKCS1_SHA256,
+                SignatureScheme::ECDSA_NISTP256_SHA256,
+                SignatureScheme::ED25519,
+            ]
+        }
+    }
+
+    /// Spawn the server with a TLS listener and return (child, tls_port).
+    fn spawn_tls_server() -> (Child, u16) {
+        let rdb = format!(
+            "{}/locus-tls-{}.rdb",
+            std::env::temp_dir().display(),
+            std::process::id()
+        );
+        let _ = std::fs::remove_file(&rdb);
+        let mut child = Command::new(env!("CARGO_BIN_EXE_locus"))
+            .env("LOCUS_PORT", "0")
+            .env("LOCUS_TLS_PORT", "0")
+            .env("LOCUS_TLS_CERT", CERT)
+            .env("LOCUS_TLS_KEY", KEY)
+            .env("LOCUS_RDB", &rdb)
+            .env_remove("LOCUS_AOF")
+            .stdout(Stdio::piped())
+            .stderr(Stdio::null())
+            .spawn()
+            .expect("spawn locus tls");
+        let stdout = child.stdout.take().unwrap();
+        let mut reader = BufReader::new(stdout);
+        let port = loop {
+            let mut line = String::new();
+            assert!(
+                reader.read_line(&mut line).unwrap() > 0,
+                "server exited early"
+            );
+            if line.contains("TLS listening")
+                && let Some(p) = line.rsplit(':').next().and_then(|s| s.trim().parse().ok())
+            {
+                break p;
+            }
+        };
+        std::thread::spawn(move || {
+            let mut sink = Vec::new();
+            let _ = reader.read_to_end(&mut sink);
+        });
+        (child, port)
+    }
+
+    #[test]
+    fn tls_handshake_and_resp_roundtrip() {
+        let _ = rustls::crypto::ring::default_provider().install_default();
+        let (mut child, port) = spawn_tls_server();
+
+        let config = ClientConfig::builder()
+            .dangerous()
+            .with_custom_certificate_verifier(Arc::new(NoVerify))
+            .with_no_client_auth();
+        let name = ServerName::try_from("localhost".to_string()).unwrap();
+        let conn = ClientConnection::new(Arc::new(config), name).unwrap();
+        let tcp = TcpStream::connect(("127.0.0.1", port)).unwrap();
+        tcp.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+        let mut tls = StreamOwned::new(conn, tcp);
+
+        // PING over TLS -> +PONG
+        tls.write_all(b"*1\r\n$4\r\nPING\r\n").unwrap();
+        let mut buf = [0u8; 64];
+        let n = tls.read(&mut buf).unwrap();
+        assert!(
+            buf[..n].starts_with(b"+PONG"),
+            "expected +PONG over TLS, got {:?}",
+            String::from_utf8_lossy(&buf[..n])
+        );
+
+        // A real write/read round-trip over the encrypted channel.
+        tls.write_all(b"*3\r\n$3\r\nSET\r\n$1\r\nk\r\n$1\r\nv\r\n")
+            .unwrap();
+        let n = tls.read(&mut buf).unwrap();
+        assert!(buf[..n].starts_with(b"+OK"));
+        tls.write_all(b"*2\r\n$3\r\nGET\r\n$1\r\nk\r\n").unwrap();
+        let n = tls.read(&mut buf).unwrap();
+        assert_eq!(&buf[..n], b"$1\r\nv\r\n");
+
+        let _ = child.kill();
+        let _ = child.wait();
+    }
+}
