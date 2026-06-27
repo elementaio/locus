@@ -1,0 +1,29 @@
+{
+  "name": "locusdb-client",
+  "version": "0.1.0",
+  "description": "Node.js client for Locus — typed access to the differentiator verbs (geo, sketches, CAS, secondary index) plus the reactive changefeed and live geofencing that a plain Redis driver can't surface.",
+  "keywords": ["locus", "locusdb", "redis", "changefeed", "cdc", "geo", "geofence"],
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/intenttext/locus",
+    "directory": "clients/node"
+  },
+  "main": "dist/index.js",
+  "types": "dist/index.d.ts",
+  "files": ["dist", "README.md"],
+  "scripts": {
+    "build": "tsc",
+    "prepublishOnly": "npm run build"
+  },
+  "engines": {
+    "node": ">=18"
+  },
+  "dependencies": {
+    "ioredis": "^5.4.0"
+  },
+  "devDependencies": {
+    "@types/node": "^20.0.0",
+    "typescript": "^5.4.0"
+  }
+}

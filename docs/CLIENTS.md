@@ -145,9 +145,32 @@ while True:
 # conn.send_command('CDCSUBSCRIBE', 'REGION', lon, lat, radius, 'km')
 ```
 
-In Node, ioredis doesn't surface a per-frame reader for custom push commands. Either use a raw
-`net.Socket` with a small RESP reader, or prefer the **pull** model above. (A thin reactive wrapper for
-the push/geofence API — `feed.on('change', …)` / `locus.geofence(…)` — is on the roadmap.)
+In Node, ioredis doesn't surface a per-frame reader for custom push commands, so use the official
+**[`locusdb-client`](../clients/node)** wrapper (below), which owns the dedicated connection and emits
+events. (Or drop to a raw `net.Socket` with a small RESP reader, or prefer the **pull** model.)
+
+## Node SDK — `locusdb-client`
+
+A thin wrapper over ioredis that adds typed helpers for the differentiator verbs and the reactive
+**changefeed / geofence** as events — the one thing a stock driver can't do. `npm install locusdb-client
+ioredis`:
+
+```js
+import { LocusClient } from 'locusdb-client';
+const locus = new LocusClient({ host: '127.0.0.1', port: 6379 });
+
+await locus.geoSet('driver:7', 13.36, 38.11, { status: 'free' });
+const hits = await locus.geoSearch({ fromLonLat: [13.4, 38.1], byRadius: [50, 'km'], withDist: true });
+
+// live changefeed + geofencing (a dedicated connection under the hood):
+locus.changefeed('user:').on('change', (c) => console.log(c.op, c.key, c.value));
+locus.geofence(13.4, 38.1, 5, 'km')
+  .on('enter', (m) => console.log('entered', m.key))
+  .on('leave', (m) => console.log('left', m.key));
+```
+
+The raw ioredis connection stays available as `locus.redis` for any standard command. Full docs:
+[clients/node/README.md](../clients/node/README.md).
 
 ## Quick testing with redis-cli
 
@@ -159,8 +182,9 @@ redis-cli -p 6379 CDCSUBSCRIBE user:      # streams snapshot, then live changes
 
 ## Notes
 
-- **No AUTH/TLS** — connect over a trusted network only. The binary binds `127.0.0.1` by default; the
-  Docker image sets `LOCUS_BIND=0.0.0.0` so a published port is reachable.
+- **Security** — `AUTH`/`requirepass`, ACLs, and protected mode are available (pass `password` to your
+  client); TLS via the optional `tls` build or a sidecar. The binary binds `127.0.0.1` by default; the
+  Docker image sets `LOCUS_BIND=0.0.0.0`. See [DEPLOYMENT.md](DEPLOYMENT.md).
 - Replies follow Redis conventions (RESP2-compatible encoders even after a RESP3 `HELLO`), so existing
   clients decode them without surprises.
 - Full command reference: [COMMANDS.md](COMMANDS.md). Semantics of the differentiators:
