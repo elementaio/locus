@@ -1833,6 +1833,54 @@ fn cluster_down_for_gap_then_setslot_serves() {
 }
 
 #[test]
+fn cluster_migrateslot_moves_keys_zero_loss() {
+    let (p1, p2) = (free_port(), free_port());
+    let nodes = format!("127.0.0.1:{p1} 0-8191;127.0.0.1:{p2} 8192-16383");
+    let mut n1 = spawn_cluster_node(p1, &nodes);
+    let mut n2 = spawn_cluster_node(p2, &nodes);
+    let mut c1 = conn_to(p1);
+    let mut c2 = conn_to(p2);
+
+    // A key owned by node1 (slot 0-8191), with a value.
+    let mut found = None;
+    for i in 0..300 {
+        let k = format!("m{i}");
+        let s: i64 = c1.cmd(&["CLUSTER", "KEYSLOT", &k]).parse().unwrap();
+        if s <= 8191 {
+            found = Some((k, s));
+            break;
+        }
+    }
+    let (k, slot) = found.expect("need a node1-owned key");
+    assert_eq!(c1.cmd(&["SET", &k, "hello"]), "OK");
+
+    // Migrate that slot to node2; propagate ownership to node2 (operator step).
+    let dst = format!("127.0.0.1:{p2}");
+    let moved: i64 = c1
+        .cmd(&["CLUSTER", "MIGRATESLOT", &slot.to_string(), &dst])
+        .parse()
+        .unwrap();
+    assert!(moved >= 1, "expected >=1 key moved, got {moved}");
+    assert_eq!(
+        c2.cmd(&["CLUSTER", "SETSLOT", &slot.to_string(), "NODE", &dst]),
+        "OK"
+    );
+
+    // Zero loss: the value lives on node2 now; node1 redirects there (no stale copy).
+    assert_eq!(c2.cmd(&["GET", &k]), "hello");
+    let r1 = c1.cmd(&["GET", &k]);
+    assert!(
+        r1.contains("MOVED") && r1.contains(&dst),
+        "expected MOVED {dst}, got {r1}"
+    );
+
+    let _ = n1.kill();
+    let _ = n1.wait();
+    let _ = n2.kill();
+    let _ = n2.wait();
+}
+
+#[test]
 fn resp3_pubsub_uses_push_frames() {
     fn drain(s: &mut TcpStream) -> Vec<u8> {
         s.set_read_timeout(Some(Duration::from_millis(300)))

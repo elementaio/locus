@@ -205,6 +205,36 @@ pub fn deserialize_with_extras(bytes: &[u8]) -> io::Result<(Db, Extras)> {
     Ok((db, extras))
 }
 
+/// Serialize one key/value/expire into a self-contained blob — the wire payload
+/// for cluster slot migration (`MIGRATE`/`XRESTORE`). Same layout as one keyspace
+/// entry: `[expire?][tag][key][value]`.
+pub fn dump_entry(key: &[u8], value: &Value, expire: Option<u64>) -> Vec<u8> {
+    let mut buf = Vec::new();
+    match expire {
+        Some(deadline) => {
+            buf.push(1);
+            buf.extend_from_slice(&deadline.to_le_bytes());
+        }
+        None => buf.push(0),
+    }
+    write_value(&mut buf, key, value).expect("writing to a Vec is infallible");
+    buf
+}
+
+/// Inverse of [`dump_entry`]: parse a migrated entry back into key/value/expire.
+pub fn restore_entry(bytes: &[u8]) -> io::Result<(Vec<u8>, Value, Option<u64>)> {
+    let mut r: &[u8] = bytes;
+    let expire = if read_u8(&mut r)? == 1 {
+        Some(read_u64(&mut r)?)
+    } else {
+        None
+    };
+    let tag = read_u8(&mut r)?;
+    let key = read_bytes(&mut r)?;
+    let value = read_value(&mut r, tag)?;
+    Ok((key, value, expire))
+}
+
 /// Serialize the whole dataset to an in-memory buffer (for replication sync).
 pub fn serialize(db: &Db) -> Vec<u8> {
     let mut buf = Vec::new();

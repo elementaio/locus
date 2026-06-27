@@ -16,7 +16,7 @@ works. This is a curated subset of Redis — the common, useful commands per typ
 | `SELECT 0` | single logical DB; `SELECT 0` is OK, other indexes error |
 | `QUIT` | |
 | `COMMAND` / `CONFIG GET` | minimal stubs so clients connect cleanly |
-| `CLUSTER INFO\|MYID\|SLOTS\|SHARDS\|NODES\|KEYSLOT key\|CELL lon lat\|SETSLOT slot NODE addr` | introspection + topology. With `LOCUS_CLUSTER_ENABLED` it reports real slot ownership and routes keys (`MOVED`/`CROSSSLOT`, `CLUSTERDOWN` for an unowned slot); off, `cluster_enabled:0`. `KEYSLOT` = CRC16 + `{hashtag}`; `CELL` = the cell tag for a point (`{cell}id` geo keys); `SETSLOT … NODE` reassigns a slot's owner at runtime (resharding/failover) |
+| `CLUSTER INFO\|MYID\|SLOTS\|SHARDS\|NODES\|KEYSLOT key\|CELL lon lat\|SETSLOT slot NODE addr\|MIGRATESLOT slot dst` | introspection + topology. With `LOCUS_CLUSTER_ENABLED` it reports real slot ownership and routes keys (`MOVED`/`CROSSSLOT`, `CLUSTERDOWN` for an unowned slot); off, `cluster_enabled:0`. `KEYSLOT` = CRC16 + `{hashtag}`; `CELL` = the cell tag for a point (`{cell}id` geo keys); `SETSLOT … NODE` reassigns a slot's owner; `MIGRATESLOT` moves a slot's keys to `dst` (zero-loss, two-phase) then hands it ownership — run `SETSLOT … NODE dst` on the other nodes to propagate |
 
 ## Generic / keyspace
 

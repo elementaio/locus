@@ -774,6 +774,18 @@ impl Hub {
         }
     }
 
+    /// Internal: install a key/value/expire migrated from another node (the receive
+    /// side of slot migration). Reindexes geo + memory like any insert. Replies `:1`.
+    fn handle_xrestore(&mut self, id: u64, tokens: &[Vec<u8>]) {
+        match tokens.get(1).map(|p| rdb::restore_entry(p)) {
+            Some(Ok((key, value, expire))) => {
+                self.db.insert_with_expire(key, value, expire);
+                self.send(id, resp::integer(1));
+            }
+            _ => self.send(id, resp::error("ERR bad XRESTORE payload")),
+        }
+    }
+
     /// Peer shards a GEOSEARCH must consult. In cell-sharded mode (`cell_bits` > 0)
     /// this is bounded to the owners of the cells the query's box covers; otherwise
     /// (or for a pole/antimeridian box) it falls back to every peer.
@@ -982,6 +994,59 @@ impl Hub {
                         id,
                         resp::error("ERR This instance has cluster support disabled"),
                     ),
+                }
+            }
+            // CLUSTER MIGRATESLOT <slot> <dst-addr> — move every local key in the
+            // slot to dst, then hand it ownership locally. Two-phase for zero loss:
+            // copy all keys (XRESTORE) first; only on full success delete them here
+            // and flip ownership (a failed copy leaves source + ownership untouched;
+            // dst keeps harmless duplicates a retry overwrites). Run CLUSTER SETSLOT
+            // NODE on the other nodes to propagate ownership. Blocks the hub for the
+            // duration (operator action) — fine for now.
+            Some(b"MIGRATESLOT") if tokens.len() == 4 => {
+                let slot = std::str::from_utf8(&tokens[2])
+                    .ok()
+                    .and_then(|s| s.trim().parse::<usize>().ok());
+                let dst = String::from_utf8_lossy(&tokens[3]).into_owned();
+                let me = self.cluster.as_ref().map(|c| c.my_addr.clone());
+                if me.is_none() {
+                    self.send(
+                        id,
+                        resp::error("ERR This instance has cluster support disabled"),
+                    );
+                } else if slot.is_none_or(|s| s >= commands::CLUSTER_SLOTS) {
+                    self.send(id, resp::error("ERR Invalid or out of range slot"));
+                } else if me.as_deref() == Some(dst.as_str()) {
+                    self.send(id, resp::error("ERR can't MIGRATESLOT to self"));
+                } else {
+                    let s = slot.unwrap();
+                    let dumps: Vec<(Vec<u8>, Vec<u8>)> = self
+                        .db
+                        .entries()
+                        .filter(|(k, _)| commands::hash_slot(k) as usize == s)
+                        .map(|(k, v)| (k.clone(), rdb::dump_entry(k, v, self.db.raw_expire(k))))
+                        .collect();
+                    // Phase 1: copy every key to dst (no deletes yet).
+                    let copied = dumps
+                        .iter()
+                        .all(|(_, p)| cluster_call_int(&dst, &[b"XRESTORE", p]) == Some(1));
+                    if !copied {
+                        self.send(
+                            id,
+                            resp::error(
+                                "ERR MIGRATESLOT failed: peer unreachable (no keys removed)",
+                            ),
+                        );
+                    } else {
+                        // Phase 2: commit — drop locals and hand dst the slot.
+                        for (k, _) in &dumps {
+                            self.db.remove(k);
+                        }
+                        if let Some(c) = self.cluster.as_mut() {
+                            c.owner[s] = Some(dst);
+                        }
+                        self.send(id, resp::integer(dumps.len() as i64));
+                    }
                 }
             }
             Some(b"COUNTKEYSINSLOT") => self.send(id, resp::integer(0)),
@@ -1653,6 +1718,7 @@ impl Hub {
             b"DBSIZE" => self.handle_dbsize(id),
             b"XDBSIZE" => self.send(id, resp::integer(self.db.dbsize() as i64)),
             b"GEOSEARCHSHARD" => self.handle_geosearch_shard(id, &tokens),
+            b"XRESTORE" => self.handle_xrestore(id, &tokens),
             b"CONFIG" => self.handle_config(id, &tokens),
             b"CLUSTER" => self.handle_cluster(id, &tokens),
             b"CLIENT" => self.handle_client(id, &tokens),
