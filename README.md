@@ -207,12 +207,27 @@ LOCUS_SENTINEL_DOWN_AFTER_MS=5000 \
 | `LOCUS_SENTINEL_DOWN_AFTER_MS` | `5000` | How long the master must be unreachable before failover |
 | `LOCUS_SENTINEL_INTERVAL_MS` | `1000` | Health-check poll interval |
 | `LOCUS_SENTINEL_QUORUM` | `1` | Replicas that must *also* report the master link down before failover (corroboration; keep ≤ replica count) |
+| `LOCUS_SENTINEL_PORT` | _(off)_ | Listen port for peer-sentinel agreement (enables multi-sentinel mode) |
+| `LOCUS_SENTINEL_PEERS` | _(empty)_ | Comma-separated peer sentinel `host:port` list |
+| `LOCUS_SENTINEL_ID` | `127.0.0.1:PORT` | This sentinel's id for leader election |
 
 Before promoting, the sentinel requires **corroboration** — a quorum of replicas must also report their
-master link down — so a sentinel that's merely partitioned from the master won't trigger a needless
-failover. It's a single-sentinel design today (inter-sentinel agreement is a later step) — run one per
-failure domain, or alongside your supervisor. See [docs/DEPLOYMENT.md](docs/DEPLOYMENT.md) for the full
-HA topology.
+master link down — so a sentinel merely partitioned from the master won't trigger a needless failover.
+
+**Run several sentinels for HA** (so failover survives a sentinel dying): give each a `LOCUS_SENTINEL_PORT`
+and list the others in `LOCUS_SENTINEL_PEERS`. A failover then also needs a **majority of sentinels** to
+agree the master is down, and only the **leader** (lowest id among the down-seeing sentinels) performs
+the promotion — the majority gate stops a partitioned minority, the leader rule stops two sentinels
+promoting different replicas. (Bully-style election over a tiny line protocol — not full Raft.)
+
+```console
+# sentinel A (run B symmetrically with PORT/PEERS swapped)
+LOCUS_SENTINEL=master:6379 LOCUS_SENTINEL_REPLICAS=r1:6379,r2:6379 \
+LOCUS_SENTINEL_PORT=26379 LOCUS_SENTINEL_PEERS=sentinelB:26379 \
+  cargo run --release
+```
+
+See [docs/DEPLOYMENT.md](docs/DEPLOYMENT.md) for the full HA topology.
 
 ---
 

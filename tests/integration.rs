@@ -1481,6 +1481,88 @@ fn sentinel_holds_failover_without_quorum() {
     );
 }
 
+/// Grab an OS-assigned free port, then release it (brief race, fine for a test).
+fn free_port() -> u16 {
+    TcpListener::bind("127.0.0.1:0")
+        .unwrap()
+        .local_addr()
+        .unwrap()
+        .port()
+}
+
+#[test]
+fn two_sentinels_agree_and_promote_exactly_once() {
+    let master = Server::start();
+    let r1 = Server::start();
+    let r2 = Server::start();
+    let mport = master.port;
+    r1.connect()
+        .cmd(&["REPLICAOF", "127.0.0.1", &mport.to_string()]);
+    r2.connect()
+        .cmd(&["REPLICAOF", "127.0.0.1", &mport.to_string()]);
+    sleep(Duration::from_millis(500));
+    master.connect().cmd(&["SET", "k", "v"]);
+    sleep(Duration::from_millis(400));
+
+    let sp1 = free_port();
+    let sp2 = free_port();
+    let spawn = |my: u16, peer: u16| {
+        Command::new(env!("CARGO_BIN_EXE_locus"))
+            .env("LOCUS_SENTINEL", format!("127.0.0.1:{mport}"))
+            .env(
+                "LOCUS_SENTINEL_REPLICAS",
+                format!("127.0.0.1:{},127.0.0.1:{}", r1.port, r2.port),
+            )
+            .env("LOCUS_SENTINEL_PORT", my.to_string())
+            .env("LOCUS_SENTINEL_PEERS", format!("127.0.0.1:{peer}"))
+            .env("LOCUS_SENTINEL_DOWN_AFTER_MS", "700")
+            .env("LOCUS_SENTINEL_INTERVAL_MS", "200")
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .expect("spawn sentinel")
+    };
+    let mut s1 = spawn(sp1, sp2);
+    let mut s2 = spawn(sp2, sp1);
+
+    drop(master); // kill the master
+
+    // Exactly one replica is promoted — never both (no split-brain), even though
+    // two sentinels race. The follower is repointed and resyncs.
+    let deadline = Instant::now() + Duration::from_secs(14);
+    let (newm, follower) = loop {
+        let m1 = role(&mut r1.connect()) == "master";
+        let m2 = role(&mut r2.connect()) == "master";
+        assert!(!(m1 && m2), "split-brain: both replicas were promoted");
+        if m1 {
+            break (&r1, &r2);
+        }
+        if m2 {
+            break (&r2, &r1);
+        }
+        assert!(Instant::now() < deadline, "no promotion by either sentinel");
+        sleep(Duration::from_millis(200));
+    };
+    newm.connect().cmd(&["SET", "after", "failover"]);
+    let propagated = loop {
+        if follower.connect().cmd(&["GET", "after"]) == "failover" {
+            break true;
+        }
+        if Instant::now() > deadline {
+            break false;
+        }
+        sleep(Duration::from_millis(200));
+    };
+    let _ = s1.kill();
+    let _ = s1.wait();
+    let _ = s2.kill();
+    let _ = s2.wait();
+    assert!(
+        propagated,
+        "follower not repointed/synced to the new master"
+    );
+}
+
 // === native TLS (only built/run under `cargo test --features tls`) ===========
 
 #[cfg(feature = "tls")]

@@ -223,9 +223,27 @@ It health-checks the master and, when it's been unreachable past `DOWN_AFTER_MS`
 **and** a quorum of replicas confirm their link is down, promotes the most
 up-to-date replica (`REPLICAOF NO ONE`) and repoints the rest. While the master is
 healthy it reconciles stray nodes (e.g. a returned old master) back to replicas —
-basic split-brain protection. It's a single-sentinel design today (inter-sentinel
-agreement is on the roadmap), so run one per failure domain. Repoint **clients** via
-your service discovery / proxy / DNS after a switch.
+basic split-brain protection. Repoint **clients** via your service discovery /
+proxy / DNS after a switch.
+
+**Run several sentinels** so failover survives a sentinel failure. Give each a
+`LOCUS_SENTINEL_PORT` and list the others in `LOCUS_SENTINEL_PEERS`:
+
+```bash
+# sentinel A (run B/C symmetrically, swapping PORT/PEERS)
+LOCUS_SENTINEL=master.host:6379 \
+LOCUS_SENTINEL_REPLICAS=replica1:6379,replica2:6379 \
+LOCUS_SENTINEL_PORT=26379 \
+LOCUS_SENTINEL_PEERS=sentinelB:26379,sentinelC:26379 \
+  locus
+```
+
+A failover then also requires a **majority of sentinels** to agree the master is
+down, and only the **leader** (lowest id among the down-seeing sentinels) performs
+the promotion — the majority gate blocks a partitioned minority, the leader rule
+prevents two sentinels promoting different replicas. Use an odd number (3 or 5) so
+a majority is well-defined. This is a bully-style election over a small line
+protocol, not full Raft (epoch consensus is a later step).
 
 ### Manual failover (runbook / fallback)
 

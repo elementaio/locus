@@ -8,11 +8,15 @@
 //! replicating from the current master (e.g. a returned old master) is pointed
 //! back, which keeps a flapping node from causing split-brain.
 //!
-//! Before failing over it requires *corroboration*: a quorum of replicas must
-//! also report their own master link down, so a sentinel that's merely partitioned
-//! from the master doesn't trigger a needless failover. This is the
-//! orchestration-hook tier from the roadmap, not embedded Raft (inter-sentinel
-//! agreement is a later step). Run one per failure domain, or beside a supervisor.
+//! Before failing over it requires *corroboration* on two axes:
+//!   * replica corroboration — a quorum of replicas must also report their master
+//!     link down (guards a single sentinel partitioned from the master); and
+//!   * inter-sentinel agreement (when peers are configured) — a majority of
+//!     sentinels must see the master down, and only the *leader* (the lowest id
+//!     among the down-seeing sentinels) performs the promotion. The majority gate
+//!     stops a partitioned minority; the leader rule stops two sentinels promoting
+//!     different replicas. This is the orchestration-hook tier — a bully-style
+//!     election over a tiny line protocol, not full Raft epochs.
 //!
 //! Config (env):
 //!   LOCUS_SENTINEL            master host:port to monitor (enables sentinel mode)
@@ -21,9 +25,15 @@
 //!   LOCUS_SENTINEL_DOWN_AFTER_MS   master-down grace before failover (default 5000)
 //!   LOCUS_SENTINEL_INTERVAL_MS     poll interval (default 1000)
 //!   LOCUS_SENTINEL_QUORUM     replicas that must confirm down before failover (default 1)
+//!   LOCUS_SENTINEL_PORT       listen port for peer-sentinel "is the master down?" queries
+//!   LOCUS_SENTINEL_PEERS      comma-separated peer sentinel host:port list
+//!   LOCUS_SENTINEL_ID         this sentinel's id for leader election (default 127.0.0.1:PORT)
 
 use std::io::{self, Read, Write};
-use std::net::{TcpStream, ToSocketAddrs};
+use std::net::{TcpListener, TcpStream, ToSocketAddrs};
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::thread;
 use std::time::{Duration, Instant};
 
 use crate::log;
@@ -46,6 +56,31 @@ pub fn run() -> io::Result<()> {
         .and_then(|s| s.trim().parse::<usize>().ok())
         .unwrap_or(1);
 
+    // Peer sentinels for inter-sentinel agreement (optional). When configured,
+    // failover also requires a majority of sentinels to see the master down and
+    // this sentinel to be the leader. `master_down` is published to peers via a
+    // tiny line server on LOCUS_SENTINEL_PORT.
+    let peers: Vec<String> = std::env::var("LOCUS_SENTINEL_PEERS")
+        .unwrap_or_default()
+        .split(',')
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+        .collect();
+    let sentinel_port = std::env::var("LOCUS_SENTINEL_PORT")
+        .ok()
+        .filter(|s| !s.is_empty());
+    let my_id = std::env::var("LOCUS_SENTINEL_ID").ok().unwrap_or_else(|| {
+        sentinel_port
+            .as_deref()
+            .map(|p| format!("127.0.0.1:{p}"))
+            .unwrap_or_default()
+    });
+    let master_down = Arc::new(AtomicBool::new(false));
+    if let Some(port) = sentinel_port.clone() {
+        let flag = master_down.clone();
+        thread::spawn(move || serve_peers(&port, flag));
+    }
+
     // The full node set is the master plus every configured replica.
     let mut nodes: Vec<String> = vec![master0.clone()];
     for r in std::env::var("LOCUS_SENTINEL_REPLICAS")
@@ -62,8 +97,9 @@ pub fn run() -> io::Result<()> {
     let mut master = master0;
     let mut down_since: Option<Instant> = None;
     log::info(&format!(
-        "sentinel: monitoring master {master} + {} replica(s); down-after {down_after}ms, quorum {quorum}",
-        nodes.len() - 1
+        "sentinel: monitoring master {master} + {} replica(s); down-after {down_after}ms, replica-quorum {quorum}, {} peer sentinel(s)",
+        nodes.len() - 1,
+        peers.len()
     ));
 
     loop {
@@ -72,14 +108,20 @@ pub fn run() -> io::Result<()> {
 
         if alive(&master, auth) {
             down_since = None;
+            master_down.store(false, Ordering::Relaxed);
             reconcile(&nodes, &master, auth);
         } else {
             let since = *down_since.get_or_insert_with(Instant::now);
             log::warn(&format!("sentinel: master {master} unreachable"));
             if since.elapsed() >= Duration::from_millis(down_after) {
+                master_down.store(true, Ordering::Relaxed); // let peers corroborate
                 if !confirmed_down(&nodes, &master, auth, quorum) {
                     log::warn(
                         "sentinel: holding failover — replicas still reach the master (likely a local partition)",
+                    );
+                } else if !sentinel_leader(&my_id, &peers) {
+                    log::warn(
+                        "sentinel: holding failover — no sentinel majority, or another sentinel leads",
                     );
                 } else if let Some(new_master) = failover(&nodes, &master, auth) {
                     log::info(&format!(
@@ -87,6 +129,7 @@ pub fn run() -> io::Result<()> {
                     ));
                     master = new_master;
                     down_since = None;
+                    master_down.store(false, Ordering::Relaxed);
                 }
             }
         }
@@ -152,6 +195,70 @@ fn confirmed_down(nodes: &[String], master: &str, auth: Option<&str>, quorum: us
         .filter(|inf| field(inf, "master_link_status").as_deref() == Some("down"))
         .count();
     confirms >= quorum
+}
+
+// === inter-sentinel agreement ================================================
+
+/// With peers configured, return true only if a majority of sentinels currently
+/// see the master down AND this sentinel is the leader (lowest id among the
+/// down-seeing sentinels). Single-sentinel (no peers) → always true (replica
+/// corroboration alone governs).
+fn sentinel_leader(my_id: &str, peers: &[String]) -> bool {
+    if peers.is_empty() {
+        return true;
+    }
+    // Down-seeing set: self (we only call this once we've decided down) + reachable
+    // peers answering "1".
+    let mut down_seeing = vec![my_id.to_string()];
+    for p in peers {
+        if peer_isdown(p) == Some(true) {
+            down_seeing.push(p.clone());
+        }
+    }
+    let majority = peers.len().div_ceil(2) + 1; // > half of (peers + self)
+    if down_seeing.len() < majority {
+        return false; // not enough sentinels agree (partition / flap)
+    }
+    // Deterministic leader: the lowest id among down-seeing sentinels acts; the
+    // rest defer, so exactly one promotion happens.
+    down_seeing.iter().min().map(|s| s.as_str()) == Some(my_id)
+}
+
+/// Ask a peer sentinel whether it currently sees the master down. None = peer
+/// unreachable (so it can't count toward the majority).
+fn peer_isdown(peer: &str) -> Option<bool> {
+    let go = || -> io::Result<bool> {
+        let mut s = connect(peer, None)?;
+        s.write_all(b"ISDOWN\n")?;
+        Ok(read_line(&mut s)? == b"1")
+    };
+    go().ok()
+}
+
+/// Serve peer "ISDOWN" / "PING" queries on a line protocol, reporting our own
+/// view of the master via the shared `master_down` flag.
+fn serve_peers(port: &str, master_down: Arc<AtomicBool>) {
+    let listener = match TcpListener::bind(format!("0.0.0.0:{port}")) {
+        Ok(l) => l,
+        Err(e) => return log::error(&format!("sentinel: peer listener bind failed: {e}")),
+    };
+    log::info(&format!("sentinel: peer agreement listening on :{port}"));
+    for stream in listener.incoming().flatten() {
+        let flag = master_down.clone();
+        thread::spawn(move || {
+            let mut s = stream;
+            let _ = s.set_read_timeout(Some(IO_TIMEOUT));
+            if let Ok(line) = read_line(&mut s) {
+                let reply: &[u8] = match line.as_slice() {
+                    b"ISDOWN" if flag.load(Ordering::Relaxed) => b"1\n",
+                    b"ISDOWN" => b"0\n",
+                    b"PING" => b"PONG\n",
+                    _ => b"-ERR\n",
+                };
+                let _ = s.write_all(reply);
+            }
+        });
+    }
 }
 
 // === tiny RESP client ========================================================
