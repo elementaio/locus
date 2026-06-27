@@ -267,8 +267,9 @@ with the official `redis-benchmark` (release build, single instance):
 | Pipelined (`-P 16`) | ~58k SET / ~80k GET ops/sec |
 
 Throughput is bounded by the single-hub design (one channel hop per command) — the deliberate price of
-lock-free, serially-consistent execution. The path to more is **thread-per-core / shared-nothing
-sharding** (each shard its own single-threaded hub), on the roadmap rather than retrofitted.
+lock-free, serially-consistent execution, and the very property (one ordered point) that makes the
+changefeed and live geo-queries possible. The path to more is **horizontal** — spatial sharding across
+nodes (P6), each shard its own single-threaded hub — rather than threading the hub itself.
 
 ---
 
@@ -276,13 +277,15 @@ sharding** (each shard its own single-threaded hub), on the roadmap rather than 
 
 **Production-readiness so far:** safe on a trusted network (AUTH/ACL/protected-mode/limits), durable
 (async snapshots, AOF + crash-recovery, persisted/replicated reactive state), observable
-(`INFO`/`SLOWLOG`/`redis_exporter`), driver-compatible (`SCAN`/`COMMAND`/`CONFIG`/RESP3), with correct
-replication (real offsets, `WAIT`, no expiry divergence) and **automatic failover** (built-in sentinel)
-— plus the full reactive/geo differentiator set.
+(`INFO`/`SLOWLOG`/`redis_exporter`), driver-compatible (`SCAN`/`COMMAND`/`CONFIG`/RESP3 incl. pub/sub
+push), with correct replication (real offsets, `WAIT`, partial-resync, no expiry divergence) and
+**automatic failover** (built-in sentinel) — plus the reactive/geo differentiator set, now with a
+**geohash-indexed `GEOSEARCH` + `WHERE` filters**, ordered-index sorted sets, and a CRC16 routing seam.
 
-**Next:** a finer S2/R-tree geo index (a geohash index already makes `GEOSEARCH` sub-linear, with
-combined `WHERE` attribute filters); thread-per-core execution; then the horizontal **spatial
-clustering** that nobody in the in-memory-geo space has packaged simply — Locus's flagship lane, done last.
+**Next — the last milestone:** the horizontal **spatial clustering** that nobody in the in-memory-geo
+space has packaged simply — Locus's flagship lane (a finer S2/R-tree geo index rides along). Thread-per-core,
+replica chaining, and numbered multi-DB are explicit non-goals (the first two fold into clustering;
+prefer key-prefix namespacing over multi-DB).
 
 **Explicit non-goals:** scripting/`EVAL`, an embedded HTTP `/metrics` endpoint (`INFO` + `redis_exporter`
 instead), and active-active replication.

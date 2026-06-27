@@ -49,10 +49,17 @@ See [CHANGEFEED.md](CHANGEFEED.md), [GEO.md](GEO.md), [SKETCHES.md](SKETCHES.md)
 
 ## Deferred (known, intentional)
 
-- A finer **S2/R-tree** geo index + keyset pagination; **thread-per-core** execution for multi-core throughput.
-- **Full RESP3 typing** of every reply (typed maps/sets/doubles + pub/sub push frames done; a few niche replies remain); multiple logical DBs (only DB 0).
+- A finer **S2/R-tree** geo index + keyset pagination (a geohash index already makes `GEOSEARCH` sub-linear).
+- **Full RESP3 typing** of every reply (typed maps/sets/doubles + pub/sub push frames done; a few niche replies remain).
 - **Native in-process TLS by default** (it's an opt-in feature; the default build stays zero-dependency).
-- The big one: horizontal **spatial clustering** (P6) — the flagship, done last.
+- The big one: horizontal **spatial clustering** (P6) — the flagship, done last; **spatial-first vs hash-slot-first** is the open call.
+
+## Dismissed (won't do — with the reasoning)
+
+- **Thread-per-core / shared-nothing hubs** — fights the single-thread identity (one ordered point powers the changefeed + geo) and overlaps clustering's cross-shard ordering. Scale is **horizontal** (P6), not vertical.
+- **Replica chaining (sub-replicas)** — niche read-fan-out; risk to the working replication offset path; P6 sharding is the scale lane.
+- **Numbered multiple DBs (`SELECT n`)** — Redis discourages it and Cluster bans DB>0, so it wouldn't compose with P6; use **key-prefix namespacing** (cluster-safe). `SELECT 0` stays for connect-compat.
+- **Scripting/`EVAL`**, an embedded HTTP `/metrics` endpoint, active-active replication.
 
 ## Distribution (shipped in v0.2.0)
 
