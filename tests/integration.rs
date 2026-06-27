@@ -1618,8 +1618,13 @@ fn cluster_routing_moved_and_crossslot() {
     assert!(cs.starts_with("-CROSSSLOT"), "{cs}");
 }
 
-/// Spawn a cluster node on a fixed port with the given topology; wait until it listens.
 fn spawn_cluster_node(port: u16, nodes: &str) -> Child {
+    spawn_cluster_node_cells(port, nodes, 0)
+}
+
+/// Spawn a cluster node on a fixed port with the given topology; wait until it
+/// listens. `cell_bits > 0` turns on cell-in-key sharding (bounded GEOSEARCH).
+fn spawn_cluster_node_cells(port: u16, nodes: &str, cell_bits: u32) -> Child {
     let rdb = format!(
         "{}/locus-clu-{}-{}.rdb",
         std::env::temp_dir().display(),
@@ -1627,17 +1632,19 @@ fn spawn_cluster_node(port: u16, nodes: &str) -> Child {
         port
     );
     let _ = std::fs::remove_file(&rdb);
-    let mut child = Command::new(env!("CARGO_BIN_EXE_locus"))
-        .env("LOCUS_PORT", port.to_string())
+    let mut cmd = Command::new(env!("CARGO_BIN_EXE_locus"));
+    cmd.env("LOCUS_PORT", port.to_string())
         .env("LOCUS_RDB", &rdb)
         .env_remove("LOCUS_AOF")
         .env("LOCUS_CLUSTER_ENABLED", "1")
         .env("LOCUS_CLUSTER_ANNOUNCE", format!("127.0.0.1:{port}"))
         .env("LOCUS_CLUSTER_NODES", nodes)
         .stdout(Stdio::piped())
-        .stderr(Stdio::null())
-        .spawn()
-        .expect("spawn cluster node");
+        .stderr(Stdio::null());
+    if cell_bits > 0 {
+        cmd.env("LOCUS_CLUSTER_CELL_BITS", cell_bits.to_string());
+    }
+    let mut child = cmd.spawn().expect("spawn cluster node");
     let mut reader = BufReader::new(child.stdout.take().unwrap());
     loop {
         let mut l = String::new();
@@ -1739,6 +1746,50 @@ fn cluster_geosearch_scatter_gather() {
         "scatter-gather should return all shards' points: {r}"
     );
     assert!(r.contains(&node2_key), "missing a node2-owned point: {r}");
+
+    let _ = n1.kill();
+    let _ = n1.wait();
+    let _ = n2.kill();
+    let _ = n2.wait();
+}
+
+#[test]
+fn cluster_geosearch_bounded_by_cell() {
+    let (p1, p2) = (free_port(), free_port());
+    let nodes = format!("127.0.0.1:{p1} 0-8191;127.0.0.1:{p2} 8192-16383");
+    let mut n1 = spawn_cluster_node_cells(p1, &nodes, 20);
+    let mut n2 = spawn_cluster_node_cells(p2, &nodes, 20);
+    let mut c1 = conn_to(p1);
+    let mut c2 = conn_to(p2);
+
+    // Place a geo point under a {cell}-tagged key on its owning node, so a region
+    // co-locates and a bounded GEOSEARCH can still find it across shards.
+    fn place(c1: &mut Conn, c2: &mut Conn, id: &str, lon: &str, lat: &str) -> String {
+        let cell = c1.cmd(&["CLUSTER", "CELL", lon, lat]);
+        let key = format!("{{{cell}}}{id}");
+        let slot: i64 = c1.cmd(&["CLUSTER", "KEYSLOT", &key]).parse().unwrap();
+        let owner = if slot <= 8191 { c1 } else { c2 };
+        assert_eq!(owner.cmd(&["GEOSET", &key, lon, lat]), "OK");
+        key
+    }
+    let near1 = place(&mut c1, &mut c2, "a", "10.00", "50.00");
+    let near2 = place(&mut c1, &mut c2, "b", "10.02", "50.00");
+    let _far = place(&mut c1, &mut c2, "z", "-100.0", "40.0");
+
+    // Bounded scatter still finds both nearby points (wherever they shard) and
+    // excludes the far one.
+    let r = c1.cmd(&[
+        "GEOSEARCH",
+        "FROMLONLAT",
+        "10.0",
+        "50.0",
+        "BYRADIUS",
+        "20",
+        "km",
+    ]);
+    assert!(r.contains(&near1), "missing near1: {r}");
+    assert!(r.contains(&near2), "missing near2: {r}");
+    assert!(!r.contains("}z"), "far point should be excluded: {r}");
 
     let _ = n1.kill();
     let _ = n1.wait();

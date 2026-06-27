@@ -3851,6 +3851,16 @@ impl GeoQuery {
         t
     }
 
+    /// The `bits`-wide geohash cells this query's box covers — the cluster shards a
+    /// bounded scatter must consult. None for a pole/antimeridian box (caller then
+    /// falls back to all shards). Used only in cell-sharded cluster mode.
+    pub fn covering_cells(&self, bits: u32) -> Option<Vec<u64>> {
+        let (mn_lon, mn_lat, mx_lon, mx_lat) = geo_bbox(self.center, &self.shape)?;
+        Some(crate::geohash::cells_for_box(
+            mn_lon, mn_lat, mx_lon, mx_lat, bits,
+        ))
+    }
+
     /// Render the reply from `hits` (local, plus any merged from peer shards):
     /// sort by distance, apply COUNT, and format per WITHCOORD/WITHDIST.
     pub fn format(&self, mut hits: Vec<GeoHit>) -> Vec<u8> {

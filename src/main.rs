@@ -229,6 +229,10 @@ fn spawn_tls_listener(
 struct Cluster {
     my_addr: String,
     owner: Vec<Option<String>>, // len 16384: slot -> owner "host:port"
+    // Cell-in-key sharding: geo keys carry a `{cell}` hashtag (cell = top
+    // `cell_bits` of the point's geohash, hex-rendered). 0 = off (GEOSEARCH
+    // scatters to all shards); >0 = bounded scatter to the cells a query covers.
+    cell_bits: u32,
 }
 
 impl Cluster {
@@ -268,7 +272,15 @@ impl Cluster {
             // No topology -> single-node cluster owning every slot.
             _ => owner.iter_mut().for_each(|o| *o = Some(my_addr.clone())),
         }
-        Some(Cluster { my_addr, owner })
+        let cell_bits = std::env::var("LOCUS_CLUSTER_CELL_BITS")
+            .ok()
+            .and_then(|s| s.trim().parse().ok())
+            .unwrap_or(0);
+        Some(Cluster {
+            my_addr,
+            owner,
+            cell_bits,
+        })
     }
 
     /// Contiguous (start, end, owner) slot ranges, for CLUSTER SLOTS/INFO.
@@ -762,6 +774,32 @@ impl Hub {
         }
     }
 
+    /// Peer shards a GEOSEARCH must consult. In cell-sharded mode (`cell_bits` > 0)
+    /// this is bounded to the owners of the cells the query's box covers; otherwise
+    /// (or for a pole/antimeridian box) it falls back to every peer.
+    fn cluster_geo_targets(&self, q: &commands::GeoQuery) -> Vec<String> {
+        let cluster = match &self.cluster {
+            Some(c) if c.cell_bits > 0 => c,
+            _ => return self.cluster_peers(),
+        };
+        match q.covering_cells(cluster.cell_bits) {
+            Some(cells) => {
+                let mut owners: Vec<String> = cells
+                    .iter()
+                    .filter_map(|code| {
+                        let slot = commands::hash_slot(format!("{code:x}").as_bytes()) as usize;
+                        cluster.owner[slot].clone()
+                    })
+                    .filter(|a| a != &cluster.my_addr)
+                    .collect();
+                owners.sort();
+                owners.dedup();
+                owners
+            }
+            None => self.cluster_peers(), // pole/antimeridian -> all shards (safe)
+        }
+    }
+
     /// Coordinate a cross-shard GEOSEARCH: collect locally, scatter GEOSEARCHSHARD
     /// to every peer, merge the raw hits, then sort/count/format once. Peer calls
     /// are bounded by short timeouts (they run synchronously on the hub for now).
@@ -773,7 +811,7 @@ impl Hub {
         let shard = q.shard_query();
         let shard_args: Vec<&[u8]> = shard.iter().map(|t| t.as_slice()).collect();
         let parse = |b: &[u8]| std::str::from_utf8(b).ok().and_then(|s| s.parse().ok());
-        for addr in self.cluster_peers() {
+        for addr in self.cluster_geo_targets(&q) {
             if let Some(flat) = cluster_call_array(&addr, &shard_args) {
                 for g in flat.chunks_exact(4) {
                     hits.push((
@@ -901,6 +939,28 @@ impl Hub {
             Some(b"KEYSLOT") if tokens.len() == 3 => {
                 let slot = commands::hash_slot(&tokens[2]) as i64;
                 self.send(id, resp::integer(slot));
+            }
+            // CLUSTER CELL <lon> <lat> -> the cell hashtag for that point, so apps
+            // can name geo keys `{<cell>}id` and have a region co-locate on a shard.
+            Some(b"CELL") if tokens.len() == 4 => {
+                let parse = |t: &[u8]| {
+                    std::str::from_utf8(t)
+                        .ok()
+                        .and_then(|s| s.trim().parse().ok())
+                };
+                match (parse(&tokens[2]), parse(&tokens[3])) {
+                    (Some(lon), Some(lat)) => {
+                        let bits = self
+                            .cluster
+                            .as_ref()
+                            .map(|c| c.cell_bits)
+                            .filter(|b| *b > 0)
+                            .unwrap_or(20);
+                        let code = geohash::cell(lon, lat, bits);
+                        self.send(id, resp::bulk_string(format!("{code:x}").as_bytes()));
+                    }
+                    _ => self.send(id, resp::error("ERR invalid longitude,latitude pair")),
+                }
             }
             Some(b"COUNTKEYSINSLOT") => self.send(id, resp::integer(0)),
             Some(b"RESET") => self.send(id, resp::simple_string("OK")),

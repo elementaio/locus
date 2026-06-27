@@ -161,6 +161,7 @@ Configured entirely through environment variables (minimal config by design):
 | `LOCUS_CLUSTER_ENABLED` | `off` | Enable cluster routing (`MOVED`/`CROSSSLOT`) |
 | `LOCUS_CLUSTER_ANNOUNCE` | `LOCUS_BIND:PORT` | This node's address in the cluster |
 | `LOCUS_CLUSTER_NODES` | _(self owns all)_ | Topology: `host:port 0-5460;host:port 5461-10922;…` |
+| `LOCUS_CLUSTER_CELL_BITS` | `0` (off) | Cell-in-key spatial sharding: bits of geohash per cell; >0 makes `GEOSEARCH` a bounded scatter (`CLUSTER CELL` gives the tag) |
 
 ### Security & replication in 30 seconds
 
@@ -287,12 +288,13 @@ push), with correct replication (real offsets, `WAIT`, partial-resync, no expiry
 
 **In progress — the last milestone:** horizontal **spatial clustering** (P6), Locus's flagship lane.
 Landed so far: **static hash-slot routing** (`MOVED`/`CROSSSLOT`, `CLUSTER SLOTS/NODES/KEYSLOT`), the
-**inter-node transport** layer (cluster-wide `DBSIZE`), and **cross-shard scatter-gather `GEOSEARCH`** —
-a query fans out to every shard and merges the hits by distance, so a clustered geo search returns one
-global result. Next: routing geo keys by their **spatial cell** so that scatter is *bounded* to the
-regions a query touches (today it fans out to all shards). Thread-per-core, replica chaining, and numbered
-multi-DB are explicit non-goals (the first two fold into clustering; prefer key-prefix namespacing over
-multi-DB).
+**inter-node transport** layer (cluster-wide `DBSIZE`), **cross-shard scatter-gather `GEOSEARCH`** (one
+global result merged by distance), and **cell-in-key spatial sharding** — name geo keys `{cell}id`
+(`cell` from `CLUSTER CELL lon lat`) so a region co-locates on one shard, and `GEOSEARCH` becomes a
+**bounded** scatter that only consults the shards whose cells the query covers — the Tile38-beating lane.
+Next: per-shard failover (reuse the sentinel) and cross-shard changefeed ordering. Thread-per-core, replica
+chaining, and numbered multi-DB are explicit non-goals (the first two fold into clustering; prefer
+key-prefix namespacing over multi-DB).
 
 **Explicit non-goals:** scripting/`EVAL`, an embedded HTTP `/metrics` endpoint (`INFO` + `redis_exporter`
 instead), and active-active replication.

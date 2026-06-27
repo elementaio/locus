@@ -73,8 +73,12 @@ redis-cli GEOSET driver:7 30 30             # moves out      -> cdc-change del  
 - **`BYBOX`** uses east-west and north-south distance from the center (an approximation that's good for
   modest boxes).
 - **Clustering:** with `LOCUS_CLUSTER_ENABLED`, `GEOSEARCH` is a **scatter-gather** — the queried node
-  fans the search out to every shard and merges the hits by distance, returning one global result. Geo
-  keys currently name-shard (so a search touches all shards); routing by **spatial cell** to make the
-  scatter *bounded* to the regions a query covers is the next step.
-- **Roadmap:** keyset pagination, a finer S2/R-tree index, and **bounded** (cell-local) cross-shard
-  `GEOSEARCH` — the Tile38-beating part: horizontal sharding that preserves locality.
+  fans out to the relevant shards and merges the hits by distance into one global result.
+  - *Unbounded* (default): geo keys name-shard, so a search consults every shard. Always correct.
+  - *Bounded* (`LOCUS_CLUSTER_CELL_BITS > 0`): name geo keys `{cell}id`, where `cell = CLUSTER CELL lon
+    lat` (the top N bits of the point's geohash, hex). A region then co-locates on one shard, and a
+    `GEOSEARCH` only consults the shards owning the cells its box covers — the Tile38-beating lane.
+    Moving an object to another cell is a re-key (`DEL` old, `GEOSET` new); name-only lookups work
+    because the cell lives in the key.
+- **Roadmap:** keyset pagination, a finer S2/R-tree index, per-shard failover, and cross-shard changefeed
+  ordering.

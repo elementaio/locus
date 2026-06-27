@@ -16,7 +16,7 @@ works. This is a curated subset of Redis — the common, useful commands per typ
 | `SELECT 0` | single logical DB; `SELECT 0` is OK, other indexes error |
 | `QUIT` | |
 | `COMMAND` / `CONFIG GET` | minimal stubs so clients connect cleanly |
-| `CLUSTER INFO\|MYID\|SLOTS\|SHARDS\|NODES\|KEYSLOT key` | introspection. With `LOCUS_CLUSTER_ENABLED` it reports real slot ownership and routes keys (`MOVED`/`CROSSSLOT`); off, it reports `cluster_enabled:0`. `KEYSLOT` = CRC16 + `{hashtag}` |
+| `CLUSTER INFO\|MYID\|SLOTS\|SHARDS\|NODES\|KEYSLOT key\|CELL lon lat` | introspection. With `LOCUS_CLUSTER_ENABLED` it reports real slot ownership and routes keys (`MOVED`/`CROSSSLOT`); off, `cluster_enabled:0`. `KEYSLOT` = CRC16 + `{hashtag}`; `CELL` returns the cell tag for a point (for `{cell}id` geo keys under cell-sharding) |
 
 ## Generic / keyspace
 

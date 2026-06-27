@@ -79,6 +79,48 @@ pub fn ranges_for_box(min_lon: f64, min_lat: f64, max_lon: f64, max_lat: f64) ->
     ranges
 }
 
+// === cluster cells (cell-in-key sharding) ====================================
+//
+// A "cell" is a fixed-precision geohash prefix: the top `bits` of the 52-bit code
+// (so `bits` is even — `bits/2` per axis). Cluster keys carry their cell as a
+// `{hashtag}`, so points in one cell co-locate on one shard, and a bounded
+// `GEOSEARCH` queries only the shards owning the cells its box covers.
+
+/// The `bits`-wide cell id for a point (the top `bits` of its 52-bit geohash).
+pub fn cell(lon: f64, lat: f64, bits: u32) -> u64 {
+    let step = (bits / 2).clamp(1, BITS);
+    let cells = (1u64 << step) as f64;
+    let la = (lat_norm(lat).clamp(0.0, 0.999_999_9) * cells) as u64;
+    let lo = (lon_norm(lon).clamp(0.0, 0.999_999_9) * cells) as u64;
+    interleave(la, lo, step)
+}
+
+/// Distinct `bits`-wide cell ids covering the lon/lat box — the shards a bounded
+/// `GEOSEARCH` must consult. Consistent with `cell`: a point in the box has its
+/// cell in this set.
+pub fn cells_for_box(
+    min_lon: f64,
+    min_lat: f64,
+    max_lon: f64,
+    max_lat: f64,
+    bits: u32,
+) -> Vec<u64> {
+    let step = (bits / 2).clamp(1, BITS);
+    let cells = (1u64 << step) as f64;
+    let idx = |norm: f64| (norm.clamp(0.0, 0.999_999_9) * cells) as u64;
+    let (la0, la1) = (idx(lat_norm(min_lat)), idx(lat_norm(max_lat)));
+    let (lo0, lo1) = (idx(lon_norm(min_lon)), idx(lon_norm(max_lon)));
+    let mut out = Vec::new();
+    for la in la0..=la1 {
+        for lo in lo0..=lo1 {
+            out.push(interleave(la, lo, step));
+        }
+    }
+    out.sort_unstable();
+    out.dedup();
+    out
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -94,6 +136,26 @@ mod tests {
             ranges.iter().any(|&(lo, hi)| code >= lo && code <= hi),
             "point code {code} not in any range {ranges:?}"
         );
+    }
+
+    #[test]
+    fn cell_is_covered_by_its_box_and_cover_set_is_small() {
+        let bits = 20;
+        let (lon, lat) = (55.27, 25.20);
+        let c = cell(lon, lat, bits);
+        // Nearby points share a coarse cell.
+        assert_eq!(c, cell(lon + 0.0001, lat + 0.0001, bits));
+        // A small box's cover set is small and includes the point's cell.
+        let d = 0.05;
+        let cells = cells_for_box(lon - d, lat - d, lon + d, lat + d, bits);
+        assert!(cells.contains(&c));
+        assert!(
+            cells.len() <= 9,
+            "small box -> few cells, got {}",
+            cells.len()
+        );
+        // A far point's cell is not in that set.
+        assert!(!cells.contains(&cell(-120.0, -40.0, bits)));
     }
 
     #[test]
