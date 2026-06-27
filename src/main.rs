@@ -744,6 +744,50 @@ impl Hub {
         self.send(id, resp::integer(total));
     }
 
+    /// Internal: compute this node's GEOSEARCH matches and return them as a flat
+    /// array of 4 bulks per hit (key, dist_m, lon, lat) for the coordinator to merge.
+    fn handle_geosearch_shard(&mut self, id: u64, tokens: &[Vec<u8>]) {
+        match commands::geosearch_collect(&mut self.db, tokens) {
+            Ok((_, hits)) => {
+                let mut flat: Vec<Vec<u8>> = Vec::with_capacity(hits.len() * 4);
+                for (k, d, lon, lat) in hits {
+                    flat.push(resp::bulk_string(&k));
+                    flat.push(resp::bulk_string(format!("{d}").as_bytes()));
+                    flat.push(resp::bulk_string(format!("{lon}").as_bytes()));
+                    flat.push(resp::bulk_string(format!("{lat}").as_bytes()));
+                }
+                self.send(id, resp::array(&flat));
+            }
+            Err(_) => self.send(id, resp::array(&[])),
+        }
+    }
+
+    /// Coordinate a cross-shard GEOSEARCH: collect locally, scatter GEOSEARCHSHARD
+    /// to every peer, merge the raw hits, then sort/count/format once. Peer calls
+    /// are bounded by short timeouts (they run synchronously on the hub for now).
+    fn cluster_geosearch(&mut self, tokens: &[Vec<u8>]) -> Vec<u8> {
+        let (q, mut hits) = match commands::geosearch_collect(&mut self.db, tokens) {
+            Ok(v) => v,
+            Err(e) => return e,
+        };
+        let shard = q.shard_query();
+        let shard_args: Vec<&[u8]> = shard.iter().map(|t| t.as_slice()).collect();
+        let parse = |b: &[u8]| std::str::from_utf8(b).ok().and_then(|s| s.parse().ok());
+        for addr in self.cluster_peers() {
+            if let Some(flat) = cluster_call_array(&addr, &shard_args) {
+                for g in flat.chunks_exact(4) {
+                    hits.push((
+                        g[0].clone(),
+                        parse(&g[1]).unwrap_or(f64::MAX),
+                        parse(&g[2]).unwrap_or(0.0),
+                        parse(&g[3]).unwrap_or(0.0),
+                    ));
+                }
+            }
+        }
+        q.format(hits)
+    }
+
     /// Should `tokens` be redirected to another node? Returns the MOVED/CROSSSLOT
     /// reply, or None to serve locally. None when cluster mode is off.
     fn cluster_redirect(&self, tokens: &[Vec<u8>]) -> Option<Vec<u8>> {
@@ -1526,6 +1570,7 @@ impl Hub {
             // local-only variant peers answer); plain DBSIZE otherwise.
             b"DBSIZE" => self.handle_dbsize(id),
             b"XDBSIZE" => self.send(id, resp::integer(self.db.dbsize() as i64)),
+            b"GEOSEARCHSHARD" => self.handle_geosearch_shard(id, &tokens),
             b"CONFIG" => self.handle_config(id, &tokens),
             b"CLUSTER" => self.handle_cluster(id, &tokens),
             b"CLIENT" => self.handle_client(id, &tokens),
@@ -2487,6 +2532,11 @@ impl Hub {
         {
             return redirect;
         }
+        // Cross-shard scatter-gather: a clustered GEOSEARCH queries every shard and
+        // merges (geo keys are name-sharded, so each node holds only a subset).
+        if id != MASTER_ID && self.cluster.is_some() && cmd.as_slice() == b"GEOSEARCH" {
+            return self.cluster_geosearch(&tokens);
+        }
         if self.master.is_some() && id != MASTER_ID && is_write {
             return resp::error("READONLY You can't write against a read only replica.");
         }
@@ -3138,6 +3188,40 @@ fn cluster_call_int(addr: &str, args: &[&[u8]]) -> Option<i64> {
                 "expected integer reply",
             )),
         }
+    };
+    go().ok()
+}
+
+/// Node-to-node call returning a flat array-of-bulks reply (`*N` then N bulks) —
+/// used for scatter-gather (GEOSEARCHSHARD returns 4 bulks per hit). None on any
+/// error; bounded by short timeouts so a dead peer can't stall the hub.
+fn cluster_call_array(addr: &str, args: &[&[u8]]) -> Option<Vec<Vec<u8>>> {
+    let sa = addr.to_socket_addrs().ok()?.next()?;
+    let go = || -> io::Result<Vec<Vec<u8>>> {
+        let mut s = TcpStream::connect_timeout(&sa, Duration::from_millis(500))?;
+        s.set_read_timeout(Some(Duration::from_millis(800)))?;
+        s.set_write_timeout(Some(Duration::from_millis(500)))?;
+        send_cmd(&mut s, args)?;
+        let line = read_line(&mut s)?;
+        if line.first() != Some(&b'*') {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "expected array reply",
+            ));
+        }
+        let n: usize = std::str::from_utf8(&line[1..])
+            .ok()
+            .and_then(|t| t.trim().parse().ok())
+            .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "bad array header"))?;
+        let mut out = Vec::new();
+        for _ in 0..n {
+            let len = read_bulk_header(&mut s)?;
+            let mut buf = vec![0u8; len + 2]; // payload + CRLF
+            s.read_exact(&mut buf)?;
+            buf.truncate(len);
+            out.push(buf);
+        }
+        Ok(out)
     };
     go().ok()
 }

@@ -1692,6 +1692,61 @@ fn cluster_dbsize_sums_all_shards() {
 }
 
 #[test]
+fn cluster_geosearch_scatter_gather() {
+    let (p1, p2) = (free_port(), free_port());
+    let nodes = format!("127.0.0.1:{p1} 0-8191;127.0.0.1:{p2} 8192-16383");
+    let mut n1 = spawn_cluster_node(p1, &nodes);
+    let mut n2 = spawn_cluster_node(p2, &nodes);
+    let mut c1 = conn_to(p1);
+    let mut c2 = conn_to(p2);
+
+    // Geo points clustered near (10,50) but with names that name-shard across both
+    // nodes. Each is stored on its owner; a node2-owned one proves the gather.
+    let total = 20;
+    let mut a_node2_key = None;
+    for i in 0..total {
+        let k = format!("pt{i}");
+        let lon = format!("{:.5}", 10.0 + (i as f64) * 0.0005); // all within a few km
+        let slot: i64 = c1.cmd(&["CLUSTER", "KEYSLOT", &k]).parse().unwrap();
+        let owner = if slot <= 8191 { &mut c1 } else { &mut c2 };
+        if slot > 8191 {
+            a_node2_key = Some(k.clone());
+        }
+        assert_eq!(owner.cmd(&["GEOSET", &k, &lon, "50.0"]), "OK");
+    }
+    let node2_key = a_node2_key.expect("test needs at least one point on node2");
+
+    // GEOSEARCH on node1 scatter-gathers both shards -> all points, incl. node2's.
+    let r = c1.cmd(&[
+        "GEOSEARCH",
+        "FROMLONLAT",
+        "10.0",
+        "50.0",
+        "BYRADIUS",
+        "50",
+        "km",
+    ]);
+    let n = if r == "[]" {
+        0
+    } else {
+        r.trim_matches(|c| c == '[' || c == ']')
+            .split(", ")
+            .filter(|s| !s.is_empty())
+            .count()
+    };
+    assert_eq!(
+        n, total,
+        "scatter-gather should return all shards' points: {r}"
+    );
+    assert!(r.contains(&node2_key), "missing a node2-owned point: {r}");
+
+    let _ = n1.kill();
+    let _ = n1.wait();
+    let _ = n2.kill();
+    let _ = n2.wait();
+}
+
+#[test]
 fn resp3_pubsub_uses_push_frames() {
     fn drain(s: &mut TcpStream) -> Vec<u8> {
         s.set_read_timeout(Some(Duration::from_millis(300)))

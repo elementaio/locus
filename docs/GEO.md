@@ -72,5 +72,9 @@ redis-cli GEOSET driver:7 30 30             # moves out      -> cdc-change del  
 - **Distance:** haversine with Redis's earth radius (6 372 797.560856 m); units `m`/`km`/`mi`/`ft`.
 - **`BYBOX`** uses east-west and north-south distance from the center (an approximation that's good for
   modest boxes).
-- **Roadmap:** keyset pagination, a finer S2/R-tree index, and **spatial clustering** (the Tile38-beating
-  part — horizontal sharding that preserves locality).
+- **Clustering:** with `LOCUS_CLUSTER_ENABLED`, `GEOSEARCH` is a **scatter-gather** — the queried node
+  fans the search out to every shard and merges the hits by distance, returning one global result. Geo
+  keys currently name-shard (so a search touches all shards); routing by **spatial cell** to make the
+  scatter *bounded* to the regions a query covers is the next step.
+- **Roadmap:** keyset pagination, a finer S2/R-tree index, and **bounded** (cell-local) cross-shard
+  `GEOSEARCH` — the Tile38-beating part: horizontal sharding that preserves locality.

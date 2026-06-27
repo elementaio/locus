@@ -90,7 +90,8 @@ pub fn command_keys(tokens: &[Vec<u8>]) -> Vec<&[u8]> {
                 .unwrap_or_default();
         }
         // Cluster-wide / cross-key data commands: not addressed to a single slot.
-        b"KEYS" | b"SCAN" | b"RANDOMKEY" | b"WAIT" | b"GEOSEARCH" | b"IDXGET" | b"IDXRANGE" => {
+        b"KEYS" | b"SCAN" | b"RANDOMKEY" | b"WAIT" | b"GEOSEARCH" | b"GEOSEARCHSHARD"
+        | b"IDXGET" | b"IDXRANGE" => {
             return vec![];
         }
         _ => {}
@@ -3800,7 +3801,98 @@ fn geo_bbox(center: (f64, f64), shape: &GeoShape) -> Option<(f64, f64, f64, f64)
     Some((min_lon, min_lat, max_lon, max_lat))
 }
 
-fn geosearch_cmd(db: &mut Db, tokens: &[Vec<u8>]) -> Vec<u8> {
+/// One GEOSEARCH match: (key, distance_m, lon, lat).
+pub type GeoHit = (Vec<u8>, f64, f64, f64);
+
+/// A parsed GEOSEARCH (without the matches), so a cluster coordinator can replay
+/// it on peers and render the merged result the same way a single node would.
+pub struct GeoQuery {
+    center: (f64, f64),
+    shape: GeoShape,
+    wheres: Vec<(Vec<u8>, Vec<u8>)>,
+    order: Option<bool>,
+    count: Option<usize>,
+    withcoord: bool,
+    withdist: bool,
+    unit_div: f64,
+}
+
+impl GeoQuery {
+    /// Tokens for the internal `GEOSEARCHSHARD` that reproduces this query on a
+    /// peer: center normalized to FROMLONLAT, shape in meters. Shards return raw
+    /// hits, so order/count/WITH* are applied only by the coordinator.
+    pub fn shard_query(&self) -> Vec<Vec<u8>> {
+        let mut t = vec![
+            b"GEOSEARCHSHARD".to_vec(),
+            b"FROMLONLAT".to_vec(),
+            format!("{}", self.center.0).into_bytes(),
+            format!("{}", self.center.1).into_bytes(),
+        ];
+        match self.shape {
+            GeoShape::Radius(r) => {
+                t.extend([
+                    b"BYRADIUS".to_vec(),
+                    format!("{r}").into_bytes(),
+                    b"M".to_vec(),
+                ]);
+            }
+            GeoShape::Box(w, h) => t.extend([
+                b"BYBOX".to_vec(),
+                format!("{w}").into_bytes(),
+                format!("{h}").into_bytes(),
+                b"M".to_vec(),
+            ]),
+        }
+        for (f, v) in &self.wheres {
+            t.push(b"WHERE".to_vec());
+            t.push(f.clone());
+            t.push(v.clone());
+        }
+        t
+    }
+
+    /// Render the reply from `hits` (local, plus any merged from peer shards):
+    /// sort by distance, apply COUNT, and format per WITHCOORD/WITHDIST.
+    pub fn format(&self, mut hits: Vec<GeoHit>) -> Vec<u8> {
+        if let Some(asc) = self.order {
+            hits.sort_by(|a, b| {
+                if asc {
+                    a.1.total_cmp(&b.1)
+                } else {
+                    b.1.total_cmp(&a.1)
+                }
+            });
+        }
+        if let Some(c) = self.count {
+            hits.truncate(c);
+        }
+        if !self.withcoord && !self.withdist {
+            return bulk_array(&hits.into_iter().map(|(k, ..)| k).collect::<Vec<_>>());
+        }
+        let mut out = Vec::new();
+        for (k, d, lon, lat) in hits {
+            let mut elem = vec![bulk_string(&k)];
+            if self.withdist {
+                elem.push(bulk_string(format!("{:.4}", d / self.unit_div).as_bytes()));
+            }
+            if self.withcoord {
+                elem.push(array(&[
+                    bulk_string(&fmt_coord(lon)),
+                    bulk_string(&fmt_coord(lat)),
+                ]));
+            }
+            out.push(array(&elem));
+        }
+        array(&out)
+    }
+}
+
+/// Parse a GEOSEARCH and collect this node's raw matches (unsorted, untruncated),
+/// returning the query (for replay/format) and the local hits — or an error reply.
+pub fn geosearch_collect(
+    db: &mut Db,
+    tokens: &[Vec<u8>],
+) -> Result<(GeoQuery, Vec<GeoHit>), Vec<u8>> {
     let bad = || error("ERR syntax error");
     let (mut center, mut from_key): (Option<(f64, f64)>, Option<Vec<u8>>) = (None, None);
     let (mut radius, mut bbox): (Option<f64>, Option<(f64, f64)>) = (None, None);
@@ -3818,7 +3910,7 @@ fn geosearch_cmd(db: &mut Db, tokens: &[Vec<u8>]) -> Vec<u8> {
                     tokens.get(i + 2).and_then(|t| parse_finite_float(t)),
                 ) {
                     (Some(a), Some(b)) => (a, b),
-                    _ => return bad(),
+                    _ => return Err(bad()),
                 };
                 center = Some((lon, lat));
                 i += 3;
@@ -3826,18 +3918,18 @@ fn geosearch_cmd(db: &mut Db, tokens: &[Vec<u8>]) -> Vec<u8> {
             b"FROMMEMBER" | b"FROMKEY" => {
                 from_key = match tokens.get(i + 1) {
                     Some(k) => Some(k.clone()),
-                    None => return bad(),
+                    None => return Err(bad()),
                 };
                 i += 2;
             }
             b"BYRADIUS" => {
                 let r = match tokens.get(i + 1).and_then(|t| parse_finite_float(t)) {
                     Some(r) => r,
-                    None => return bad(),
+                    None => return Err(bad()),
                 };
                 let u = match tokens.get(i + 2).and_then(|t| geo_unit(t)) {
                     Some(u) => u,
-                    None => return bad(),
+                    None => return Err(bad()),
                 };
                 unit_div = u;
                 radius = Some(r * u);
@@ -3849,11 +3941,11 @@ fn geosearch_cmd(db: &mut Db, tokens: &[Vec<u8>]) -> Vec<u8> {
                     tokens.get(i + 2).and_then(|t| parse_finite_float(t)),
                 ) {
                     (Some(a), Some(b)) => (a, b),
-                    _ => return bad(),
+                    _ => return Err(bad()),
                 };
                 let u = match tokens.get(i + 3).and_then(|t| geo_unit(t)) {
                     Some(u) => u,
-                    None => return bad(),
+                    None => return Err(bad()),
                 };
                 unit_div = u;
                 bbox = Some((w * u, h * u));
@@ -3870,7 +3962,7 @@ fn geosearch_cmd(db: &mut Db, tokens: &[Vec<u8>]) -> Vec<u8> {
             b"COUNT" => {
                 count = match tokens.get(i + 1).and_then(|t| parse_int(t)) {
                     Some(c) if c > 0 => Some(c as usize),
-                    _ => return error("ERR COUNT must be > 0"),
+                    _ => return Err(error("ERR COUNT must be > 0")),
                 };
                 i += 2;
             }
@@ -3883,29 +3975,36 @@ fn geosearch_cmd(db: &mut Db, tokens: &[Vec<u8>]) -> Vec<u8> {
                 i += 1;
             }
             b"WHERE" => {
-                // WHERE field value — repeatable; all must match (AND).
                 match (tokens.get(i + 1), tokens.get(i + 2)) {
                     (Some(f), Some(v)) => wheres.push((f.clone(), v.clone())),
-                    _ => return bad(),
+                    _ => return Err(bad()),
                 }
                 i += 3;
             }
-            _ => return bad(),
+            _ => return Err(bad()),
         }
     }
     let center = match (center, from_key) {
         (Some(c), None) => c,
         (None, Some(k)) => match geo_point(db, &k) {
             Ok(Some(p)) => p,
-            Ok(None) => return error("ERR could not decode requested geo member"),
-            Err(()) => return wrongtype(),
+            Ok(None) => return Err(error("ERR could not decode requested geo member")),
+            Err(()) => return Err(wrongtype()),
         },
-        _ => return error("ERR exactly one of FROMMEMBER or FROMLONLAT can be specified"),
+        _ => {
+            return Err(error(
+                "ERR exactly one of FROMMEMBER or FROMLONLAT can be specified",
+            ));
+        }
     };
     let shape = match (radius, bbox) {
         (Some(r), None) => GeoShape::Radius(r),
         (None, Some((w, h))) => GeoShape::Box(w, h),
-        _ => return error("ERR exactly one of BYRADIUS and BYBOX can be specified"),
+        _ => {
+            return Err(error(
+                "ERR exactly one of BYRADIUS and BYBOX can be specified",
+            ));
+        }
     };
     // Prefilter via the spatial index (a handful of geohash cells), then refine
     // with the exact shape below. Pole/antimeridian boxes fall back to a full scan.
@@ -3913,7 +4012,7 @@ fn geosearch_cmd(db: &mut Db, tokens: &[Vec<u8>]) -> Vec<u8> {
         Some((mn_lon, mn_lat, mx_lon, mx_lat)) => db.geo_candidates(mn_lon, mn_lat, mx_lon, mx_lat),
         None => db.geo_keys(),
     };
-    let mut hits: Vec<(Vec<u8>, f64, f64, f64)> = Vec::new(); // (key, dist_m, lon, lat)
+    let mut hits: Vec<GeoHit> = Vec::new(); // (key, dist_m, lon, lat)
     for key in candidates {
         if let Ok(Some((lon, lat))) = geo_point(db, &key) {
             let d = haversine_m(center.0, center.1, lon, lat);
@@ -3930,36 +4029,26 @@ fn geosearch_cmd(db: &mut Db, tokens: &[Vec<u8>]) -> Vec<u8> {
             }
         }
     }
-    if let Some(asc) = order {
-        hits.sort_by(|a, b| {
-            if asc {
-                a.1.total_cmp(&b.1)
-            } else {
-                b.1.total_cmp(&a.1)
-            }
-        });
+    Ok((
+        GeoQuery {
+            center,
+            shape,
+            wheres,
+            order,
+            count,
+            withcoord,
+            withdist,
+            unit_div,
+        },
+        hits,
+    ))
+}
+
+fn geosearch_cmd(db: &mut Db, tokens: &[Vec<u8>]) -> Vec<u8> {
+    match geosearch_collect(db, tokens) {
+        Ok((q, hits)) => q.format(hits),
+        Err(e) => e,
     }
-    if let Some(c) = count {
-        hits.truncate(c);
-    }
-    if !withcoord && !withdist {
-        return bulk_array(&hits.into_iter().map(|(k, ..)| k).collect::<Vec<_>>());
-    }
-    let mut out = Vec::new();
-    for (k, d, lon, lat) in hits {
-        let mut elem = vec![bulk_string(&k)];
-        if withdist {
-            elem.push(bulk_string(format!("{:.4}", d / unit_div).as_bytes()));
-        }
-        if withcoord {
-            elem.push(array(&[
-                bulk_string(&fmt_coord(lon)),
-                bulk_string(&fmt_coord(lat)),
-            ]));
-        }
-        out.push(array(&elem));
-    }
-    array(&out)
 }
 
 #[cfg(test)]

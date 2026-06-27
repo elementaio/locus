@@ -286,10 +286,11 @@ push), with correct replication (real offsets, `WAIT`, partial-resync, no expiry
 **geohash-indexed `GEOSEARCH` + `WHERE` filters**, ordered-index sorted sets, and a CRC16 routing seam.
 
 **In progress — the last milestone:** horizontal **spatial clustering** (P6), Locus's flagship lane.
-Landed so far: **static hash-slot routing** (`MOVED`/`CROSSSLOT`, `CLUSTER SLOTS/NODES/KEYSLOT`) and the
-**inter-node transport** layer (a node answers cluster-wide `DBSIZE` by summing its own keyspace plus its
-peers'). Next: cross-shard scatter-gather `GEOSEARCH`, then routing geo keys by their **spatial cell** so
-that scatter is *bounded* to the regions a query touches. Thread-per-core, replica chaining, and numbered
+Landed so far: **static hash-slot routing** (`MOVED`/`CROSSSLOT`, `CLUSTER SLOTS/NODES/KEYSLOT`), the
+**inter-node transport** layer (cluster-wide `DBSIZE`), and **cross-shard scatter-gather `GEOSEARCH`** —
+a query fans out to every shard and merges the hits by distance, so a clustered geo search returns one
+global result. Next: routing geo keys by their **spatial cell** so that scatter is *bounded* to the
+regions a query touches (today it fans out to all shards). Thread-per-core, replica chaining, and numbered
 multi-DB are explicit non-goals (the first two fold into clustering; prefer key-prefix namespacing over
 multi-DB).
 
