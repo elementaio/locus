@@ -1162,6 +1162,13 @@ fn resp3_typed_replies() {
     assert_eq!(c.cmd(&["ZSCORE", "z", "m"]), "1.5"); // double (,)
     // CONFIG GET is a map in RESP3 too.
     assert_eq!(c.cmd(&["CONFIG", "GET", "appendonly"]), "[appendonly, no]");
+    // Set-ops return RESP3 set frames (~); scores return doubles (,).
+    c.cmd(&["SADD", "s1", "a", "b", "c"]);
+    c.cmd(&["SADD", "s2", "b", "c", "d"]);
+    let inter = c.cmd(&["SINTER", "s1", "s2"]); // ~ set, order-independent
+    assert!(inter.contains('b') && inter.contains('c') && !inter.contains('a'));
+    assert_eq!(c.cmd(&["ZINCRBY", "z", "0.5", "m"]), "2"); // double (,)
+    assert_eq!(c.cmd(&["ZMSCORE", "z", "m", "absent"]), "[2, (nil)]"); // doubles + null
 }
 
 #[test]
