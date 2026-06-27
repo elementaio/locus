@@ -104,6 +104,9 @@ pub fn command_keys(tokens: &[Vec<u8>]) -> Vec<&[u8]> {
     }
 }
 
+/// Number of hash slots in the keyspace (Redis Cluster's fixed 16384).
+pub const CLUSTER_SLOTS: usize = 16384;
+
 /// Map a key to one of 16384 hash slots, honoring a `{hashtag}` (the first
 /// non-empty `{...}` is hashed instead of the whole key) — Redis Cluster's rule.
 pub fn hash_slot(key: &[u8]) -> u16 {
@@ -114,7 +117,7 @@ pub fn hash_slot(key: &[u8]) -> u16 {
         },
         None => key,
     };
-    crc16(tag) % 16384
+    crc16(tag) % CLUSTER_SLOTS as u16
 }
 
 /// Pick `k` distinct indices from `0..n` (k clamped to n) via partial

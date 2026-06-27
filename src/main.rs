@@ -252,7 +252,7 @@ impl Cluster {
             let port = std::env::var("LOCUS_PORT").unwrap_or_else(|_| "6379".to_string());
             format!("{bind}:{port}")
         });
-        let mut owner = vec![None; 16384];
+        let mut owner = vec![None; commands::CLUSTER_SLOTS];
         match std::env::var("LOCUS_CLUSTER_NODES") {
             Ok(spec) if !spec.trim().is_empty() => {
                 for node in spec.split(';').map(str::trim).filter(|s| !s.is_empty()) {
@@ -850,7 +850,9 @@ impl Hub {
         match &cluster.owner[slot.unwrap() as usize] {
             Some(a) if a == &cluster.my_addr => None, // ours
             Some(a) => Some(resp::error(&format!("MOVED {} {a}", slot.unwrap()))),
-            None => None, // unassigned slot: serve locally for now
+            // No node owns this slot — the cluster can't serve it (a single-node or
+            // fully-covered cluster never hits this; a gap in the topology does).
+            None => Some(resp::error("CLUSTERDOWN Hash slot not served")),
         }
     }
 
@@ -960,6 +962,26 @@ impl Hub {
                         self.send(id, resp::bulk_string(format!("{code:x}").as_bytes()));
                     }
                     _ => self.send(id, resp::error("ERR invalid longitude,latitude pair")),
+                }
+            }
+            // CLUSTER SETSLOT <slot> NODE <addr> — reassign a slot's owner at
+            // runtime (the basis for resharding and failover). Run on every node so
+            // the cluster agrees; pair with MIGRATE to move the data first.
+            Some(b"SETSLOT") if tokens.len() == 5 && tokens[3].eq_ignore_ascii_case(b"NODE") => {
+                let slot = std::str::from_utf8(&tokens[2])
+                    .ok()
+                    .and_then(|s| s.trim().parse::<usize>().ok());
+                let addr = String::from_utf8_lossy(&tokens[4]).into_owned();
+                match (self.cluster.as_mut(), slot) {
+                    (Some(c), Some(s)) if s < commands::CLUSTER_SLOTS => {
+                        c.owner[s] = Some(addr);
+                        self.send(id, resp::simple_string("OK"));
+                    }
+                    (Some(_), _) => self.send(id, resp::error("ERR Invalid or out of range slot")),
+                    (None, _) => self.send(
+                        id,
+                        resp::error("ERR This instance has cluster support disabled"),
+                    ),
                 }
             }
             Some(b"COUNTKEYSINSLOT") => self.send(id, resp::integer(0)),

@@ -1798,6 +1798,41 @@ fn cluster_geosearch_bounded_by_cell() {
 }
 
 #[test]
+fn cluster_down_for_gap_then_setslot_serves() {
+    let p1 = free_port();
+    // Topology with a deliberate gap: we own 0-10000, 10001-16383 are unassigned.
+    let nodes = format!("127.0.0.1:{p1} 0-10000");
+    let mut n1 = spawn_cluster_node(p1, &nodes);
+    let mut c1 = conn_to(p1);
+
+    // A key landing in the gap can't be served -> CLUSTERDOWN.
+    let mut gap = None;
+    for i in 0..200 {
+        let k = format!("k{i}");
+        let slot: i64 = c1.cmd(&["CLUSTER", "KEYSLOT", &k]).parse().unwrap();
+        if slot > 10000 {
+            gap = Some((k, slot));
+            break;
+        }
+    }
+    let (gk, gslot) = gap.expect("need a key in the unassigned range");
+    let r = c1.cmd(&["SET", &gk, "v"]);
+    assert!(r.contains("CLUSTERDOWN"), "expected CLUSTERDOWN, got {r}");
+
+    // Assign that slot to ourselves at runtime -> the key is now served.
+    let me = format!("127.0.0.1:{p1}");
+    assert_eq!(
+        c1.cmd(&["CLUSTER", "SETSLOT", &gslot.to_string(), "NODE", &me]),
+        "OK"
+    );
+    assert_eq!(c1.cmd(&["SET", &gk, "v"]), "OK");
+    assert_eq!(c1.cmd(&["GET", &gk]), "v");
+
+    let _ = n1.kill();
+    let _ = n1.wait();
+}
+
+#[test]
 fn resp3_pubsub_uses_push_frames() {
     fn drain(s: &mut TcpStream) -> Vec<u8> {
         s.set_read_timeout(Some(Duration::from_millis(300)))
