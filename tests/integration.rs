@@ -1307,3 +1307,23 @@ fn replica_reports_link_up_and_its_own_offset() {
         sleep(Duration::from_millis(50));
     }
 }
+
+#[test]
+fn wait_counts_replicas_that_acked() {
+    let master = Server::start();
+    let replica = Server::start();
+    let mut m = master.connect();
+    let mut r = replica.connect();
+    // No replicas required -> returns immediately.
+    assert_eq!(m.cmd(&["WAIT", "0", "100"]), "0");
+    assert_eq!(
+        r.cmd(&["REPLICAOF", "127.0.0.1", &master.port.to_string()]),
+        "OK"
+    );
+    sleep(Duration::from_millis(400));
+    m.cmd(&["SET", "k", "v"]);
+    // The replica acks the write within the timeout, so WAIT 1 returns 1.
+    assert_eq!(m.cmd(&["WAIT", "1", "2000"]), "1");
+    // Asking for more replicas than exist times out and returns the real count.
+    assert_eq!(m.cmd(&["WAIT", "5", "300"]), "1");
+}

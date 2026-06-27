@@ -211,6 +211,9 @@ struct Hub {
     replid: String,
     master_repl_offset: u64,
     master_link_up: bool, // replica side: is the link to our master up?
+    // master side: each replica's last-acked offset + clients parked on WAIT.
+    replica_acks: HashMap<u64, u64>,
+    waiting: Vec<WaitReq>,
 }
 
 /// One slow-log entry.
@@ -265,6 +268,14 @@ struct BlockedReader {
     specs: Vec<(Vec<u8>, db::StreamId)>,
     count: Option<usize>,
     deadline: Option<u64>, // None = block forever
+}
+
+/// A client parked on WAIT until enough replicas ack `target` (or it times out).
+struct WaitReq {
+    id: u64,
+    target: u64,
+    numreplicas: usize,
+    deadline: Option<u64>, // None = block forever (WAIT ... 0)
 }
 
 /// Per-client transaction state (MULTI/EXEC/WATCH).
@@ -372,6 +383,8 @@ impl Hub {
                 .to_string(),
             master_repl_offset: 0,
             master_link_up: false,
+            replica_acks: HashMap::new(),
+            waiting: Vec::new(),
         };
         hub.apply_extras(extras);
         hub
@@ -1099,7 +1112,26 @@ impl Hub {
             b"AUTH" => self.handle_auth(id, &tokens),
 
             // --- replication ---
-            b"REPLCONF" => self.send(id, resp::simple_string("OK")),
+            b"REPLCONF" => {
+                // A replica's periodic `REPLCONF ACK <offset>` gets no reply; any
+                // other REPLCONF (e.g. listening-port) just acks OK.
+                if tokens
+                    .get(1)
+                    .is_some_and(|s| s.eq_ignore_ascii_case(b"ACK"))
+                {
+                    if let Some(off) = tokens
+                        .get(2)
+                        .and_then(|t| std::str::from_utf8(t).ok())
+                        .and_then(|s| s.parse::<u64>().ok())
+                    {
+                        self.replica_acks.insert(id, off);
+                        self.check_waits();
+                    }
+                } else {
+                    self.send(id, resp::simple_string("OK"));
+                }
+            }
+            b"WAIT" => self.handle_wait(id, &tokens),
             b"PSYNC" | b"SYNC" => {
                 self.send(
                     id,
@@ -1861,6 +1893,61 @@ impl Hub {
         }
     }
 
+    /// WAIT numreplicas timeout — reply with the count of replicas that have
+    /// acked the offset as of this command, blocking up to `timeout` ms (0 =
+    /// forever) until that many catch up.
+    fn handle_wait(&mut self, id: u64, tokens: &[Vec<u8>]) {
+        let parse = |t: Option<&Vec<u8>>| -> Option<u64> {
+            std::str::from_utf8(t?).ok()?.trim().parse().ok()
+        };
+        let (numreplicas, timeout) = match (parse(tokens.get(1)), parse(tokens.get(2))) {
+            (Some(n), Some(t)) => (n as usize, t),
+            _ => {
+                return self.send(
+                    id,
+                    resp::error("ERR wrong number of arguments for 'wait' command"),
+                );
+            }
+        };
+        let target = self.master_repl_offset;
+        let acked = self.count_acked(target);
+        if acked >= numreplicas {
+            return self.send(id, resp::integer(acked as i64));
+        }
+        let deadline = if timeout == 0 {
+            None
+        } else {
+            Some(now_ms() + timeout)
+        };
+        self.waiting.push(WaitReq {
+            id,
+            target,
+            numreplicas,
+            deadline,
+        });
+    }
+
+    fn count_acked(&self, target: u64) -> usize {
+        self.replica_acks.values().filter(|&&o| o >= target).count()
+    }
+
+    /// Reply to any parked WAITs whose replica quorum is now met or that timed out.
+    fn check_waits(&mut self) {
+        let now = now_ms();
+        let mut i = 0;
+        while i < self.waiting.len() {
+            let w = &self.waiting[i];
+            let acked = self.count_acked(w.target);
+            if acked >= w.numreplicas || w.deadline.is_some_and(|d| d <= now) {
+                let rid = w.id;
+                self.waiting.remove(i);
+                self.send(rid, resp::integer(acked as i64));
+            } else {
+                i += 1;
+            }
+        }
+    }
+
     /// RESP3 negotiation. Accepts HELLO [2|3]; replies with server info as a
     /// RESP3 map (proto 3) or RESP2 flat array (proto 2). Most reply types are
     /// identical across RESP2/RESP3, so we track the version but keep the
@@ -2364,6 +2451,8 @@ fn run_hub(rx: mpsc::Receiver<Msg>, tx: mpsc::Sender<Msg>) {
                     hub.unwatch_keys(&t.watched, id);
                 }
                 hub.blocked.retain(|r| r.id != id);
+                hub.replica_acks.remove(&id);
+                hub.waiting.retain(|w| w.id != id);
                 hub.protos.remove(&id);
                 hub.changefeeds.remove(&id);
                 hub.authed.remove(&id);
@@ -2417,6 +2506,7 @@ fn run_hub(rx: mpsc::Receiver<Msg>, tx: mpsc::Sender<Msg>) {
                 }
                 hub.dirty_expired_watchers();
                 hub.expire_blocked();
+                hub.check_waits();
             }
             Err(mpsc::RecvTimeoutError::Disconnected) => break,
         }
@@ -2515,6 +2605,7 @@ fn try_sync(
     stream.set_read_timeout(Some(Duration::from_millis(200)))?;
     let mut inbuf: Vec<u8> = Vec::new();
     let mut chunk = [0u8; 4096];
+    let mut applied = offset; // our processed offset, seeded from FULLRESYNC
     loop {
         if stop.load(Ordering::Relaxed) {
             return Ok(());
@@ -2527,6 +2618,7 @@ fn try_sync(
                     match parse_command(&inbuf) {
                         Parsed::Complete(tokens, consumed) => {
                             inbuf.drain(0..consumed);
+                            applied += consumed as u64;
                             if !tokens.is_empty()
                                 && hub_tx
                                     .send(Msg::Command {
@@ -2542,12 +2634,19 @@ fn try_sync(
                         Parsed::Error(_) => return Ok(()),
                     }
                 }
+                let off = applied.to_string();
+                let _ = send_cmd(&mut stream, &[b"REPLCONF", b"ACK", off.as_bytes()]);
             }
             Err(e)
                 if matches!(
                     e.kind(),
                     io::ErrorKind::WouldBlock | io::ErrorKind::TimedOut
-                ) => {}
+                ) =>
+            {
+                // Idle: keep the master's view of our offset fresh (drives WAIT).
+                let off = applied.to_string();
+                let _ = send_cmd(&mut stream, &[b"REPLCONF", b"ACK", off.as_bytes()]);
+            }
             Err(e) => return Err(e),
         }
     }

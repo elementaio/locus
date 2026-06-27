@@ -306,7 +306,7 @@ pub fn command_meta(cmd: &[u8]) -> Option<CmdMeta> {
         | b"ZMSCORE" | b"ZRANK" | b"ZREVRANK" | b"PUBLISH" | b"REPLICAOF" | b"SLAVEOF"
         | b"LPOS" | b"SINTERCARD" | b"GETBIT" | b"BITPOS" | b"CDCGROUP" | b"CDCREADGROUP"
         | b"CDCACK" | b"GEODIST" | b"BFEXISTS" | b"CMSQUERY" | b"TOPKCOUNT" | b"TDQUANTILE"
-        | b"IDXCREATE" | b"IDXGET" | b"HSCAN" | b"SSCAN" | b"ZSCAN" => (3, false),
+        | b"IDXCREATE" | b"IDXGET" | b"HSCAN" | b"SSCAN" | b"ZSCAN" | b"WAIT" => (3, false),
         // arity 3 writes
         b"INCRBY" | b"DECRBY" | b"APPEND" | b"HDEL" | b"SADD" | b"SREM" | b"ZREM" | b"EXPIRE"
         | b"PEXPIRE" | b"EXPIREAT" | b"PEXPIREAT" | b"LPUSH" | b"RPUSH" | b"LPUSHX" | b"RPUSHX"
@@ -518,6 +518,7 @@ static COMMAND_NAMES: &[&[u8]] = &[
     b"UNLINK",
     b"UNSUBSCRIBE",
     b"UNWATCH",
+    b"WAIT",
     b"WATCH",
     b"XADD",
     b"XLEN",
