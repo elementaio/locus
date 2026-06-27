@@ -213,9 +213,9 @@ pub fn execute_proto(tokens: &[Vec<u8>], db: &mut Db, proto: u8) -> Vec<u8> {
         b"SCARD" => scard_cmd(db, tokens),
         b"SPOP" => spop_cmd(db, tokens),
         b"SRANDMEMBER" => srandmember_cmd(db, tokens),
-        b"SINTER" => setop_cmd(db, tokens, SetOp::Inter),
-        b"SUNION" => setop_cmd(db, tokens, SetOp::Union),
-        b"SDIFF" => setop_cmd(db, tokens, SetOp::Diff),
+        b"SINTER" => setop_cmd(db, tokens, SetOp::Inter, proto),
+        b"SUNION" => setop_cmd(db, tokens, SetOp::Union, proto),
+        b"SDIFF" => setop_cmd(db, tokens, SetOp::Diff, proto),
         b"SINTERSTORE" => setop_store_cmd(db, tokens, SetOp::Inter),
         b"SUNIONSTORE" => setop_store_cmd(db, tokens, SetOp::Union),
         b"SDIFFSTORE" => setop_store_cmd(db, tokens, SetOp::Diff),
@@ -224,10 +224,10 @@ pub fn execute_proto(tokens: &[Vec<u8>], db: &mut Db, proto: u8) -> Vec<u8> {
         // sorted sets
         b"ZADD" => zadd_cmd(db, tokens),
         b"ZSCORE" => zscore_cmd(db, tokens, proto),
-        b"ZMSCORE" => zmscore_cmd(db, tokens),
+        b"ZMSCORE" => zmscore_cmd(db, tokens, proto),
         b"ZCARD" => zcard_cmd(db, tokens),
         b"ZREM" => zrem_cmd(db, tokens),
-        b"ZINCRBY" => zincrby_cmd(db, tokens),
+        b"ZINCRBY" => zincrby_cmd(db, tokens, proto),
         b"ZRANK" => zrank_cmd(db, tokens, false),
         b"ZREVRANK" => zrank_cmd(db, tokens, true),
         b"ZRANGE" => zrange_cmd(db, tokens),
@@ -2859,12 +2859,12 @@ fn setop_compute(db: &mut Db, keys: &[Vec<u8>], op: SetOp) -> Result<HashSet<Vec
     Ok(acc)
 }
 
-fn setop_cmd(db: &mut Db, tokens: &[Vec<u8>], op: SetOp) -> Vec<u8> {
+fn setop_cmd(db: &mut Db, tokens: &[Vec<u8>], op: SetOp, proto: u8) -> Vec<u8> {
     if tokens.len() < 2 {
         return wrong_args("setop");
     }
     match setop_compute(db, &tokens[1..], op) {
-        Ok(acc) => bulk_array(&acc.into_iter().collect::<Vec<_>>()),
+        Ok(acc) => crate::resp::set(&acc.into_iter().collect::<Vec<_>>(), proto),
         Err(()) => wrongtype(),
     }
 }
@@ -3118,7 +3118,7 @@ fn zscore_cmd(db: &mut Db, tokens: &[Vec<u8>], proto: u8) -> Vec<u8> {
     }
 }
 
-fn zmscore_cmd(db: &mut Db, tokens: &[Vec<u8>]) -> Vec<u8> {
+fn zmscore_cmd(db: &mut Db, tokens: &[Vec<u8>], proto: u8) -> Vec<u8> {
     if tokens.len() < 3 {
         return wrong_args("zmscore");
     }
@@ -3128,7 +3128,7 @@ fn zmscore_cmd(db: &mut Db, tokens: &[Vec<u8>]) -> Vec<u8> {
             let elems: Vec<Vec<u8>> = tokens[2..]
                 .iter()
                 .map(|m| match opt.and_then(|z| z.get(m)) {
-                    Some(s) => bulk_string(&fmt_score(*s)),
+                    Some(s) => crate::resp::double(&fmt_score(*s), proto),
                     None => null_bulk(),
                 })
                 .collect();
@@ -3164,7 +3164,7 @@ fn zrem_cmd(db: &mut Db, tokens: &[Vec<u8>]) -> Vec<u8> {
     integer(removed)
 }
 
-fn zincrby_cmd(db: &mut Db, tokens: &[Vec<u8>]) -> Vec<u8> {
+fn zincrby_cmd(db: &mut Db, tokens: &[Vec<u8>], proto: u8) -> Vec<u8> {
     if tokens.len() != 4 {
         return wrong_args("zincrby");
     }
@@ -3178,7 +3178,7 @@ fn zincrby_cmd(db: &mut Db, tokens: &[Vec<u8>]) -> Vec<u8> {
     };
     let newv = z.get(&tokens[3]).copied().unwrap_or(0.0) + incr;
     z.insert(tokens[3].clone(), newv);
-    bulk_string(&fmt_score(newv))
+    crate::resp::double(&fmt_score(newv), proto)
 }
 
 fn zrank_cmd(db: &mut Db, tokens: &[Vec<u8>], rev: bool) -> Vec<u8> {
