@@ -765,10 +765,9 @@ impl Hub {
     /// bounded by short timeouts so they can't stall the hub indefinitely.
     fn handle_dbsize(&mut self, id: u64) {
         let mut total = self.db.dbsize() as i64;
-        for addr in self.cluster_peers() {
-            if let Some(n) = cluster_call_int(&addr, &[b"XDBSIZE"]) {
-                total += n;
-            }
+        let peers = self.cluster_peers();
+        for n in scatter_int(&peers, &[b"XDBSIZE"]).into_iter().flatten() {
+            total += n;
         }
         self.send(id, resp::integer(total));
     }
@@ -840,16 +839,15 @@ impl Hub {
         let shard = q.shard_query();
         let shard_args: Vec<&[u8]> = shard.iter().map(|t| t.as_slice()).collect();
         let parse = |b: &[u8]| std::str::from_utf8(b).ok().and_then(|s| s.parse().ok());
-        for addr in self.cluster_geo_targets(&q) {
-            if let Some(flat) = cluster_call_array(&addr, &shard_args) {
-                for g in flat.chunks_exact(4) {
-                    hits.push((
-                        g[0].clone(),
-                        parse(&g[1]).unwrap_or(f64::MAX),
-                        parse(&g[2]).unwrap_or(0.0),
-                        parse(&g[3]).unwrap_or(0.0),
-                    ));
-                }
+        let targets = self.cluster_geo_targets(&q);
+        for flat in scatter_array(&targets, &shard_args).into_iter().flatten() {
+            for g in flat.chunks_exact(4) {
+                hits.push((
+                    g[0].clone(),
+                    parse(&g[1]).unwrap_or(f64::MAX),
+                    parse(&g[2]).unwrap_or(0.0),
+                    parse(&g[3]).unwrap_or(0.0),
+                ));
             }
         }
         q.format(hits)
@@ -910,16 +908,19 @@ impl Hub {
             None => vec![],
         };
         let since_s = since.to_string();
-        for addr in peers {
-            let Some(flat) = cluster_call_array(
-                &addr,
-                &[b"XCDCSINCE", since_s.as_bytes(), b"COUNT", b"10000"],
-            ) else {
+        // Fan out to all shards at once (bounded by one peer timeout), then fold
+        // the results in on the hub thread so the floor bookkeeping stays serial.
+        let replies = scatter_array(
+            &peers,
+            &[b"XCDCSINCE", since_s.as_bytes(), b"COUNT", b"10000"],
+        );
+        for (addr, reply) in peers.iter().zip(replies) {
+            let Some(flat) = reply else {
                 // Unreachable: if we've heard from this shard before, hold the
                 // watermark at its last floor so we don't emit past it. A shard
                 // never yet seen is skipped, so a boot-time outage can't stall the
                 // whole merge; its changes join once it's first reached.
-                if let Some(&known) = self.cdc_peer_floors.get(&addr) {
+                if let Some(&known) = self.cdc_peer_floors.get(addr) {
                     watermark = watermark.min(known);
                 }
                 continue;
@@ -3559,6 +3560,51 @@ fn cluster_call_array(addr: &str, args: &[&[u8]]) -> Option<Vec<Vec<u8>>> {
         Ok(out)
     };
     go().ok()
+}
+
+/// Fan `args` out to every target concurrently and collect the array replies in
+/// the same order (None for an unreachable/slow peer). One thread per peer, each
+/// bounded by `cluster_call_array`'s own timeouts — so the caller waits at most
+/// ~one peer timeout total, not the sum across peers. Keeps replies synchronous
+/// (and thus correctly ordered on the client connection); only the peer I/O is
+/// parallel.
+fn scatter_array(targets: &[String], args: &[&[u8]]) -> Vec<Option<Vec<Vec<u8>>>> {
+    let owned: Vec<Vec<u8>> = args.iter().map(|a| a.to_vec()).collect();
+    let handles: Vec<_> = targets
+        .iter()
+        .map(|addr| {
+            let addr = addr.clone();
+            let owned = owned.clone();
+            thread::spawn(move || {
+                let refs: Vec<&[u8]> = owned.iter().map(|v| v.as_slice()).collect();
+                cluster_call_array(&addr, &refs)
+            })
+        })
+        .collect();
+    handles
+        .into_iter()
+        .map(|h| h.join().unwrap_or(None))
+        .collect()
+}
+
+/// Like [`scatter_array`] for integer replies (e.g. cluster-wide DBSIZE).
+fn scatter_int(targets: &[String], args: &[&[u8]]) -> Vec<Option<i64>> {
+    let owned: Vec<Vec<u8>> = args.iter().map(|a| a.to_vec()).collect();
+    let handles: Vec<_> = targets
+        .iter()
+        .map(|addr| {
+            let addr = addr.clone();
+            let owned = owned.clone();
+            thread::spawn(move || {
+                let refs: Vec<&[u8]> = owned.iter().map(|v| v.as_slice()).collect();
+                cluster_call_int(&addr, &refs)
+            })
+        })
+        .collect();
+    handles
+        .into_iter()
+        .map(|h| h.join().unwrap_or(None))
+        .collect()
 }
 
 fn read_line(s: &mut TcpStream) -> io::Result<Vec<u8>> {
