@@ -262,6 +262,7 @@ pub fn serialize(db: &Db) -> Vec<u8> {
 #[derive(Default)]
 pub struct Extras {
     pub cdc_next_offset: u64,
+    pub hlc_last: u64, // hub's last HLC stamp (cross-shard CDC ordering)
     pub cdc_log: Vec<CdcRec>,
     pub cdc_groups: Vec<CdcGrp>,
     pub index_defs: Vec<(Vec<u8>, Vec<u8>)>, // (index name, hash field)
@@ -269,6 +270,7 @@ pub struct Extras {
 
 pub struct CdcRec {
     pub offset: u64,
+    pub hlc: u64, // HLC stamp; 0 for pre-LXT2 snapshots (sorts before live events)
     pub event: Vec<u8>,
     pub key: Vec<u8>,
     pub value: Option<Vec<u8>>,
@@ -280,7 +282,10 @@ pub struct CdcGrp {
     pub pending: Vec<(u64, Vec<u8>)>, // (offset, consumer)
 }
 
-const TRAILER_MAGIC: &[u8; 4] = b"LXT1";
+// Trailer format versions. LXT2 adds the hub HLC (`hlc_last`) and a per-record
+// HLC stamp; LXT1 (pre-clustering) snapshots still load, with HLC defaulted to 0.
+const TRAILER_MAGIC_V1: &[u8; 4] = b"LXT1";
+const TRAILER_MAGIC: &[u8; 4] = b"LXT2";
 
 fn put_bytes(buf: &mut Vec<u8>, b: &[u8]) {
     buf.extend_from_slice(&(b.len() as u32).to_le_bytes());
@@ -291,9 +296,11 @@ fn put_bytes(buf: &mut Vec<u8>, b: &[u8]) {
 pub fn append_extras(buf: &mut Vec<u8>, x: &Extras) {
     buf.extend_from_slice(TRAILER_MAGIC);
     buf.extend_from_slice(&x.cdc_next_offset.to_le_bytes());
+    buf.extend_from_slice(&x.hlc_last.to_le_bytes());
     buf.extend_from_slice(&(x.cdc_log.len() as u32).to_le_bytes());
     for r in &x.cdc_log {
         buf.extend_from_slice(&r.offset.to_le_bytes());
+        buf.extend_from_slice(&r.hlc.to_le_bytes());
         put_bytes(buf, &r.event);
         put_bytes(buf, &r.key);
         match &r.value {
@@ -330,16 +337,19 @@ fn read_extras<R: Read>(r: &mut R) -> io::Result<Extras> {
         Err(e) if e.kind() == io::ErrorKind::UnexpectedEof => return Ok(Extras::default()),
         Err(e) => return Err(e),
     }
-    if &marker != TRAILER_MAGIC {
+    let v2 = &marker == TRAILER_MAGIC;
+    if !v2 && &marker != TRAILER_MAGIC_V1 {
         return Err(io::Error::new(
             io::ErrorKind::InvalidData,
             "bad RDB trailer magic",
         ));
     }
     let cdc_next_offset = read_u64(r)?;
+    let hlc_last = if v2 { read_u64(r)? } else { 0 };
     let mut cdc_log = Vec::new();
     for _ in 0..read_u32(r)? {
         let offset = read_u64(r)?;
+        let hlc = if v2 { read_u64(r)? } else { 0 };
         let event = read_bytes(r)?;
         let key = read_bytes(r)?;
         let value = if read_u8(r)? == 1 {
@@ -349,6 +359,7 @@ fn read_extras<R: Read>(r: &mut R) -> io::Result<Extras> {
         };
         cdc_log.push(CdcRec {
             offset,
+            hlc,
             event,
             key,
             value,
@@ -377,6 +388,7 @@ fn read_extras<R: Read>(r: &mut R) -> io::Result<Extras> {
     }
     Ok(Extras {
         cdc_next_offset,
+        hlc_last,
         cdc_log,
         cdc_groups,
         index_defs,
@@ -669,8 +681,10 @@ mod tests {
     fn extras_trailer_roundtrips() {
         let extras = Extras {
             cdc_next_offset: 42,
+            hlc_last: 99,
             cdc_log: vec![CdcRec {
                 offset: 7,
+                hlc: 88,
                 event: b"write".to_vec(),
                 key: b"k".to_vec(),
                 value: Some(b"v".to_vec()),
@@ -686,8 +700,10 @@ mod tests {
         append_extras(&mut bytes, &extras);
         let (_, got) = deserialize_with_extras(&bytes).unwrap();
         assert_eq!(got.cdc_next_offset, 42);
+        assert_eq!(got.hlc_last, 99);
         assert_eq!(got.cdc_log.len(), 1);
         assert_eq!(got.cdc_log[0].offset, 7);
+        assert_eq!(got.cdc_log[0].hlc, 88);
         assert_eq!(got.cdc_log[0].value.as_deref(), Some(&b"v"[..]));
         assert_eq!(got.cdc_groups[0].pending, vec![(3u64, b"c1".to_vec())]);
         assert_eq!(

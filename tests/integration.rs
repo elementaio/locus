@@ -951,6 +951,40 @@ fn secondary_index_survives_restart() {
 }
 
 #[test]
+fn hlc_stamps_survive_restart() {
+    let rdb = format!(
+        "{}/locus-hlc-restart-{}.rdb",
+        std::env::temp_dir().display(),
+        std::process::id()
+    );
+    let _ = std::fs::remove_file(&rdb);
+    let cdc_env = [("LOCUS_CDC_MAXLEN", "100")];
+    // Round 1: make changes, capture the HLC-ordered merged feed, persist.
+    let before = {
+        let mut s = Server::spawn_at(rdb.clone(), &cdc_env);
+        let mut c = s.connect();
+        c.cmd(&["SET", "a", "1"]);
+        c.cmd(&["SET", "b", "2"]);
+        let feed = c.cmd(&["CLUSTER", "CDCMERGE", "0", "COUNT", "10"]);
+        assert!(feed.contains('a') && feed.contains('b'), "feed: {feed}");
+        assert_eq!(c.cmd(&["SAVE"]), "OK");
+        c.send(&["SHUTDOWN"]);
+        assert!(s.wait_exit().success());
+        std::mem::forget(s); // keep the RDB for round 2
+        feed
+    };
+    // Round 2: a fresh server on the same RDB renders an identical feed — HLC
+    // stamps were persisted (had they reset to 0, the hlc fields would differ).
+    {
+        let s = Server::spawn_at(rdb.clone(), &cdc_env);
+        let mut c = s.connect();
+        let after = c.cmd(&["CLUSTER", "CDCMERGE", "0", "COUNT", "10"]);
+        assert_eq!(before, after, "HLC-ordered feed changed across restart");
+    }
+    let _ = std::fs::remove_file(&rdb);
+}
+
+#[test]
 fn aof_recovers_all_acked_writes_after_kill9() {
     let rdb = format!(
         "{}/locus-crash-{}.rdb",

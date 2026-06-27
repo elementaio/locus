@@ -582,12 +582,13 @@ impl Hub {
     /// Restore CDC + secondary-index state loaded from a snapshot trailer.
     fn apply_extras(&mut self, x: rdb::Extras) {
         self.cdc_next_offset = x.cdc_next_offset.max(self.cdc_next_offset);
+        self.hlc_last = x.hlc_last.max(self.hlc_last);
         self.cdc_log = x
             .cdc_log
             .into_iter()
             .map(|r| ChangeRecord {
                 offset: r.offset,
-                hlc: 0, // not persisted; reloaded history sorts before live events
+                hlc: r.hlc, // 0 for pre-LXT2 snapshots
                 event: r.event,
                 key: r.key,
                 value: r.value,
@@ -615,11 +616,13 @@ impl Hub {
     fn build_extras(&self) -> rdb::Extras {
         rdb::Extras {
             cdc_next_offset: self.cdc_next_offset,
+            hlc_last: self.hlc_last,
             cdc_log: self
                 .cdc_log
                 .iter()
                 .map(|r| rdb::CdcRec {
                     offset: r.offset,
+                    hlc: r.hlc,
                     event: r.event.clone(),
                     key: r.key.clone(),
                     value: r.value.clone(),
