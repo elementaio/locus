@@ -53,7 +53,8 @@ $ redis-cli -p 6379 GEOSEARCH fleet FROMLONLAT 55.27 25.2 BYRADIUS 5 km ASC   # 
 - **`maxmemory` + eviction:** soft cap with key eviction and `OOM` rejection.
 - **Transactions:** `MULTI`/`EXEC`/`DISCARD`, `WATCH`/`UNWATCH` (EXECABORT + WATCH-on-expiry).
 - **Streams:** `XADD`/`XRANGE`/`XREAD`, including **blocking `XREAD`**.
-- **Protocol:** RESP2 **and RESP3** typed replies (maps/sets/doubles) on `HELLO 3`; pipelining.
+- **Protocol:** RESP2 **and RESP3** typed replies (maps/sets/doubles) + **push frames** for pub/sub on
+  `HELLO 3`; pipelining.
 
 **Security & operations** *(safe on a trusted network)*
 

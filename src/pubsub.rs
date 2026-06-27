@@ -111,13 +111,15 @@ impl PubSub {
         channel: &[u8],
         payload: &[u8],
         clients: &HashMap<u64, Sender<Vec<u8>>>,
+        protos: &HashMap<u64, u8>,
     ) -> i64 {
         let mut n = 0i64;
+        let proto_of = |id: &u64| protos.get(id).copied().unwrap_or(2);
         if let Some(subs) = self.channels.get(channel) {
-            let msg = message(channel, payload);
             for id in subs {
+                // Encode per subscriber so RESP3 clients get a push frame.
                 if let Some(out) = clients.get(id)
-                    && out.send(msg.clone()).is_ok()
+                    && out.send(message(channel, payload, proto_of(id))).is_ok()
                 {
                     n += 1;
                 }
@@ -125,10 +127,11 @@ impl PubSub {
         }
         for (pat, subs) in &self.patterns {
             if glob_match(pat, channel) {
-                let msg = pmessage(pat, channel, payload);
                 for id in subs {
                     if let Some(out) = clients.get(id)
-                        && out.send(msg.clone()).is_ok()
+                        && out
+                            .send(pmessage(pat, channel, payload, proto_of(id)))
+                            .is_ok()
                     {
                         n += 1;
                     }
@@ -180,8 +183,15 @@ pub fn glob_match(pat: &[u8], text: &[u8]) -> bool {
 
 // --- message encoders -------------------------------------------------------
 
-fn kind_reply(kind: &[u8], channel: Option<&[u8]>, count: i64) -> Vec<u8> {
-    let mut o = b"*3\r\n".to_vec();
+/// Outer frame: a RESP3 push (`>`) on proto 3, else a RESP2 array (`*`). RESP3
+/// clients use the push type to tell pub/sub traffic apart from command replies.
+fn frame(proto: u8, n: usize) -> Vec<u8> {
+    let tag = if proto >= 3 { '>' } else { '*' };
+    format!("{tag}{n}\r\n").into_bytes()
+}
+
+fn kind_reply(kind: &[u8], channel: Option<&[u8]>, count: i64, proto: u8) -> Vec<u8> {
+    let mut o = frame(proto, 3);
     o.extend_from_slice(&bulk_string(kind));
     match channel {
         Some(c) => o.extend_from_slice(&bulk_string(c)),
@@ -191,29 +201,29 @@ fn kind_reply(kind: &[u8], channel: Option<&[u8]>, count: i64) -> Vec<u8> {
     o
 }
 
-pub fn subscribe_reply(channel: &[u8], count: usize) -> Vec<u8> {
-    kind_reply(b"subscribe", Some(channel), count as i64)
+pub fn subscribe_reply(channel: &[u8], count: usize, proto: u8) -> Vec<u8> {
+    kind_reply(b"subscribe", Some(channel), count as i64, proto)
 }
-pub fn psubscribe_reply(pat: &[u8], count: usize) -> Vec<u8> {
-    kind_reply(b"psubscribe", Some(pat), count as i64)
+pub fn psubscribe_reply(pat: &[u8], count: usize, proto: u8) -> Vec<u8> {
+    kind_reply(b"psubscribe", Some(pat), count as i64, proto)
 }
-pub fn unsubscribe_reply(channel: Option<&[u8]>, count: usize) -> Vec<u8> {
-    kind_reply(b"unsubscribe", channel, count as i64)
+pub fn unsubscribe_reply(channel: Option<&[u8]>, count: usize, proto: u8) -> Vec<u8> {
+    kind_reply(b"unsubscribe", channel, count as i64, proto)
 }
-pub fn punsubscribe_reply(pat: Option<&[u8]>, count: usize) -> Vec<u8> {
-    kind_reply(b"punsubscribe", pat, count as i64)
+pub fn punsubscribe_reply(pat: Option<&[u8]>, count: usize, proto: u8) -> Vec<u8> {
+    kind_reply(b"punsubscribe", pat, count as i64, proto)
 }
 
-pub fn message(channel: &[u8], payload: &[u8]) -> Vec<u8> {
-    let mut o = b"*3\r\n".to_vec();
+pub fn message(channel: &[u8], payload: &[u8], proto: u8) -> Vec<u8> {
+    let mut o = frame(proto, 3);
     o.extend_from_slice(&bulk_string(b"message"));
     o.extend_from_slice(&bulk_string(channel));
     o.extend_from_slice(&bulk_string(payload));
     o
 }
 
-pub fn pmessage(pattern: &[u8], channel: &[u8], payload: &[u8]) -> Vec<u8> {
-    let mut o = b"*4\r\n".to_vec();
+pub fn pmessage(pattern: &[u8], channel: &[u8], payload: &[u8], proto: u8) -> Vec<u8> {
+    let mut o = frame(proto, 4);
     o.extend_from_slice(&bulk_string(b"pmessage"));
     o.extend_from_slice(&bulk_string(pattern));
     o.extend_from_slice(&bulk_string(channel));

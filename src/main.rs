@@ -1163,9 +1163,10 @@ impl Hub {
                         resp::error("ERR wrong number of arguments for 'subscribe' command"),
                     );
                 }
+                let proto = self.protos.get(&id).copied().unwrap_or(2);
                 for ch in &tokens[1..] {
                     let c = self.pubsub.subscribe(id, ch);
-                    self.send(id, pubsub::subscribe_reply(ch, c));
+                    self.send(id, pubsub::subscribe_reply(ch, c, proto));
                 }
             }
             b"PSUBSCRIBE" => {
@@ -1175,9 +1176,10 @@ impl Hub {
                         resp::error("ERR wrong number of arguments for 'psubscribe' command"),
                     );
                 }
+                let proto = self.protos.get(&id).copied().unwrap_or(2);
                 for pat in &tokens[1..] {
                     let c = self.pubsub.psubscribe(id, pat);
-                    self.send(id, pubsub::psubscribe_reply(pat, c));
+                    self.send(id, pubsub::psubscribe_reply(pat, c, proto));
                 }
             }
             b"UNSUBSCRIBE" => {
@@ -1186,12 +1188,13 @@ impl Hub {
                 } else {
                     self.pubsub.channels_of(id)
                 };
+                let proto = self.protos.get(&id).copied().unwrap_or(2);
                 if chans.is_empty() {
-                    self.send(id, pubsub::unsubscribe_reply(None, 0));
+                    self.send(id, pubsub::unsubscribe_reply(None, 0, proto));
                 } else {
                     for ch in chans {
                         let c = self.pubsub.unsubscribe(id, &ch);
-                        self.send(id, pubsub::unsubscribe_reply(Some(&ch), c));
+                        self.send(id, pubsub::unsubscribe_reply(Some(&ch), c, proto));
                     }
                 }
             }
@@ -1201,12 +1204,13 @@ impl Hub {
                 } else {
                     self.pubsub.patterns_of(id)
                 };
+                let proto = self.protos.get(&id).copied().unwrap_or(2);
                 if pats.is_empty() {
-                    self.send(id, pubsub::punsubscribe_reply(None, 0));
+                    self.send(id, pubsub::punsubscribe_reply(None, 0, proto));
                 } else {
                     for pat in pats {
                         let c = self.pubsub.punsubscribe(id, &pat);
-                        self.send(id, pubsub::punsubscribe_reply(Some(&pat), c));
+                        self.send(id, pubsub::punsubscribe_reply(Some(&pat), c, proto));
                     }
                 }
             }
@@ -1217,7 +1221,9 @@ impl Hub {
                         resp::error("ERR wrong number of arguments for 'publish' command"),
                     );
                 }
-                let n = self.pubsub.publish(&tokens[1], &tokens[2], &self.clients);
+                let n = self
+                    .pubsub
+                    .publish(&tokens[1], &tokens[2], &self.clients, &self.protos);
                 self.send(id, resp::integer(n));
             }
             b"PUBSUB" => self.handle_pubsub_introspect(id, &tokens),

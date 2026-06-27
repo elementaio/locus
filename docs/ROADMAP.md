@@ -50,7 +50,7 @@ See [CHANGEFEED.md](CHANGEFEED.md), [GEO.md](GEO.md), [SKETCHES.md](SKETCHES.md)
 ## Deferred (known, intentional)
 
 - A finer **S2/R-tree** geo index + keyset pagination; **thread-per-core** execution for multi-core throughput.
-- **Full RESP3 typing** of every reply (typed maps/sets/doubles done; pub/sub push frames pending); multiple logical DBs (only DB 0).
+- **Full RESP3 typing** of every reply (typed maps/sets/doubles + pub/sub push frames done; a few niche replies remain); multiple logical DBs (only DB 0).
 - **Native in-process TLS by default** (it's an opt-in feature; the default build stays zero-dependency).
 - The big one: horizontal **spatial clustering** (P6) — the flagship, done last.
 

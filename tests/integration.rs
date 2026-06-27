@@ -1581,6 +1581,47 @@ fn cluster_introspection_standalone() {
     assert_eq!(c.cmd(&["CLUSTER", "SLOTS"]), "[]");
 }
 
+#[test]
+fn resp3_pubsub_uses_push_frames() {
+    fn drain(s: &mut TcpStream) -> Vec<u8> {
+        s.set_read_timeout(Some(Duration::from_millis(300)))
+            .unwrap();
+        let mut buf = Vec::new();
+        let mut chunk = [0u8; 4096];
+        while let Ok(n) = s.read(&mut chunk) {
+            if n == 0 {
+                break;
+            }
+            buf.extend_from_slice(&chunk[..n]);
+        }
+        buf
+    }
+    let contains = |hay: &[u8], needle: &[u8]| hay.windows(needle.len()).any(|w| w == needle);
+
+    let s = Server::start();
+    // RESP3 subscriber (raw, so we can inspect the frame tag).
+    let mut sub3 = TcpStream::connect(("127.0.0.1", s.port)).unwrap();
+    send_resp(&mut sub3, &[b"HELLO", b"3"]);
+    send_resp(&mut sub3, &[b"SUBSCRIBE", b"ch"]);
+    // RESP2 subscriber.
+    let mut sub2 = TcpStream::connect(("127.0.0.1", s.port)).unwrap();
+    send_resp(&mut sub2, &[b"SUBSCRIBE", b"ch"]);
+    sleep(Duration::from_millis(200)); // let both subscriptions register
+
+    s.connect().cmd(&["PUBLISH", "ch", "hi"]);
+    sleep(Duration::from_millis(100));
+
+    // RESP3 gets a push frame (>), RESP2 the legacy array (*).
+    assert!(
+        contains(&drain(&mut sub3), b">3\r\n$7\r\nmessage"),
+        "RESP3 subscriber should receive a push (>) frame"
+    );
+    assert!(
+        contains(&drain(&mut sub2), b"*3\r\n$7\r\nmessage"),
+        "RESP2 subscriber should receive an array (*) frame"
+    );
+}
+
 // === partial resync (PSYNC CONTINUE) =========================================
 
 fn send_resp(s: &mut TcpStream, args: &[&[u8]]) {
