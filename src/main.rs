@@ -60,6 +60,9 @@ enum Msg {
     ReplaceDb(Box<Db>, Box<rdb::Extras>, String, u64),
     /// The replica's link to its master dropped (clear master_link_status).
     MasterLinkDown,
+    /// An async BGREWRITEAOF finished writing its base image off-thread; carries
+    /// the temp path on success (to finalize) or an error string.
+    AofRewriteDone(Result<String, String>),
 }
 
 /// Set by the SIGTERM/SIGINT handler so the hub can persist and exit cleanly.
@@ -156,6 +159,9 @@ struct Hub {
     db: Db,
     aof: Option<aof::Aof>,
     aof_path: Option<String>,
+    // Some(buf) while an async BGREWRITEAOF runs: captures writes that land
+    // during the rewrite so they can be folded into the new file (no loss).
+    aof_rewrite_buf: Option<Vec<u8>>,
     clients: HashMap<u64, mpsc::Sender<Vec<u8>>>,
     pubsub: PubSub,
     // replication
@@ -320,6 +326,7 @@ impl Hub {
             db,
             aof,
             aof_path,
+            aof_rewrite_buf: None,
             clients: HashMap::new(),
             pubsub: PubSub::new(),
             replicas: HashSet::new(),
@@ -1161,15 +1168,25 @@ impl Hub {
 
             // --- persistence (owner-side) ---
             b"BGREWRITEAOF" => {
-                let reply = match (&self.aof_path, self.aof.is_some()) {
-                    (Some(path), true) => match aof::rewrite(&self.db, path) {
-                        Ok(()) => {
-                            self.aof = aof::Aof::open(path).ok();
-                            resp::simple_string("Background append only file rewriting started")
-                        }
-                        Err(e) => resp::error(&format!("ERR {e}")),
-                    },
-                    _ => resp::error("ERR AOF is not enabled"),
+                let reply = if self.aof_rewrite_buf.is_some() {
+                    resp::error("ERR Background append only file rewriting already in progress")
+                } else if let (Some(path), true) = (self.aof_path.clone(), self.aof.is_some()) {
+                    // Serialize the base image on the hub (fast, in-memory), then
+                    // write+fsync it off-thread. Writes that land meanwhile are
+                    // captured in aof_rewrite_buf and folded in on completion.
+                    let tmp = format!("{path}.tmp");
+                    let buf = aof::serialize_rewrite(&self.db);
+                    self.aof_rewrite_buf = Some(Vec::new());
+                    let tx = self.tx.clone();
+                    thread::spawn(move || {
+                        let res = aof::write_tmp(&tmp, &buf)
+                            .map(|()| tmp)
+                            .map_err(|e| e.to_string());
+                        let _ = tx.send(Msg::AofRewriteDone(res));
+                    });
+                    resp::simple_string("Background append only file rewriting started")
+                } else {
+                    resp::error("ERR AOF is not enabled")
                 };
                 self.send(id, reply);
             }
@@ -2126,6 +2143,11 @@ impl Hub {
                 if let Some(a) = self.aof.as_mut() {
                     let _ = a.append(&entries);
                 }
+                // Mirror into the rewrite buffer so an in-flight BGREWRITEAOF
+                // doesn't lose writes made while its base image is being written.
+                if let Some(buf) = self.aof_rewrite_buf.as_mut() {
+                    aof::encode_into(buf, &entries);
+                }
                 // Propagate the deterministic form to every replica.
                 for e in &entries {
                     self.replicate(resp::command(e));
@@ -2486,6 +2508,28 @@ fn run_hub(rx: mpsc::Receiver<Msg>, tx: mpsc::Sender<Msg>) {
                 hub.serve_blocked();
             }
             Ok(Msg::MasterLinkDown) => hub.master_link_up = false,
+            Ok(Msg::AofRewriteDone(res)) => {
+                // Fold the writes buffered during the rewrite into the new file,
+                // then swap it in. On any failure we keep the old AOF (which still
+                // holds those writes), so durability is never broken.
+                let tail = hub.aof_rewrite_buf.take().unwrap_or_default();
+                match (res, hub.aof_path.clone()) {
+                    (Ok(tmp), Some(path)) => match aof::finalize_rewrite(&tmp, &path, &tail) {
+                        Ok(()) => {
+                            hub.aof = aof::Aof::open(&path).ok();
+                            log::info("AOF rewrite complete");
+                        }
+                        Err(e) => {
+                            let _ = std::fs::remove_file(&tmp);
+                            log::error(&format!("AOF rewrite finalize failed: {e}"));
+                        }
+                    },
+                    (Ok(tmp), None) => {
+                        let _ = std::fs::remove_file(&tmp);
+                    }
+                    (Err(e), _) => log::error(&format!("AOF rewrite failed: {e}")),
+                }
+            }
             Err(mpsc::RecvTimeoutError::Timeout) => {
                 if SHUTDOWN.load(Ordering::Relaxed) {
                     // Drain anything already queued, then persist and exit.

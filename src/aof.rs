@@ -289,26 +289,46 @@ pub fn load(path: &str) -> io::Result<Db> {
     Ok(db)
 }
 
-/// Compact the AOF: rewrite it as the minimal set of commands that rebuilds the
-/// current dataset (BGREWRITEAOF). temp -> fsync -> atomic rename.
-pub fn rewrite(db: &Db, path: &str) -> io::Result<()> {
-    let tmp = format!("{path}.tmp");
-    {
-        let file = File::create(&tmp)?;
-        let mut buf = Vec::new();
-        for (key, value) in db.entries() {
-            for c in reconstruct(key, value) {
-                encode_command(&mut buf, &c);
-            }
-            if let Some(t) = db.raw_expire(key) {
-                encode_command(&mut buf, &pexpireat(key, t));
-            }
+/// Serialize the whole dataset as the minimal command set that rebuilds it — the
+/// base image for an AOF rewrite (BGREWRITEAOF). Pure in-memory; the disk write
+/// is done off the hub thread (see `write_tmp` / `finalize_rewrite`).
+pub fn serialize_rewrite(db: &Db) -> Vec<u8> {
+    let mut buf = Vec::new();
+    for (key, value) in db.entries() {
+        for c in reconstruct(key, value) {
+            encode_command(&mut buf, &c);
         }
-        let mut w = file;
-        w.write_all(&buf)?;
-        w.sync_all()?;
+        if let Some(t) = db.raw_expire(key) {
+            encode_command(&mut buf, &pexpireat(key, t));
+        }
     }
-    fs::rename(&tmp, path)?;
+    buf
+}
+
+/// Encode already-deterministic commands onto `buf` — used to capture writes that
+/// land while an async rewrite's base image is being written off-thread.
+pub fn encode_into(buf: &mut Vec<u8>, commands: &[Vec<Vec<u8>>]) {
+    for c in commands {
+        encode_command(buf, c);
+    }
+}
+
+/// Write a rewrite's base image to a temp file and fsync it (runs off-thread).
+pub fn write_tmp(tmp: &str, buf: &[u8]) -> io::Result<()> {
+    let mut w = File::create(tmp)?;
+    w.write_all(buf)?;
+    w.sync_all()
+}
+
+/// Finish an async rewrite (on the hub): append the writes buffered during the
+/// rewrite onto the base image, fsync, then atomically swap it into place.
+pub fn finalize_rewrite(tmp: &str, path: &str, tail: &[u8]) -> io::Result<()> {
+    if !tail.is_empty() {
+        let mut f = OpenOptions::new().append(true).open(tmp)?;
+        f.write_all(tail)?;
+        f.sync_all()?;
+    }
+    fs::rename(tmp, path)?;
     crate::rdb::fsync_parent_dir(path); // make the rename durable
     Ok(())
 }
@@ -460,6 +480,31 @@ mod tests {
         let mut db = load(path).unwrap();
         assert_eq!(run(&mut db, &[b"GET", b"ok"]), b"$1\r\n1\r\n".to_vec());
         assert_eq!(run(&mut db, &[b"EXISTS", b"half"]), b":0\r\n".to_vec()); // torn cmd dropped
+        let _ = fs::remove_file(path);
+    }
+
+    #[test]
+    fn async_rewrite_base_plus_tail_roundtrips() {
+        let path = "/tmp/locus_aof_rewrite.aof";
+        let tmp = format!("{path}.tmp");
+        let _ = fs::remove_file(path);
+        let _ = fs::remove_file(&tmp);
+        // Base image captured before the (off-thread) rewrite.
+        let mut db = Db::new();
+        db.insert_with_expire(b"k".to_vec(), Value::Str(b"v".to_vec()), None);
+        let base = serialize_rewrite(&db);
+        write_tmp(&tmp, &base).unwrap();
+        // A write that lands during the rewrite, captured as a tail and folded in.
+        let mut tail = Vec::new();
+        encode_into(
+            &mut tail,
+            &[vec![b"SET".to_vec(), b"k2".to_vec(), b"v2".to_vec()]],
+        );
+        finalize_rewrite(&tmp, path, &tail).unwrap();
+        // Replaying the swapped-in file yields base + tail, nothing lost.
+        let mut loaded = load(path).unwrap();
+        assert_eq!(run(&mut loaded, &[b"GET", b"k"]), b"$1\r\nv\r\n".to_vec());
+        assert_eq!(run(&mut loaded, &[b"GET", b"k2"]), b"$2\r\nv2\r\n".to_vec());
         let _ = fs::remove_file(path);
     }
 

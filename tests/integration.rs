@@ -1327,3 +1327,41 @@ fn wait_counts_replicas_that_acked() {
     // Asking for more replicas than exist times out and returns the real count.
     assert_eq!(m.cmd(&["WAIT", "5", "300"]), "1");
 }
+
+#[test]
+fn bgrewriteaof_is_async_and_loses_no_writes() {
+    let aof = format!(
+        "{}/locus-asyncaof-{}.aof",
+        std::env::temp_dir().display(),
+        std::process::id()
+    );
+    let _ = std::fs::remove_file(&aof);
+    let _ = std::fs::remove_file(format!("{aof}.tmp"));
+    {
+        let s = Server::start_inner(&[("LOCUS_AOF", &aof)]);
+        let mut c = s.connect();
+        for i in 0..50 {
+            c.cmd(&["SET", &format!("k{i}"), &i.to_string()]);
+        }
+        // Async: returns immediately, before the base image is on disk.
+        assert_eq!(
+            c.cmd(&["BGREWRITEAOF"]),
+            "Background append only file rewriting started"
+        );
+        // Writes that race the rewrite must be folded into the new file.
+        for i in 50..100 {
+            c.cmd(&["SET", &format!("k{i}"), &i.to_string()]);
+        }
+        sleep(Duration::from_millis(300)); // let the rewrite finalize + swap
+        assert_eq!(c.cmd(&["DBSIZE"]), "100");
+    }
+    // Restart against the same AOF: every write replays, none lost in the swap.
+    let s2 = Server::start_inner(&[("LOCUS_AOF", &aof)]);
+    let mut c2 = s2.connect();
+    assert_eq!(c2.cmd(&["DBSIZE"]), "100");
+    assert_eq!(c2.cmd(&["GET", "k0"]), "0");
+    assert_eq!(c2.cmd(&["GET", "k99"]), "99");
+    drop(s2);
+    let _ = std::fs::remove_file(&aof);
+    let _ = std::fs::remove_file(format!("{aof}.tmp"));
+}
