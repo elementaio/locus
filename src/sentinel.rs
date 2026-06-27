@@ -8,9 +8,11 @@
 //! replicating from the current master (e.g. a returned old master) is pointed
 //! back, which keeps a flapping node from causing split-brain.
 //!
-//! This is deliberately a single-sentinel design (no inter-sentinel quorum yet) —
-//! the orchestration-hook tier from the roadmap, not embedded Raft. Pair it with
-//! your supervisor for redundancy, or run one per failure domain.
+//! Before failing over it requires *corroboration*: a quorum of replicas must
+//! also report their own master link down, so a sentinel that's merely partitioned
+//! from the master doesn't trigger a needless failover. This is the
+//! orchestration-hook tier from the roadmap, not embedded Raft (inter-sentinel
+//! agreement is a later step). Run one per failure domain, or beside a supervisor.
 //!
 //! Config (env):
 //!   LOCUS_SENTINEL            master host:port to monitor (enables sentinel mode)
@@ -18,6 +20,7 @@
 //!   LOCUS_SENTINEL_AUTH       password presented to monitored nodes (optional)
 //!   LOCUS_SENTINEL_DOWN_AFTER_MS   master-down grace before failover (default 5000)
 //!   LOCUS_SENTINEL_INTERVAL_MS     poll interval (default 1000)
+//!   LOCUS_SENTINEL_QUORUM     replicas that must confirm down before failover (default 1)
 
 use std::io::{self, Read, Write};
 use std::net::{TcpStream, ToSocketAddrs};
@@ -35,6 +38,13 @@ pub fn run() -> io::Result<()> {
         .filter(|s| !s.is_empty());
     let down_after = env_ms("LOCUS_SENTINEL_DOWN_AFTER_MS", 5000);
     let interval = env_ms("LOCUS_SENTINEL_INTERVAL_MS", 1000);
+    // How many replicas must ALSO report their master link down before we fail
+    // over — corroboration that guards against a partitioned sentinel acting
+    // alone. 0 = trust this sentinel's view only. Keep it <= replica count.
+    let quorum = std::env::var("LOCUS_SENTINEL_QUORUM")
+        .ok()
+        .and_then(|s| s.trim().parse::<usize>().ok())
+        .unwrap_or(1);
 
     // The full node set is the master plus every configured replica.
     let mut nodes: Vec<String> = vec![master0.clone()];
@@ -52,7 +62,7 @@ pub fn run() -> io::Result<()> {
     let mut master = master0;
     let mut down_since: Option<Instant> = None;
     log::info(&format!(
-        "sentinel: monitoring master {master} + {} replica(s); down-after {down_after}ms",
+        "sentinel: monitoring master {master} + {} replica(s); down-after {down_after}ms, quorum {quorum}",
         nodes.len() - 1
     ));
 
@@ -66,14 +76,18 @@ pub fn run() -> io::Result<()> {
         } else {
             let since = *down_since.get_or_insert_with(Instant::now);
             log::warn(&format!("sentinel: master {master} unreachable"));
-            if since.elapsed() >= Duration::from_millis(down_after)
-                && let Some(new_master) = failover(&nodes, &master, auth)
-            {
-                log::info(&format!(
-                    "sentinel: +switch-master {master} -> {new_master}"
-                ));
-                master = new_master;
-                down_since = None;
+            if since.elapsed() >= Duration::from_millis(down_after) {
+                if !confirmed_down(&nodes, &master, auth, quorum) {
+                    log::warn(
+                        "sentinel: holding failover — replicas still reach the master (likely a local partition)",
+                    );
+                } else if let Some(new_master) = failover(&nodes, &master, auth) {
+                    log::info(&format!(
+                        "sentinel: +switch-master {master} -> {new_master}"
+                    ));
+                    master = new_master;
+                    down_since = None;
+                }
             }
         }
     }
@@ -122,6 +136,22 @@ fn failover(nodes: &[String], old_master: &str, auth: Option<&str>) -> Option<St
         let _ = command(n, auth, &["REPLICAOF", wh, wp]); // best-effort
     }
     Some(winner)
+}
+
+/// Corroborate that the master is really down (not just unreachable from this
+/// sentinel) by counting replicas that report their own master link as down.
+/// Guards against a partitioned sentinel triggering a needless failover.
+fn confirmed_down(nodes: &[String], master: &str, auth: Option<&str>, quorum: usize) -> bool {
+    if quorum == 0 {
+        return true; // trust this sentinel's view alone
+    }
+    let confirms = nodes
+        .iter()
+        .filter(|n| n.as_str() != master)
+        .filter_map(|n| info(n, auth))
+        .filter(|inf| field(inf, "master_link_status").as_deref() == Some("down"))
+        .count();
+    confirms >= quorum
 }
 
 // === tiny RESP client ========================================================

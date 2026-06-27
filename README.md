@@ -192,9 +192,13 @@ LOCUS_SENTINEL_DOWN_AFTER_MS=5000 \
 | `LOCUS_SENTINEL_AUTH` | _(off)_ | Password presented to the monitored nodes |
 | `LOCUS_SENTINEL_DOWN_AFTER_MS` | `5000` | How long the master must be unreachable before failover |
 | `LOCUS_SENTINEL_INTERVAL_MS` | `1000` | Health-check poll interval |
+| `LOCUS_SENTINEL_QUORUM` | `1` | Replicas that must *also* report the master link down before failover (corroboration; keep ≤ replica count) |
 
-It's a single-sentinel design today (no inter-sentinel quorum yet) — run one per failure domain, or
-alongside your supervisor. See [docs/DEPLOYMENT.md](docs/DEPLOYMENT.md) for the full HA topology.
+Before promoting, the sentinel requires **corroboration** — a quorum of replicas must also report their
+master link down — so a sentinel that's merely partitioned from the master won't trigger a needless
+failover. It's a single-sentinel design today (inter-sentinel agreement is a later step) — run one per
+failure domain, or alongside your supervisor. See [docs/DEPLOYMENT.md](docs/DEPLOYMENT.md) for the full
+HA topology.
 
 ---
 

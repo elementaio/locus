@@ -1400,3 +1400,38 @@ fn sentinel_promotes_replica_and_repoints_on_master_death() {
         "follower was not repointed to / synced from the new master"
     );
 }
+
+#[test]
+fn sentinel_holds_failover_without_quorum() {
+    let master = Server::start();
+    let r1 = Server::start();
+    r1.connect()
+        .cmd(&["REPLICAOF", "127.0.0.1", &master.port.to_string()]);
+    sleep(Duration::from_millis(500));
+    master.connect().cmd(&["SET", "k", "v"]);
+    sleep(Duration::from_millis(300));
+
+    // Quorum of 2 but only one replica exists -> failover can never be confirmed.
+    let mut sentinel = Command::new(env!("CARGO_BIN_EXE_locus"))
+        .env("LOCUS_SENTINEL", format!("127.0.0.1:{}", master.port))
+        .env("LOCUS_SENTINEL_REPLICAS", format!("127.0.0.1:{}", r1.port))
+        .env("LOCUS_SENTINEL_DOWN_AFTER_MS", "500")
+        .env("LOCUS_SENTINEL_INTERVAL_MS", "200")
+        .env("LOCUS_SENTINEL_QUORUM", "2")
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .expect("spawn sentinel");
+
+    drop(master); // kill the master
+    sleep(Duration::from_secs(3)); // well past down-after + several poll cycles
+
+    // Unconfirmed: the lone replica must NOT have been promoted.
+    let still_slave = role(&mut r1.connect());
+    let _ = sentinel.kill();
+    let _ = sentinel.wait();
+    assert_eq!(
+        still_slave, "slave",
+        "sentinel promoted without the configured quorum"
+    );
+}
