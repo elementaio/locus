@@ -46,13 +46,14 @@ See [CHANGEFEED.md](CHANGEFEED.md), [GEO.md](GEO.md), [SKETCHES.md](SKETCHES.md)
 - **Compat/observability:** `SCAN`/`COMMAND`/`CONFIG`/`SLOWLOG`/`INFO` (works with `redis_exporter`), RESP3 typed replies.
 - **Geo depth:** geohash **spatial index** (sub-linear `GEOSEARCH`) + combined `WHERE` attribute filters.
 - **Sorted sets:** ordered index (std `BTreeSet`) for range/rank without re-sorting on read.
+- **Spatial clustering (the flagship):** hash-slot routing (`MOVED`/`CROSSSLOT`/`CLUSTERDOWN`), **cell-in-key sharding** so a region co-locates and `GEOSEARCH` is a **bounded** cross-shard scatter, **live zero-loss resharding** (`MIGRATESLOT`), **per-shard failover** (the sentinel reassigns slots), and a **global HLC-ordered cross-shard changefeed** (`CLUSTER CDCMERGE`).
 
 ## Deferred (known, intentional)
 
 - A finer **S2/R-tree** geo index + keyset pagination (a geohash index already makes `GEOSEARCH` sub-linear).
 - **Full RESP3 typing** of every reply (typed maps/sets/doubles + pub/sub push frames done; a few niche replies remain).
 - **Native in-process TLS by default** (it's an opt-in feature; the default build stays zero-dependency).
-- The big one: horizontal **spatial clustering** (P6) — the flagship, done last; **spatial-first vs hash-slot-first** is the open call.
+- Clustering hardening (optional, post-flagship): off-thread cross-shard scatter, persisted HLC stamps, `ASK`-redirect *online* migration, gossip-based topology propagation (today it's operator/sentinel-driven). Full Raft/gossip consensus stays deferred by the zero-dep stance.
 
 ## Dismissed (won't do — with the reasoning)
 
@@ -69,12 +70,14 @@ See [CHANGEFEED.md](CHANGEFEED.md), [GEO.md](GEO.md), [SKETCHES.md](SKETCHES.md)
 - Any **Redis client** works over RESP; the custom verbs go through each client's raw-command API
   (see [CLIENTS.md](CLIENTS.md)).
 
-## Next major arc — geo phase 3 & clustering
+## Next major arc — depth on the shipped flagship
 
-- A real **S2-cell / R-tree** spatial index (sub-linear `GEOSEARCH`) with **combined attribute filters**
-  (`nearby AND status=…`) and keyset pagination.
-- **Spatial clustering** — horizontal sharding that preserves locality — the empty market intersection
-  (in-memory · geo-first · clustered) that even Tile38 leaves open.
+The flagship — **spatial clustering** (horizontal sharding that preserves locality, the in-memory ·
+geo-first · clustered intersection even Tile38 leaves open) — is now **shipped**. What's left is depth:
+
+- A finer **S2-cell / R-tree** spatial index with keyset pagination (the geohash index already makes
+  `GEOSEARCH` sub-linear; this sharpens it further).
+- Clustering hardening: off-thread scatter, persisted HLC, online (`ASK`-redirect) migration, gossip.
 
 ## Ecosystem & smaller follow-ups
 
