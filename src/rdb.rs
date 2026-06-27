@@ -110,7 +110,7 @@ fn write_value<W: Write>(w: &mut W, key: &[u8], v: &Value) -> io::Result<()> {
         }
         Value::ZSet(z) => {
             w.write_all(&(z.len() as u32).to_le_bytes())?;
-            for (m, score) in z {
+            for (m, score) in z.iter() {
                 write_bytes(w, m)?;
                 w.write_all(&score.to_le_bytes())?;
             }
@@ -391,7 +391,7 @@ fn read_value<R: Read>(r: &mut R, tag: u8) -> io::Result<Value> {
         }
         4 => {
             let n = read_u32(r)?;
-            let mut z = HashMap::with_capacity(n.min(READ_ALLOC_CAP));
+            let mut z = crate::db::ZSet::new();
             for _ in 0..n {
                 let m = read_bytes(r)?;
                 let score = read_f64(r)?;

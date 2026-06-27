@@ -280,7 +280,7 @@ replication (real offsets, `WAIT`, no expiry divergence) and **automatic failove
 — plus the full reactive/geo differentiator set.
 
 **Next:** a finer S2/R-tree geo index (a geohash index already makes `GEOSEARCH` sub-linear, with
-combined `WHERE` attribute filters); O(log n) sorted sets; thread-per-core; then the horizontal **spatial
+combined `WHERE` attribute filters); thread-per-core execution; then the horizontal **spatial
 clustering** that nobody in the in-memory-geo space has packaged simply — Locus's flagship lane, done last.
 
 **Explicit non-goals:** scripting/`EVAL`, an embedded HTTP `/metrics` endpoint (`INFO` + `redis_exporter`

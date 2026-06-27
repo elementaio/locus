@@ -357,7 +357,7 @@ fn reconstruct(key: &[u8], value: &Value) -> Vec<Vec<Vec<u8>>> {
         }
         Value::ZSet(z) => {
             let mut c = vec![b"ZADD".to_vec(), k];
-            for (m, score) in z {
+            for (m, score) in z.iter() {
                 c.push(fmt_score(*score));
                 c.push(m.clone());
             }

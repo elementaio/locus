@@ -7,7 +7,7 @@
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::atomic::{AtomicU64, Ordering};
 
-use crate::db::{Db, Value, now_ms};
+use crate::db::{Db, Value, ZSet, now_ms};
 use crate::resp::{
     array, bulk_array, bulk_string, error, integer, null_array, null_bulk, simple_string,
 };
@@ -2992,14 +2992,13 @@ fn in_range(s: f64, lo: f64, lo_ex: bool, hi: f64, hi_ex: bool) -> bool {
     above && below
 }
 
-/// Members sorted by (score, then member bytes), ascending.
-fn sorted_members(z: &HashMap<Vec<u8>, f64>) -> Vec<(Vec<u8>, f64)> {
-    let mut v: Vec<(Vec<u8>, f64)> = z.iter().map(|(m, s)| (m.clone(), *s)).collect();
-    v.sort_by(|a, b| a.1.total_cmp(&b.1).then_with(|| a.0.cmp(&b.0)));
-    v
+/// Members in (score, then member bytes) ascending order — straight from the
+/// sorted set's ordered index, no per-call sort.
+fn sorted_members(z: &ZSet) -> Vec<(Vec<u8>, f64)> {
+    z.ordered().collect()
 }
 
-fn get_zset<'a>(db: &'a mut Db, key: &[u8]) -> Result<Option<&'a HashMap<Vec<u8>, f64>>, ()> {
+fn get_zset<'a>(db: &'a mut Db, key: &[u8]) -> Result<Option<&'a ZSet>, ()> {
     match db.get(key) {
         None => Ok(None),
         Some(Value::ZSet(z)) => Ok(Some(z)),
@@ -3052,7 +3051,7 @@ fn zadd_cmd(db: &mut Db, tokens: &[Vec<u8>]) -> Vec<u8> {
         j += 2;
     }
     let key = &tokens[1];
-    let z = match db.get_or_insert_with(key, || Value::ZSet(HashMap::new())) {
+    let z = match db.get_or_insert_with(key, || Value::ZSet(ZSet::new())) {
         Value::ZSet(z) => z,
         _ => return wrongtype(),
     };
@@ -3154,10 +3153,7 @@ fn zrem_cmd(db: &mut Db, tokens: &[Vec<u8>]) -> Vec<u8> {
     }
     let removed = match db.get_mut(&tokens[1]) {
         None => 0,
-        Some(Value::ZSet(z)) => tokens[2..]
-            .iter()
-            .filter(|m| z.remove(*m).is_some())
-            .count() as i64,
+        Some(Value::ZSet(z)) => tokens[2..].iter().filter(|m| z.remove(m).is_some()).count() as i64,
         Some(_) => return wrongtype(),
     };
     db.remove_if_empty(&tokens[1]);
@@ -3172,7 +3168,7 @@ fn zincrby_cmd(db: &mut Db, tokens: &[Vec<u8>], proto: u8) -> Vec<u8> {
         Some(s) => s,
         None => return error("ERR value is not a valid float"),
     };
-    let z = match db.get_or_insert_with(&tokens[1], || Value::ZSet(HashMap::new())) {
+    let z = match db.get_or_insert_with(&tokens[1], || Value::ZSet(ZSet::new())) {
         Value::ZSet(z) => z,
         _ => return wrongtype(),
     };
@@ -3188,26 +3184,19 @@ fn zrank_cmd(db: &mut Db, tokens: &[Vec<u8>], rev: bool) -> Vec<u8> {
     match get_zset(db, &tokens[1]) {
         Err(()) => wrongtype(),
         Ok(None) => null_bulk(),
-        Ok(Some(z)) => {
-            let mut sorted = sorted_members(z);
-            if rev {
-                sorted.reverse();
-            }
-            match sorted.iter().position(|(m, _)| m == &tokens[2]) {
-                Some(i) => integer(i as i64),
-                None => null_bulk(),
-            }
-        }
+        Ok(Some(z)) => match z.rank(&tokens[2]) {
+            // rank() is ascending; reverse rank is len-1-asc.
+            Some(asc) => integer(if rev {
+                (z.len() - 1 - asc) as i64
+            } else {
+                asc as i64
+            }),
+            None => null_bulk(),
+        },
     }
 }
 
-fn zrange_index(
-    z: &HashMap<Vec<u8>, f64>,
-    start: i64,
-    stop: i64,
-    withscores: bool,
-    rev: bool,
-) -> Vec<u8> {
+fn zrange_index(z: &ZSet, start: i64, stop: i64, withscores: bool, rev: bool) -> Vec<u8> {
     let mut sorted = sorted_members(z);
     if rev {
         sorted.reverse();
@@ -3371,8 +3360,8 @@ fn zcount_cmd(db: &mut Db, tokens: &[Vec<u8>]) -> Vec<u8> {
         Ok(None) => integer(0),
         Ok(Some(z)) => {
             let n = z
-                .values()
-                .filter(|s| in_range(**s, lo, lo_ex, hi, hi_ex))
+                .iter()
+                .filter(|(_, s)| in_range(**s, lo, lo_ex, hi, hi_ex))
                 .count();
             integer(n as i64)
         }
@@ -3571,7 +3560,7 @@ fn zstore_cmd(db: &mut Db, tokens: &[Vec<u8>], inter: bool) -> Vec<u8> {
     if acc.is_empty() {
         db.remove(dest);
     } else {
-        db.insert(dest.clone(), Value::ZSet(acc));
+        db.insert(dest.clone(), Value::ZSet(acc.into_iter().collect()));
         db.clear_expire(dest);
     }
     integer(n as i64)
@@ -4107,6 +4096,29 @@ mod tests {
             cmd(&mut db, &[b"ZPOPMIN", b"z"]),
             bulk_array(&[b"b".to_vec(), b"2".to_vec()])
         );
+    }
+
+    #[test]
+    fn zset_ordered_index_ties_and_reposition() {
+        let mut db = Db::new();
+        // Equal scores order by member bytes; lower score sorts first.
+        cmd(
+            &mut db,
+            &[b"ZADD", b"z", b"5", b"b", b"5", b"a", b"3", b"c"],
+        );
+        assert_eq!(
+            cmd(&mut db, &[b"ZRANGE", b"z", b"0", b"-1"]),
+            b"*3\r\n$1\r\nc\r\n$1\r\na\r\n$1\r\nb\r\n".to_vec() // c(3), a(5), b(5)
+        );
+        assert_eq!(cmd(&mut db, &[b"ZRANK", b"z", b"c"]), b":0\r\n".to_vec());
+        assert_eq!(cmd(&mut db, &[b"ZRANK", b"z", b"b"]), b":2\r\n".to_vec());
+        assert_eq!(cmd(&mut db, &[b"ZREVRANK", b"z", b"c"]), b":2\r\n".to_vec());
+        // Re-scoring a member must reposition it in the ordered index.
+        cmd(&mut db, &[b"ZADD", b"z", b"1", b"b"]);
+        assert_eq!(cmd(&mut db, &[b"ZRANK", b"z", b"b"]), b":0\r\n".to_vec());
+        // Removing keeps the index consistent.
+        cmd(&mut db, &[b"ZREM", b"z", b"c"]);
+        assert_eq!(cmd(&mut db, &[b"ZRANK", b"z", b"a"]), b":1\r\n".to_vec());
     }
 
     #[test]

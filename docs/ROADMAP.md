@@ -37,13 +37,22 @@ On top of M0–M12, the reactive + geo-first vision is now implemented:
 
 See [CHANGEFEED.md](CHANGEFEED.md), [GEO.md](GEO.md), [SKETCHES.md](SKETCHES.md).
 
+## Shipped since (P0–P5 hardening)
+
+- **Security:** AUTH + protected mode + a simple multi-user **ACL**; conn limits, idle timeout.
+- **Durability:** async `BGSAVE`/`BGREWRITEAOF`, `appendfsync`, persisted+replicated reactive state, crash tests.
+- **Replication:** real replid/offset, **`WAIT`**, **PSYNC partial-resync** over a backlog ring, no expiry divergence.
+- **HA + TLS:** built-in **sentinel** auto-failover (quorum + inter-sentinel agreement); TLS via sidecar or the optional `tls` feature.
+- **Compat/observability:** `SCAN`/`COMMAND`/`CONFIG`/`SLOWLOG`/`INFO` (works with `redis_exporter`), RESP3 typed replies.
+- **Geo depth:** geohash **spatial index** (sub-linear `GEOSEARCH`) + combined `WHERE` attribute filters.
+- **Sorted sets:** ordered index (std `BTreeSet`) for range/rank without re-sorting on read.
+
 ## Deferred (known, intentional)
 
-- Replication's deep tail: **PSYNC partial resync**, replication backlog, `WAIT`, automatic **failover**
-- A **skiplist** for O(log n) sorted-set rank/range (currently correct sort-on-demand)
-- **AUTH / ACL / TLS**; multiple logical DBs (only DB 0)
-- **Full RESP3 typing** of every reply (we negotiate `HELLO` but keep RESP2-compatible encoders)
-- **Thread-per-core** execution for multi-core throughput
+- A finer **S2/R-tree** geo index + keyset pagination; **thread-per-core** execution for multi-core throughput.
+- **Full RESP3 typing** of every reply (typed maps/sets/doubles done; pub/sub push frames pending); multiple logical DBs (only DB 0).
+- **Native in-process TLS by default** (it's an opt-in feature; the default build stays zero-dependency).
+- The big one: horizontal **spatial clustering** (P6) — the flagship, done last.
 
 ## Distribution (shipped in v0.2.0)
 

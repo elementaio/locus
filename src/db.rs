@@ -6,7 +6,8 @@
 //! Expiry (key -> deadline) is kept in a separate map, with PASSIVE checking on
 //! access and an ACTIVE sampling reaper (see `active_expire`).
 
-use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
+use std::cmp::Ordering;
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet, VecDeque};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use crate::geohash;
@@ -22,15 +23,93 @@ pub fn now_ms() -> u64 {
 /// typically tiny, so a `Vec` of pairs beats a map here.
 pub type GeoAttrs = Vec<(Vec<u8>, Vec<u8>)>;
 
+/// Total order over scores for the sorted-set index. Scores are finite-or-±inf
+/// (never NaN — `parse_score` rejects it), so `total_cmp` is a valid total order.
+#[derive(Clone, Copy, PartialEq)]
+struct Score(f64);
+impl Eq for Score {}
+impl Ord for Score {
+    fn cmp(&self, other: &Self) -> Ordering {
+        self.0.total_cmp(&other.0)
+    }
+}
+impl PartialOrd for Score {
+    fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
+/// A sorted set: `member -> score` for O(1) lookup, paired with an ordered index
+/// of `(score, member)` for range/rank without re-sorting on every read. Mutate
+/// only through `insert`/`remove` so the two stay in lock-step.
+#[derive(Default)]
+pub struct ZSet {
+    map: HashMap<Vec<u8>, f64>,
+    sorted: BTreeSet<(Score, Vec<u8>)>,
+}
+
+impl ZSet {
+    pub fn new() -> Self {
+        Self::default()
+    }
+    pub fn len(&self) -> usize {
+        self.map.len()
+    }
+    pub fn is_empty(&self) -> bool {
+        self.map.is_empty()
+    }
+    pub fn get(&self, member: &[u8]) -> Option<&f64> {
+        self.map.get(member)
+    }
+    /// Set a member's score, returning its previous score. Keeps the ordered index
+    /// consistent (removes the old (score, member) entry first).
+    pub fn insert(&mut self, member: Vec<u8>, score: f64) -> Option<f64> {
+        let old = self.map.insert(member.clone(), score);
+        if let Some(o) = old {
+            self.sorted.remove(&(Score(o), member.clone()));
+        }
+        self.sorted.insert((Score(score), member));
+        old
+    }
+    pub fn remove(&mut self, member: &[u8]) -> Option<f64> {
+        let old = self.map.remove(member)?;
+        self.sorted.remove(&(Score(old), member.to_vec()));
+        Some(old)
+    }
+    /// Unordered (member, score) pairs — for serialization and set algebra.
+    pub fn iter(&self) -> impl Iterator<Item = (&Vec<u8>, &f64)> {
+        self.map.iter()
+    }
+    /// (member, score) pairs in ascending (score, member) order — no per-call sort.
+    pub fn ordered(&self) -> impl Iterator<Item = (Vec<u8>, f64)> + '_ {
+        self.sorted.iter().map(|(s, m)| (m.clone(), s.0))
+    }
+    /// 0-based ascending rank of a member, in O(rank) via the ordered index.
+    pub fn rank(&self, member: &[u8]) -> Option<usize> {
+        let score = *self.map.get(member)?;
+        Some(self.sorted.range(..(Score(score), member.to_vec())).count())
+    }
+}
+
+impl FromIterator<(Vec<u8>, f64)> for ZSet {
+    fn from_iter<I: IntoIterator<Item = (Vec<u8>, f64)>>(iter: I) -> Self {
+        let mut z = ZSet::new();
+        for (m, s) in iter {
+            z.insert(m, s);
+        }
+        z
+    }
+}
+
 /// A stored value. Each variant is a distinct Redis type.
 pub enum Value {
     Str(Vec<u8>),
     List(VecDeque<Vec<u8>>),
     Hash(HashMap<Vec<u8>, Vec<u8>>),
     Set(HashSet<Vec<u8>>),
-    /// Sorted set: member -> score. Kept correct-but-simple (sorted on demand);
-    /// a skiplist for O(log n) rank/range is the documented later optimization.
-    ZSet(HashMap<Vec<u8>, f64>),
+    /// Sorted set — a `member -> score` map plus an ordered `(score, member)`
+    /// index for range/rank without re-sorting (see `ZSet`).
+    ZSet(ZSet),
     Stream(Stream),
     /// A geo point `(lon, lat)` plus optional inline attributes (`field -> value`,
     /// insertion-ordered). Each geo object is its own key (the geo-first model): a
@@ -403,7 +482,7 @@ fn estimate_size(key_len: usize, v: &Value) -> usize {
         Value::List(l) => l.iter().map(|e| e.len() + ELEM_OVH).sum(),
         Value::Hash(h) => h.iter().map(|(k, vv)| k.len() + vv.len() + ELEM_OVH).sum(),
         Value::Set(s) => s.iter().map(|e| e.len() + ELEM_OVH).sum(),
-        Value::ZSet(z) => z.keys().map(|m| m.len() + 8 + ELEM_OVH).sum(),
+        Value::ZSet(z) => z.iter().map(|(m, _)| m.len() + 8 + ELEM_OVH).sum(),
         Value::Stream(st) => st
             .entries
             .iter()
