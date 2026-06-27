@@ -1190,3 +1190,140 @@ fn acl_user_least_privilege() {
     assert_eq!(admin.cmd(&["ACL", "WHOAMI"]), "default");
     assert!(admin.cmd(&["ACL", "USERS"]).contains("alice"));
 }
+
+#[test]
+fn replica_loses_keys_when_the_master_expires_them() {
+    let master = Server::start();
+    let replica = Server::start();
+    let (mut m, mut r) = (master.connect(), replica.connect());
+    assert_eq!(
+        r.cmd(&["REPLICAOF", "127.0.0.1", &master.port.to_string()]),
+        "OK"
+    );
+    sleep(Duration::from_millis(400)); // full sync
+    m.cmd(&["SET", "k", "v", "PX", "200"]);
+    // The write replicates...
+    let deadline = Instant::now() + Duration::from_secs(2);
+    loop {
+        if r.cmd(&["GET", "k"]) == "v" {
+            break;
+        }
+        assert!(Instant::now() < deadline, "key never replicated");
+        sleep(Duration::from_millis(20));
+    }
+    // ...then the master expires it and streams a DEL; the replica converges to
+    // empty rather than holding a stale key (the divergence REPL-1 fixes).
+    let deadline = Instant::now() + Duration::from_secs(3);
+    loop {
+        if r.cmd(&["GET", "k"]) == "(nil)" {
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "expiry not reflected on the replica"
+        );
+        sleep(Duration::from_millis(50));
+    }
+}
+
+#[test]
+fn master_reports_real_replid_and_advancing_offset() {
+    let master = Server::start();
+    let replica = Server::start();
+    let mut m = master.connect();
+    let mut r = replica.connect();
+    assert_eq!(
+        r.cmd(&["REPLICAOF", "127.0.0.1", &master.port.to_string()]),
+        "OK"
+    );
+    sleep(Duration::from_millis(400)); // full sync, replica registered
+    let field = |info: &str, key: &str| -> String {
+        info.split("\r\n")
+            .find_map(|l| l.strip_prefix(key).and_then(|x| x.strip_prefix(':')))
+            .unwrap_or("")
+            .trim()
+            .to_string()
+    };
+    let info0 = m.cmd(&["INFO"]);
+    let replid = field(&info0, "master_replid");
+    assert_eq!(
+        replid.len(),
+        40,
+        "replid should be 40 hex chars: {replid:?}"
+    );
+    assert_ne!(replid, "0".repeat(40), "replid must not be all zeros");
+    let off0: u64 = field(&info0, "master_repl_offset").parse().unwrap();
+    // A replicated write advances the offset.
+    m.cmd(&["SET", "k", "v"]);
+    let deadline = Instant::now() + Duration::from_secs(2);
+    loop {
+        let off1: u64 = field(&m.cmd(&["INFO"]), "master_repl_offset")
+            .parse()
+            .unwrap();
+        if off1 > off0 {
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "offset did not advance on a write"
+        );
+        sleep(Duration::from_millis(50));
+    }
+}
+
+#[test]
+fn replica_reports_link_up_and_its_own_offset() {
+    let master = Server::start();
+    let replica = Server::start();
+    let mut m = master.connect();
+    let mut r = replica.connect();
+    assert_eq!(
+        r.cmd(&["REPLICAOF", "127.0.0.1", &master.port.to_string()]),
+        "OK"
+    );
+    sleep(Duration::from_millis(400));
+    m.cmd(&["SET", "k", "v"]);
+    let field = |info: &str, key: &str| -> String {
+        info.split("\r\n")
+            .find_map(|l| l.strip_prefix(key).and_then(|x| x.strip_prefix(':')))
+            .unwrap_or("")
+            .trim()
+            .to_string()
+    };
+    // The replica reports the link up and its applied offset advancing as it
+    // consumes the master's stream.
+    let deadline = Instant::now() + Duration::from_secs(3);
+    loop {
+        let info = r.cmd(&["INFO"]);
+        let link = field(&info, "master_link_status");
+        let off: u64 = field(&info, "master_repl_offset").parse().unwrap_or(0);
+        if link == "up" && off > 0 {
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "replica link/offset wrong: link={link} off={off}"
+        );
+        sleep(Duration::from_millis(50));
+    }
+}
+
+#[test]
+fn wait_counts_replicas_that_acked() {
+    let master = Server::start();
+    let replica = Server::start();
+    let mut m = master.connect();
+    let mut r = replica.connect();
+    // No replicas required -> returns immediately.
+    assert_eq!(m.cmd(&["WAIT", "0", "100"]), "0");
+    assert_eq!(
+        r.cmd(&["REPLICAOF", "127.0.0.1", &master.port.to_string()]),
+        "OK"
+    );
+    sleep(Duration::from_millis(400));
+    m.cmd(&["SET", "k", "v"]);
+    // The replica acks the write within the timeout, so WAIT 1 returns 1.
+    assert_eq!(m.cmd(&["WAIT", "1", "2000"]), "1");
+    // Asking for more replicas than exist times out and returns the real count.
+    assert_eq!(m.cmd(&["WAIT", "5", "300"]), "1");
+}

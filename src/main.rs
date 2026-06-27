@@ -57,7 +57,9 @@ enum Msg {
     },
     /// Replica received a full-sync snapshot; replace the whole dataset plus the
     /// CDC / secondary-index state carried in the snapshot trailer.
-    ReplaceDb(Box<Db>, Box<rdb::Extras>),
+    ReplaceDb(Box<Db>, Box<rdb::Extras>, String, u64),
+    /// The replica's link to its master dropped (clear master_link_status).
+    MasterLinkDown,
 }
 
 /// Set by the SIGTERM/SIGINT handler so the hub can persist and exit cleanly.
@@ -205,6 +207,13 @@ struct Hub {
     // ACL: named users + each connection's current user (default user is implicit).
     users: HashMap<Vec<u8>, acl::User>,
     current_user: HashMap<u64, Vec<u8>>,
+    // replication identity + stream position (bytes streamed to replicas).
+    replid: String,
+    master_repl_offset: u64,
+    master_link_up: bool, // replica side: is the link to our master up?
+    // master side: each replica's last-acked offset + clients parked on WAIT.
+    replica_acks: HashMap<u64, u64>,
+    waiting: Vec<WaitReq>,
 }
 
 /// One slow-log entry.
@@ -259,6 +268,14 @@ struct BlockedReader {
     specs: Vec<(Vec<u8>, db::StreamId)>,
     count: Option<usize>,
     deadline: Option<u64>, // None = block forever
+}
+
+/// A client parked on WAIT until enough replicas ack `target` (or it times out).
+struct WaitReq {
+    id: u64,
+    target: u64,
+    numreplicas: usize,
+    deadline: Option<u64>, // None = block forever (WAIT ... 0)
 }
 
 /// Per-client transaction state (MULTI/EXEC/WATCH).
@@ -360,6 +377,14 @@ impl Hub {
                 .unwrap_or(128),
             users: HashMap::new(),
             current_user: HashMap::new(),
+            replid: acl::hex32(&acl::sha256(
+                format!("{}-{}", std::process::id(), now_ms()).as_bytes(),
+            ))[..40]
+                .to_string(),
+            master_repl_offset: 0,
+            master_link_up: false,
+            replica_acks: HashMap::new(),
+            waiting: Vec::new(),
         };
         hub.apply_extras(extras);
         hub
@@ -795,10 +820,15 @@ impl Hub {
         s.push_str("# Replication\r\n");
         s.push_str(&format!("role:{role}\r\n"));
         s.push_str(&format!("connected_slaves:{}\r\n", self.replicas.len()));
-        s.push_str("master_repl_offset:0\r\n");
+        s.push_str(&format!("master_replid:{}\r\n", self.replid));
+        s.push_str(&format!(
+            "master_repl_offset:{}\r\n",
+            self.master_repl_offset
+        ));
         if let Some((h, p)) = &self.master {
+            let link = if self.master_link_up { "up" } else { "down" };
             s.push_str(&format!(
-                "master_host:{h}\r\nmaster_port:{p}\r\nmaster_link_status:up\r\n"
+                "master_host:{h}\r\nmaster_port:{p}\r\nmaster_link_status:{link}\r\n"
             ));
         }
         s.push_str("# Keyspace\r\n");
@@ -815,6 +845,11 @@ impl Hub {
         }
         let cmd = tokens[0].to_ascii_uppercase();
         self.commands_processed = self.commands_processed.wrapping_add(1);
+        // On a replica, applying the master's stream advances our offset by the
+        // same bytes the master counted (canonical RESP encoding is identical).
+        if id == MASTER_ID {
+            self.master_repl_offset += resp::command(&tokens).len() as u64;
+        }
 
         // Protected mode: if no password is set, refuse non-loopback clients so an
         // accidentally-exposed instance (e.g. the 0.0.0.0 Docker image) isn't wide
@@ -1077,11 +1112,34 @@ impl Hub {
             b"AUTH" => self.handle_auth(id, &tokens),
 
             // --- replication ---
-            b"REPLCONF" => self.send(id, resp::simple_string("OK")),
+            b"REPLCONF" => {
+                // A replica's periodic `REPLCONF ACK <offset>` gets no reply; any
+                // other REPLCONF (e.g. listening-port) just acks OK.
+                if tokens
+                    .get(1)
+                    .is_some_and(|s| s.eq_ignore_ascii_case(b"ACK"))
+                {
+                    if let Some(off) = tokens
+                        .get(2)
+                        .and_then(|t| std::str::from_utf8(t).ok())
+                        .and_then(|s| s.parse::<u64>().ok())
+                    {
+                        self.replica_acks.insert(id, off);
+                        self.check_waits();
+                    }
+                } else {
+                    self.send(id, resp::simple_string("OK"));
+                }
+            }
+            b"WAIT" => self.handle_wait(id, &tokens),
             b"PSYNC" | b"SYNC" => {
                 self.send(
                     id,
-                    b"+FULLRESYNC 0000000000000000000000000000000000000000 0\r\n".to_vec(),
+                    format!(
+                        "+FULLRESYNC {} {}\r\n",
+                        self.replid, self.master_repl_offset
+                    )
+                    .into_bytes(),
                 );
                 let mut snap = rdb::serialize(&self.db);
                 rdb::append_extras(&mut snap, &self.build_extras());
@@ -1835,6 +1893,61 @@ impl Hub {
         }
     }
 
+    /// WAIT numreplicas timeout — reply with the count of replicas that have
+    /// acked the offset as of this command, blocking up to `timeout` ms (0 =
+    /// forever) until that many catch up.
+    fn handle_wait(&mut self, id: u64, tokens: &[Vec<u8>]) {
+        let parse = |t: Option<&Vec<u8>>| -> Option<u64> {
+            std::str::from_utf8(t?).ok()?.trim().parse().ok()
+        };
+        let (numreplicas, timeout) = match (parse(tokens.get(1)), parse(tokens.get(2))) {
+            (Some(n), Some(t)) => (n as usize, t),
+            _ => {
+                return self.send(
+                    id,
+                    resp::error("ERR wrong number of arguments for 'wait' command"),
+                );
+            }
+        };
+        let target = self.master_repl_offset;
+        let acked = self.count_acked(target);
+        if acked >= numreplicas {
+            return self.send(id, resp::integer(acked as i64));
+        }
+        let deadline = if timeout == 0 {
+            None
+        } else {
+            Some(now_ms() + timeout)
+        };
+        self.waiting.push(WaitReq {
+            id,
+            target,
+            numreplicas,
+            deadline,
+        });
+    }
+
+    fn count_acked(&self, target: u64) -> usize {
+        self.replica_acks.values().filter(|&&o| o >= target).count()
+    }
+
+    /// Reply to any parked WAITs whose replica quorum is now met or that timed out.
+    fn check_waits(&mut self) {
+        let now = now_ms();
+        let mut i = 0;
+        while i < self.waiting.len() {
+            let w = &self.waiting[i];
+            let acked = self.count_acked(w.target);
+            if acked >= w.numreplicas || w.deadline.is_some_and(|d| d <= now) {
+                let rid = w.id;
+                self.waiting.remove(i);
+                self.send(rid, resp::integer(acked as i64));
+            } else {
+                i += 1;
+            }
+        }
+    }
+
     /// RESP3 negotiation. Accepts HELLO [2|3]; replies with server info as a
     /// RESP3 map (proto 3) or RESP2 flat array (proto 2). Most reply types are
     /// identical across RESP2/RESP3, so we track the version but keep the
@@ -2014,15 +2127,8 @@ impl Hub {
                     let _ = a.append(&entries);
                 }
                 // Propagate the deterministic form to every replica.
-                if !self.replicas.is_empty() {
-                    for e in &entries {
-                        let bytes = resp::command(e);
-                        for rid in self.replicas.iter() {
-                            if let Some(out) = self.clients.get(rid) {
-                                let _ = out.send(bytes.clone());
-                            }
-                        }
-                    }
+                for e in &entries {
+                    self.replicate(resp::command(e));
                 }
                 // Feed the changefeed (same modified-key set as WATCH/AOF).
                 self.emit_write_changes(&tokens);
@@ -2052,10 +2158,17 @@ impl Hub {
     /// Dirty the WATCHers of any key the keyspace expired since the last drain,
     /// and emit an `expire` change to changefeed subscribers.
     fn dirty_expired_watchers(&mut self) {
+        let is_master = self.master.is_none();
         for key in self.db.take_expired() {
             self.dirty_watchers(&key);
             self.record_change(b"expire", &key, None);
             self.reindex_key(&key); // drop expired key from secondary indexes
+            // The master is authoritative for expiry: stream a DEL to replicas
+            // (and the AOF) so they delete the key on our schedule instead of
+            // expiring independently (which would let the two diverge).
+            if is_master {
+                self.propagate(&[b"DEL".to_vec(), key]);
+            }
         }
     }
 
@@ -2089,12 +2202,19 @@ impl Hub {
         if let Some(a) = self.aof.as_mut() {
             let _ = a.append(&batch);
         }
-        if !self.replicas.is_empty() {
-            let bytes = resp::command(tokens);
-            for rid in self.replicas.iter() {
-                if let Some(out) = self.clients.get(rid) {
-                    let _ = out.send(bytes.clone());
-                }
+        self.replicate(resp::command(tokens));
+    }
+
+    /// Stream one already-encoded command to every replica and advance the
+    /// replication offset (the running byte position in the write stream).
+    fn replicate(&mut self, bytes: Vec<u8>) {
+        if self.replicas.is_empty() {
+            return;
+        }
+        self.master_repl_offset += bytes.len() as u64;
+        for rid in self.replicas.iter() {
+            if let Some(out) = self.clients.get(rid) {
+                let _ = out.send(bytes.clone());
             }
         }
     }
@@ -2129,6 +2249,7 @@ impl Hub {
         let host = String::from_utf8_lossy(&tokens[1]).to_string();
         let port = String::from_utf8_lossy(&tokens[2]).to_string();
         self.master = Some((host.clone(), port.clone()));
+        self.master_link_up = false; // until the full sync completes
         let stop = Arc::new(AtomicBool::new(false));
         self.replica_stop = Some(stop.clone());
         let addr = format!("{host}:{port}");
@@ -2330,6 +2451,8 @@ fn run_hub(rx: mpsc::Receiver<Msg>, tx: mpsc::Sender<Msg>) {
                     hub.unwatch_keys(&t.watched, id);
                 }
                 hub.blocked.retain(|r| r.id != id);
+                hub.replica_acks.remove(&id);
+                hub.waiting.retain(|w| w.id != id);
                 hub.protos.remove(&id);
                 hub.changefeeds.remove(&id);
                 hub.authed.remove(&id);
@@ -2350,13 +2473,19 @@ fn run_hub(rx: mpsc::Receiver<Msg>, tx: mpsc::Sender<Msg>) {
                     hub.handle_command(id, tokens);
                 }
             }
-            Ok(Msg::ReplaceDb(db, extras)) => {
+            Ok(Msg::ReplaceDb(db, extras, replid, offset)) => {
                 hub.db = *db;
                 hub.apply_extras(*extras); // CDC offsets/log/groups + rebuilt indexes
+                // Adopt the master's replication id + offset (Redis semantics) so
+                // our INFO and future reconnects line up with the master's stream.
+                hub.replid = replid;
+                hub.master_repl_offset = offset;
+                hub.master_link_up = true;
                 // A replica that just loaded a full-sync snapshot may now be able
                 // to satisfy readers parked on a blocking XREAD.
                 hub.serve_blocked();
             }
+            Ok(Msg::MasterLinkDown) => hub.master_link_up = false,
             Err(mpsc::RecvTimeoutError::Timeout) => {
                 if SHUTDOWN.load(Ordering::Relaxed) {
                     // Drain anything already queued, then persist and exit.
@@ -2370,9 +2499,14 @@ fn run_hub(rx: mpsc::Receiver<Msg>, tx: mpsc::Sender<Msg>) {
                 if let Some(a) = hub.aof.as_mut() {
                     a.maybe_fsync();
                 }
-                hub.db.active_expire();
+                // Only the master actively expires keys; a replica waits for the
+                // master's DELs, so the two never diverge on expiry timing.
+                if hub.master.is_none() {
+                    hub.db.active_expire();
+                }
                 hub.dirty_expired_watchers();
                 hub.expire_blocked();
+                hub.check_waits();
             }
             Err(mpsc::RecvTimeoutError::Disconnected) => break,
         }
@@ -2380,6 +2514,16 @@ fn run_hub(rx: mpsc::Receiver<Msg>, tx: mpsc::Sender<Msg>) {
 }
 
 // === replica side: connect to a master and apply its stream =================
+
+/// Parse `+FULLRESYNC <replid> <offset>` into (replid, offset). Best-effort.
+fn parse_fullresync(line: &[u8]) -> (String, u64) {
+    let s = String::from_utf8_lossy(line);
+    let mut parts = s.trim_start_matches('+').split_whitespace();
+    let _ = parts.next(); // "FULLRESYNC"
+    let replid = parts.next().unwrap_or("").to_string();
+    let offset = parts.next().and_then(|o| o.parse().ok()).unwrap_or(0);
+    (replid, offset)
+}
 
 fn replica_sync(
     addr: String,
@@ -2391,6 +2535,7 @@ fn replica_sync(
         if let Err(e) = try_sync(&addr, masterauth.as_deref(), &hub_tx, &stop) {
             log::warn(&format!("replication: link to {addr} dropped: {e}"));
         }
+        let _ = hub_tx.send(Msg::MasterLinkDown);
         // Reconnect after a short delay (a real impl would PSYNC partial-resync).
         for _ in 0..10 {
             if stop.load(Ordering::Relaxed) {
@@ -2434,7 +2579,8 @@ fn try_sync(
     )?;
     read_line(&mut stream)?;
     send_cmd(&mut stream, &[b"PSYNC", b"?", b"-1"])?;
-    read_line(&mut stream)?; // +FULLRESYNC <id> <offset>
+    let resync = read_line(&mut stream)?; // +FULLRESYNC <replid> <offset>
+    let (replid, offset) = parse_fullresync(&resync);
 
     // Full-sync snapshot: $<len>\r\n<bytes>
     let len = read_bulk_header(&mut stream)?;
@@ -2442,7 +2588,12 @@ fn try_sync(
     stream.read_exact(&mut snap)?;
     let (db, extras) = rdb::deserialize_with_extras(&snap)?;
     if hub_tx
-        .send(Msg::ReplaceDb(Box::new(db), Box::new(extras)))
+        .send(Msg::ReplaceDb(
+            Box::new(db),
+            Box::new(extras),
+            replid,
+            offset,
+        ))
         .is_err()
     {
         return Ok(());
@@ -2454,6 +2605,7 @@ fn try_sync(
     stream.set_read_timeout(Some(Duration::from_millis(200)))?;
     let mut inbuf: Vec<u8> = Vec::new();
     let mut chunk = [0u8; 4096];
+    let mut applied = offset; // our processed offset, seeded from FULLRESYNC
     loop {
         if stop.load(Ordering::Relaxed) {
             return Ok(());
@@ -2466,6 +2618,7 @@ fn try_sync(
                     match parse_command(&inbuf) {
                         Parsed::Complete(tokens, consumed) => {
                             inbuf.drain(0..consumed);
+                            applied += consumed as u64;
                             if !tokens.is_empty()
                                 && hub_tx
                                     .send(Msg::Command {
@@ -2481,12 +2634,19 @@ fn try_sync(
                         Parsed::Error(_) => return Ok(()),
                     }
                 }
+                let off = applied.to_string();
+                let _ = send_cmd(&mut stream, &[b"REPLCONF", b"ACK", off.as_bytes()]);
             }
             Err(e)
                 if matches!(
                     e.kind(),
                     io::ErrorKind::WouldBlock | io::ErrorKind::TimedOut
-                ) => {}
+                ) =>
+            {
+                // Idle: keep the master's view of our offset fresh (drives WAIT).
+                let off = applied.to_string();
+                let _ = send_cmd(&mut stream, &[b"REPLCONF", b"ACK", off.as_bytes()]);
+            }
             Err(e) => return Err(e),
         }
     }
