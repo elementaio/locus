@@ -6,6 +6,78 @@ All notable changes to Locus are documented here. The format is based on
 
 ## [Unreleased]
 
+## [0.3.0] — 2026-06-27
+
+The production-hardening + clustering release. On top of the reactive/geo core (0.2.0), Locus becomes
+safe to operate, durable under crashes, correctly replicated, highly available, TLS-capable, and —
+the flagship — **horizontally clustered with spatial locality**. The default build is still 100%
+dependency-free; the optional `tls` feature is the only thing that pulls a crate.
+
+### Added — security & access control
+- **`AUTH` / `requirepass`** with a constant-time compare, `NOAUTH` gating, and a `HELLO AUTH` clause.
+- **Protected mode** (`LOCUS_PROTECTED_MODE`) — refuses non-loopback traffic without a password, closing
+  the accidental-exposure hole; **replica `masterauth`** closes the unauthenticated-`PSYNC` siphon.
+- **ACL** — users, five command classes (read/write/admin/connection/pubsub) and key-prefix rules,
+  layered additively over `requirepass` (vendored SHA-256). `ACL SETUSER/GETUSER/DELUSER/LIST/USERS/
+  WHOAMI/CAT`.
+- **Connection limits** — `LOCUS_MAXCLIENTS` cap and `LOCUS_TIMEOUT` idle timeout; `TCP_NODELAY`.
+
+### Added — durability
+- **Async `BGSAVE` and `BGREWRITEAOF`** — serialize on the hub, write/fsync off-thread, fold in writes
+  buffered during the rewrite; the old file is kept on failure.
+- **`appendfsync`** (`always`/`everysec`/`no`), directory fsync after rename, surfaced AOF fsync errors,
+  and end-to-end `kill -9` crash-recovery tests. CDC + secondary-index state persists in an RDB trailer.
+
+### Added — replication v2
+- Stable 40-hex **replid** and a byte-accurate **`master_repl_offset`**; `INFO replication` reports both.
+- **`WAIT numreplicas timeout`** with `REPLCONF ACK` and per-replica acked-offset tracking.
+- **PSYNC partial-resync** over a 4 MiB backlog ring (`+CONTINUE` when covered, else `+FULLRESYNC`).
+- No replica **expiry divergence** — the master streams a `DEL` for every expired key; real
+  `master_link_status`.
+
+### Added — high availability
+- **Built-in sentinel** (`LOCUS_SENTINEL=…`) — health-checks the master and promotes the most
+  up-to-date replica, repointing the rest, with replica-quorum corroboration and anti-split-brain
+  reconciliation.
+- **Inter-sentinel agreement** — multiple sentinels (`LOCUS_SENTINEL_PEERS`/`_PORT`/`_ID`) require a
+  majority to see the master down, and only the elected leader promotes (no dual promotion).
+
+### Added — TLS (optional)
+- **In-process TLS** via the opt-in `tls` cargo feature (rustls + ring; no OpenSSL/C). `LOCUS_TLS_PORT`/
+  `_CERT`/`_KEY` add a TLS listener alongside plaintext. The **default build stays zero-dependency**;
+  a sidecar (ghostunnel/stunnel) remains documented for those who want it.
+
+### Added — compatibility & observability
+- **`SCAN`/`HSCAN`/`SSCAN`/`ZSCAN`** (stable cursor, `MATCH`/`COUNT`/`TYPE`/`NOVALUES`), real
+  **`CONFIG GET/SET`**, fleshed-out **`INFO`** (works with `redis_exporter`), **`COMMAND`(`/COUNT/DOCS/
+  INFO`)**, **`SLOWLOG`**, `OBJECT`, `CLIENT`, `GETEX`.
+- **RESP3 typed replies** — maps (`HGETALL`, `CONFIG GET`), sets (`SMEMBERS`, `SINTER`/`SUNION`/`SDIFF`),
+  doubles (`ZSCORE`/`ZINCRBY`/`ZMSCORE`), and **pub/sub push frames**.
+
+### Added — geo & data-structure depth
+- **Geohash spatial index** — a `BTreeMap` over 52-bit cells makes `GEOSEARCH` sub-linear (was a linear
+  scan); **`WHERE field value`** attribute filters; `GEOSET` stores inline attributes.
+- **Ordered-index sorted sets** — a `BTreeSet` companion index gives range/rank without re-sorting on read.
+
+### Added — horizontal spatial clustering (the flagship)
+- **Hash-slot routing** — CRC16 slots with `{hashtag}`, `MOVED`/`CROSSSLOT`/`CLUSTERDOWN`,
+  `CLUSTER SLOTS/SHARDS/NODES/KEYSLOT`.
+- **Cell-in-key spatial sharding** — `LOCUS_CLUSTER_CELL_BITS` + `{cell}id` keys (`CLUSTER CELL lon lat`)
+  co-locate a region on one shard, so `GEOSEARCH` is a **bounded** cross-shard scatter (only the covering
+  shards), not a full fan-out. Cross-shard scatter is parallelized (bounded to ~one peer timeout).
+- **Live, zero-loss resharding** — `CLUSTER MIGRATESLOT slot dst` (two-phase copy-then-commit),
+  `CLUSTER SETSLOT slot NODE addr`; changes are HLC-epoch-stamped and **converge via anti-entropy gossip**
+  (`LOCUS_CLUSTER_GOSSIP_MS`) without pushing to every node.
+- **Per-shard failover** — the sentinel (`LOCUS_SENTINEL_CLUSTER_NODES`) broadcasts `CLUSTER REASSIGN`
+  after promotion so a dead master's slots follow its replica.
+- **Global changefeed** — every change carries a **hybrid logical clock** (persisted across restarts);
+  `CLUSTER CDCMERGE since-hlc` merges all shards' feeds in HLC order up to a watermark that bounds
+  staleness (and holds for a downed shard).
+
+### Changed
+- Crate description and version reflect the reactive/geo/clustered scope. `~14k` lines of std-only Rust
+  across 15 modules. CI now also lints and tests the `tls` feature.
+
 ## [0.2.0] — 2026-06-16
 
 The reactive + geo-first release. On top of the Redis-compatible core (0.1.0), Locus gains its
@@ -158,6 +230,7 @@ milestone. Zero third-party dependencies (pure `std`).
   a skiplist for O(log n) sorted-set ops; full RESP3 typing of every reply; thread-per-core execution.
 - No authentication or TLS yet — bind to a trusted network only.
 
-[Unreleased]: https://github.com/intenttext/locus/compare/v0.2.0...HEAD
+[Unreleased]: https://github.com/intenttext/locus/compare/v0.3.0...HEAD
+[0.3.0]: https://github.com/intenttext/locus/compare/v0.2.0...v0.3.0
 [0.2.0]: https://github.com/intenttext/locus/compare/v0.1.0...v0.2.0
 [0.1.0]: https://github.com/intenttext/locus/releases/tag/v0.1.0

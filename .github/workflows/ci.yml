@@ -23,8 +23,16 @@ jobs:
       - name: Clippy
         run: cargo clippy --all-targets -- -D warnings
 
+      # The default build is zero-dependency; the optional `tls` feature must also
+      # stay lint- and test-clean (it pulls rustls). Mirror the local check loop.
+      - name: Clippy (tls feature)
+        run: cargo clippy --all-targets --features tls -- -D warnings
+
       - name: Build
         run: cargo build --release --verbose
 
       - name: Test
         run: cargo test --verbose
+
+      - name: Test (tls feature)
+        run: cargo test --features tls --verbose

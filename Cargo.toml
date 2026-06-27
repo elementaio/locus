@@ -3,9 +3,9 @@
 # repo, and Docker image are all still `locus`. So `cargo install locusdb`
 # installs a `locus` command (see [[bin]] below).
 name = "locusdb"
-version = "0.2.0"
+version = "0.3.0"
 edition = "2024"
-description = "An in-memory datastore that speaks the Redis protocol — from scratch in Rust, zero dependencies."
+description = "A zero-dependency, from-scratch Redis-protocol datastore in Rust — with a reactive changefeed, geo-first spatial model, and horizontal spatial clustering."
 authors = ["Emad Jumaah"]
 license = "MIT"
 repository = "https://github.com/intenttext/locus"
