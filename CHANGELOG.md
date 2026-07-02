@@ -6,6 +6,73 @@ All notable changes to Locus are documented here. The format is based on
 
 ## [Unreleased]
 
+## [0.4.0] — 2026-07-02
+
+The **adversarial-hardening** release. Three independent reviewers read Locus end-to-end; every
+finding was fixed under a capability-gated plan (single-node → replication → cluster). The single-node
+foundations were already sound — this release closes the resource-exhaustion, role-transition,
+failover, cross-shard-merge, and migration edges that a demo and a single node never exercise but a
+production cluster does. The default build stays 100% dependency-free. See
+`plans/HARDENING-REVIEW-2026-07.md` for the full finding-by-finding ledger.
+
+### Added — resource safety (single-node)
+- **Per-client output-buffer limits** — `LOCUS_OUTBUF_NORMAL` / `_REPLICA` (256mb) / `_PUBSUB` (32mb):
+  a stalled subscriber/replica is disconnected at its cap instead of growing server memory to OOM.
+- **Query-buffer cap** (`LOCUS_QUERYBUF_LIMIT`, default 1gb) and a **resumable parse cursor** — a
+  dribbled huge command can't hold unbounded memory pre-`AUTH`, and re-parsing an in-progress command
+  is now O(new bytes), not O(N²).
+- **Bounded hub input** (`LOCUS_HUB_QUEUE`, default 65536) — a pipelining flood backpressures its own
+  reader instead of growing a shared queue without bound.
+- **CDC log byte bound** (`LOCUS_CDC_MAXBYTES`, default 64mb) and it now counts toward `used_memory`;
+  **consumer-group PEL bound** (`LOCUS_CDC_PEL_MAX`, default 100k).
+
+### Changed — single-node correctness
+- **Hub maintenance runs on a wall-clock cadence** — active expiry, `XREAD BLOCK` / `WAIT` deadlines,
+  the `everysec` fsync, and `SIGTERM` no longer starve under a sustained command stream.
+- **AOF write/fsync errors are surfaced** (`aof_last_write_status`) and, by default
+  (`LOCUS_AOF_ON_WRITE_ERROR=stop`), reject writes until a recovery rewrite restores the log — a full
+  disk no longer silently ACKs unlogged writes.
+- **AOF mid-file corruption refuses to start** (vs. a torn tail, which is still tolerated);
+  `LOCUS_AOF_LOAD_TRUNCATED=yes` recovers everything up to the corruption. A corrupt RDB/AOF at boot is
+  moved aside, not overwritten. `SET … EX` logs one atomic record; `FLUSH` no longer DEL-storms the AOF.
+- **Random expiry sampling and random eviction** (was iteration-order, which leaked whole cohorts);
+  **memory estimate** now counts the zset ordered index, geo spatial index, and side-tables.
+- **ACL checks every key** a command touches (was the first only — a real `MSET app:x secret:y`
+  cross-prefix hole); **changefeed commands are read-class** and prefix-gated (`+@pubsub` no longer
+  streams the whole keyspace); **`WAIT`** counts only real replicas' acks (forged/early acks rejected).
+
+### Changed — replication & failover
+- **Role transitions are fenced** — the backlog/acks/attached-replicas reset at every boundary, the
+  offset is single-counted (a demoted master no longer inflates it), and the **replid rotates on
+  promotion** so a stale `PSYNC` full-resyncs instead of continuing a different stream.
+- **Replica role + config epoch persist** across restarts (`LOCUS_ROLE_FILE`, `LOCUS_REPLICAOF`) — a
+  crashed replica resumes as a read-only replica, and its AOF is rebuilt from the resync snapshot (no
+  Frankenstein merge). **Sync-session generations** drop a superseded master's stream.
+- **Sentinel config epochs** — a promotion mints an epoch above every known one, data nodes reject a
+  stale `REPLICAOF … EPOCH n` (`STALEEPOCH`), and the decision propagates + persists
+  (`LOCUS_SENTINEL_STATE`); a restarted sentinel re-derives the master from live `INFO`. A resurrected
+  old master can no longer demote the legitimate one. Replicas hide-but-keep expired keys (clock-skew
+  divergence fixed).
+
+### Changed — cluster (before you enable it)
+- **Cross-shard CDC merge**: node id embedded in the HLC (globally-unique stamps), off-by-one watermark
+  closed, truncation reports the last-returned floor, and a dead shard releases the watermark after
+  `LOCUS_CDC_PEER_TIMEOUT_MS` (default 30s) — no lost or stalled records.
+- **Slot migration is durable, replicated, and crash-safe** — routed through the AOF + replication path,
+  fsynced before ownership flips, zombie copies purged (`CLUSTER FLUSHSLOT`), and coherent with the
+  changefeed / WATCH / indexes. **Topology persists** (`LOCUS_CLUSTER_STATE`) so a full-cluster restart
+  doesn't revert ownership to env.
+- **Internal RPCs authenticate** (`LOCUS_CLUSTER_SECRET`) — secure and clustered coexist. A clustered
+  `GEOSEARCH` **errors on an unreachable shard** (`LOCUS_CLUSTER_ALLOW_PARTIAL=yes` for best-effort)
+  instead of silently returning fewer hits; `GEOSEARCH FROMKEY` is cluster-aware.
+- **`GEOSEARCH COUNT n`** returns the n **closest** (add `ANY` for any-n); **`BYBOX`** measures
+  east-west at the point's latitude; **`CDCSUBSCRIBE REGION`** rejects NaN/±inf/non-positive radius.
+
+### Note — cross-node pub/sub
+- `PUBLISH` / `CDCSUBSCRIBE` deliver **per-node**, not cluster-wide (only `CLUSTER CDCMERGE` is
+  cross-shard). This matches Locus's per-region-stack model; see DEPLOYMENT.md §7. A drop-in Redis
+  Cluster client expecting broadcast pub/sub should subscribe on the owning node.
+
 ## [0.3.0] — 2026-06-27
 
 The production-hardening + clustering release. On top of the reactive/geo core (0.2.0), Locus becomes

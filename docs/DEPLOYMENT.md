@@ -310,6 +310,27 @@ LOCUS_CLUSTER_NODES="10.0.0.1:6379 0-8191;10.0.0.2:6379 8192-16383" \
   replica and broadcasts `CLUSTER REASSIGN` so the slots follow (see §6).
 - **Global changefeed.** `CLUSTER CDCMERGE <since-hlc>` merges every shard's
   changefeed into one HLC-ordered stream (see [CHANGEFEED.md](CHANGEFEED.md)).
+- **Secured + clustered.** Set the same `LOCUS_CLUSTER_SECRET` on every node so
+  internal RPCs authenticate; clients still use `LOCUS_REQUIREPASS`. Without a
+  shared secret a `requirepass` node's internal calls fail and cross-shard
+  `GEOSEARCH` / gossip / migration silently degrade.
+- **Durability.** Slot migration and its deletes are logged + replicated +
+  fsynced before ownership flips, and the topology persists
+  (`LOCUS_CLUSTER_STATE`, default beside the RDB) so a full-cluster restart
+  keeps the migrated ownership instead of reverting to `LOCUS_CLUSTER_NODES`.
+- **Partial results.** A cross-shard `GEOSEARCH` with an unreachable shard
+  returns `CLUSTERDOWN` by default (a silently-incomplete "nearest" answer is
+  dangerous); set `LOCUS_CLUSTER_ALLOW_PARTIAL=yes` for best-effort. Give each
+  node a distinct `LOCUS_NODE_ID` (0–255) — it seeds globally-unique changefeed
+  stamps; it's derived from the announce address if unset.
+
+> **Pub/sub is per-node, not cluster-wide.** `PUBLISH` and `CDCSUBSCRIBE` deliver
+> only to subscribers connected to the node that received them — Locus does **not**
+> broadcast pub/sub across shards (unlike Redis Cluster). The cross-shard primitive
+> is the *pull-based* `CLUSTER CDCMERGE`. This matches the intended topology: one
+> region → one shard stack, with subscribers on the owning node. A drop-in client
+> that expects cluster-wide fan-out should subscribe on the shard that owns the
+> channel's keys, or use `CLUSTER CDCMERGE` for a global feed.
 
 Each shard is itself a master (+ optional replicas + sentinel), so combine this
 with §6 for an HA cluster. Replication runs per shard, not cluster-wide.

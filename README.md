@@ -163,16 +163,30 @@ Configured entirely through environment variables (minimal config by design):
 | `LOCUS_RDB` | `locus.rdb` | RDB snapshot path |
 | `LOCUS_AOF` | _(off)_ | Path (or `1`) to enable append-only persistence |
 | `LOCUS_APPENDFSYNC` | `everysec` | AOF fsync policy: `always` / `everysec` / `no` |
+| `LOCUS_AOF_ON_WRITE_ERROR` | `stop` | On a failed AOF append/fsync, reject writes until a recovery rewrite succeeds; `continue` to keep serving (durability at risk) |
+| `LOCUS_AOF_LOAD_TRUNCATED` | `no` | `yes` loads everything up to a mid-file corruption instead of refusing to start (a torn tail is always tolerated) |
 | `LOCUS_MAXMEMORY` | _(unlimited)_ | Soft cap; `kb`/`mb`/`gb` (e.g. `256mb`). Master evicts; `OOM` if still over |
+| `LOCUS_OUTBUF_NORMAL` / `_REPLICA` / `_PUBSUB` | `0` / `256mb` / `32mb` | Per-client output-buffer cap; a client over its cap is disconnected (slow-consumer OOM guard) |
+| `LOCUS_QUERYBUF_LIMIT` | `1gb` | Max bytes a connection may buffer assembling one command (pre-`AUTH` memory guard) |
+| `LOCUS_HUB_QUEUE` | `65536` | Bounded hub input queue — a pipelining flood backpressures its reader instead of growing memory |
 | `LOCUS_CDC_MAXLEN` | _(off)_ | Retained changefeed log size for `CDCREAD` catch-up / consumer groups |
+| `LOCUS_CDC_MAXBYTES` | `64mb` | Byte cap on the retained changefeed log (counts toward `used_memory`) |
+| `LOCUS_CDC_PEL_MAX` | `100000` | Per-group pending-entries cap (a never-acking consumer can't grow memory unbounded) |
 | `LOCUS_SLOWLOG_US` | `10000` | Log commands slower than this (µs); `<0` disables |
 | `LOCUS_SLOWLOG_MAXLEN` | `128` | Max entries retained in the `SLOWLOG` ring |
 | `LOCUS_LOGLEVEL` | `info` | `error` / `warn` / `info` / `debug` |
+| `LOCUS_REPLICAOF` | _(off)_ | Boot as a replica of `host port` / `host:port`; else the persisted role resumes |
+| `LOCUS_ROLE_FILE` | `<rdb>.role` | Where the node's role + config epoch persist across restarts |
 | `LOCUS_CLUSTER_ENABLED` | `off` | Enable cluster routing (`MOVED`/`CROSSSLOT`) |
 | `LOCUS_CLUSTER_ANNOUNCE` | `LOCUS_BIND:PORT` | This node's address in the cluster |
 | `LOCUS_CLUSTER_NODES` | _(self owns all)_ | Topology: `host:port 0-5460;host:port 5461-10922;…` |
+| `LOCUS_CLUSTER_STATE` | `<rdb>.cluster` | Where runtime slot ownership persists (survives a full-cluster restart) |
+| `LOCUS_CLUSTER_SECRET` | _(off)_ | Shared secret internal cluster RPCs present; lets `requirepass` and clustering coexist |
+| `LOCUS_CLUSTER_ALLOW_PARTIAL` | `no` | `yes` lets a cross-shard `GEOSEARCH` return partial results when a shard is down (else `CLUSTERDOWN`) |
 | `LOCUS_CLUSTER_CELL_BITS` | `0` (off) | Cell-in-key spatial sharding: bits of geohash per cell; >0 makes `GEOSEARCH` a bounded scatter (`CLUSTER CELL` gives the tag) |
 | `LOCUS_CLUSTER_GOSSIP_MS` | `1000` | Topology anti-entropy interval — how often a node pulls peers' slot maps to converge on ownership changes |
+| `LOCUS_CDC_PEER_TIMEOUT_MS` | `30000` | How long a down shard holds the `CLUSTER CDCMERGE` watermark before it's released |
+| `LOCUS_NODE_ID` | _(derived)_ | This node's id (0–255) for globally-unique changefeed stamps; derived from the announce address if unset |
 
 ### Security & replication in 30 seconds
 
@@ -230,6 +244,7 @@ LOCUS_SENTINEL_DOWN_AFTER_MS=5000 \
 | `LOCUS_SENTINEL_PORT` | _(off)_ | Listen port for peer-sentinel agreement (enables multi-sentinel mode) |
 | `LOCUS_SENTINEL_PEERS` | _(empty)_ | Comma-separated peer sentinel `host:port` list |
 | `LOCUS_SENTINEL_ID` | `127.0.0.1:PORT` | This sentinel's id for leader election |
+| `LOCUS_SENTINEL_STATE` | _(off)_ | File to persist the current `(master, epoch)` decision so a restart doesn't revert to the env master |
 
 Before promoting, the sentinel requires **corroboration** — a quorum of replicas must also report their
 master link down — so a sentinel merely partitioned from the master won't trigger a needless failover.

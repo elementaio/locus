@@ -3840,7 +3840,7 @@ impl Hub {
         };
         let fields: Vec<(&[u8], Vec<u8>)> = vec![
             (b"server", b"locus".to_vec()),
-            (b"version", b"0.1.0".to_vec()),
+            (b"version", env!("CARGO_PKG_VERSION").as_bytes().to_vec()),
             (b"proto", proto.to_string().into_bytes()),
             (b"id", id.to_string().into_bytes()),
             (b"mode", b"standalone".to_vec()),
