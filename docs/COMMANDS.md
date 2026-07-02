@@ -103,6 +103,23 @@ monotonic cursors, and quotas.
 | `SETMAX key n` | monotonic: store `n` iff `n` > current integer (or missing) → `1` if advanced else `0` |
 | `INCRCAP key delta cap` | increment iff result ≤ `cap`; returns the new value, or nil if it would exceed |
 
+## Disk tier (hot in RAM, warm on disk)
+
+RAM is for LIVE data. `TIER key` moves a key's value into a segmented, append-only value-log on
+disk (`LOCUS_TIER`), leaving a tiny stub in RAM; any read that needs the value transparently thaws
+it back. TTLs keep running on the stub; `TYPE`/`EXISTS` answer without a disk read. Segments are
+immutable and deleted whole when their last live entry dies — pair tiering with TTLs (retention
+archives) and reclamation is automatic. Tiered = archived: a tiered geo key leaves the live spatial
+index until thawed. `TIER` replicates as a command (each node tiers its own copy); full-syncs and
+migrations always ship full values.
+
+| Command | Notes |
+|---|---|
+| `TIER key` | move the value to the disk tier → `1` (idempotent) / `0` missing; error if `LOCUS_TIER` unset |
+| `TIERREF key seg off len vtag` | internal (AOF rewrite): re-point a stub at an existing local log entry |
+
+INFO reports `tier_enabled`, `tier_segments`, `tier_log_bytes`, `tier_keys`, `tier_lost`.
+
 ## Geo (geo-first)
 
 Each geo object is its **own key** holding a point (the geo-first model, not Redis's members-in-a-zset).

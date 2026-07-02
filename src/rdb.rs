@@ -84,6 +84,25 @@ fn write_bytes<W: Write>(w: &mut W, b: &[u8]) -> io::Result<()> {
     w.write_all(b)
 }
 
+/// The human name for a serialized value tag — lets a tiered stub answer TYPE
+/// without a disk read.
+pub fn tag_type_name(tag: u8) -> &'static str {
+    match tag {
+        0 => "string",
+        1 => "list",
+        2 => "hash",
+        3 => "set",
+        4 => "zset",
+        5 => "stream",
+        6 | 11 => "geo",
+        7 => "bloom",
+        8 => "cms",
+        9 => "topk",
+        10 => "tdigest",
+        _ => "none",
+    }
+}
+
 fn write_value<W: Write>(w: &mut W, key: &[u8], v: &Value) -> io::Result<()> {
     let tag: u8 = match v {
         Value::Str(_) => 0,
@@ -98,6 +117,7 @@ fn write_value<W: Write>(w: &mut W, key: &[u8], v: &Value) -> io::Result<()> {
         Value::Cms(_) => 8,
         Value::TopK(_) => 9,
         Value::TDigest(_) => 10,
+        Value::Tiered { .. } => 12, // stub: address into the local value-log
     };
     w.write_all(&[tag])?;
     write_bytes(w, key)?;
@@ -168,6 +188,17 @@ fn write_value<W: Write>(w: &mut W, key: &[u8], v: &Value) -> io::Result<()> {
         }
         Value::TopK(t) => write_bytes(w, &t.to_bytes())?, // self-describing blob
         Value::TDigest(t) => write_bytes(w, &t.to_bytes())?,
+        Value::Tiered {
+            seg,
+            off,
+            len,
+            vtag,
+        } => {
+            w.write_all(&seg.to_le_bytes())?;
+            w.write_all(&off.to_le_bytes())?;
+            w.write_all(&len.to_le_bytes())?;
+            w.write_all(&[*vtag])?;
+        }
     }
     Ok(())
 }
@@ -247,6 +278,57 @@ pub fn restore_entry(bytes: &[u8]) -> io::Result<(Vec<u8>, Value, Option<u64>)> 
     let key = read_bytes(&mut r)?;
     let value = read_value(&mut r, tag)?;
     Ok((key, value, expire))
+}
+
+/// Serialize the dataset for the WIRE (replication full-sync): tiered stubs
+/// are read through and sent as their FULL values — a stub addresses this
+/// node's local value-log and means nothing on another machine. An unreadable
+/// tiered entry (detected loss) is skipped, matching local semantics.
+pub fn serialize_wire(db: &Db) -> Vec<u8> {
+    let mut buf = Vec::new();
+    buf.extend_from_slice(MAGIC);
+    let count_at = buf.len();
+    buf.extend_from_slice(&0u64.to_le_bytes()); // patched below (skips possible)
+    let mut n: u64 = 0;
+    for (key, value) in db.entries() {
+        let expire = db.raw_expire(key);
+        let full;
+        let v = match value {
+            Value::Tiered { seg, off, len, .. } => {
+                match db.tier_fetch(key, *seg, *off, *len) {
+                    Some(fv) => {
+                        full = fv;
+                        &full
+                    }
+                    None => continue, // detected loss: don't ship garbage
+                }
+            }
+            v => v,
+        };
+        match expire {
+            Some(deadline) => {
+                buf.push(1);
+                buf.extend_from_slice(&deadline.to_le_bytes());
+            }
+            None => buf.push(0),
+        }
+        write_value(&mut buf, key, v).expect("writing to a Vec is infallible");
+        n += 1;
+    }
+    buf[count_at..count_at + 8].copy_from_slice(&n.to_le_bytes());
+    buf
+}
+
+/// [`dump_entry`] with tier read-through, for slot migration (the wire again).
+/// None = the key is a tiered entry that could not be read (detected loss).
+pub fn dump_entry_full(db: &Db, key: &[u8], value: &Value, expire: Option<u64>) -> Option<Vec<u8>> {
+    match value {
+        Value::Tiered { seg, off, len, .. } => {
+            let full = db.tier_fetch(key, *seg, *off, *len)?;
+            Some(dump_entry(key, &full, expire))
+        }
+        v => Some(dump_entry(key, v, expire)),
+    }
 }
 
 /// Serialize the whole dataset to an in-memory buffer (for replication sync).
@@ -510,6 +592,18 @@ fn read_value<R: Read>(r: &mut R, tag: u8) -> io::Result<Value> {
                 attrs.push((f, v));
             }
             Value::Geo(lon, lat, attrs)
+        }
+        12 => {
+            let seg = read_u32(r)? as u32;
+            let off = read_u64(r)?;
+            let len = read_u32(r)? as u32;
+            let vtag = read_u8(r)?;
+            Value::Tiered {
+                seg,
+                off,
+                len,
+                vtag,
+            }
         }
         _ => {
             return Err(io::Error::new(

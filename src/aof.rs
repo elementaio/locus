@@ -441,6 +441,23 @@ fn reconstruct(key: &[u8], value: &Value) -> Vec<Vec<Vec<u8>>> {
             }
             vec![c]
         }
+        // A tiered stub: reference the LOCAL value-log entry directly. Valid
+        // because segments are immutable and delete-only (never rewritten), and
+        // the AOF never leaves this node. A key that dies later in the log
+        // replays its death after this, so end-state stays exact.
+        Value::Tiered {
+            seg,
+            off,
+            len,
+            vtag,
+        } => vec![vec![
+            b"TIERREF".to_vec(),
+            k,
+            seg.to_string().into_bytes(),
+            off.to_string().into_bytes(),
+            len.to_string().into_bytes(),
+            vtag.to_string().into_bytes(),
+        ]],
         // A sketch can't be rebuilt from its add-history; restore raw state.
         Value::Bloom(b) => vec![vec![
             b"BFLOAD".to_vec(),

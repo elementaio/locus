@@ -6,6 +6,29 @@ All notable changes to Locus are documented here. The format is based on
 
 ## [Unreleased]
 
+## [0.5.0] — 2026-07-02
+
+**The disk tier: RAM is for LIVE data.** New `TIER key` moves a key's value into a segmented,
+append-only value-log on disk, leaving a ~stub in RAM (key + TTL + pointer + type). Reads
+transparently **thaw** the value back; `TYPE`/`EXISTS`/TTLs never touch the disk. Segments are
+immutable and delete-only — with TTL'd archives (the intended use), same-aged data dies together and
+whole segments vanish; no compaction rewrites, so a persisted pointer can never silently move. Every
+entry embeds its key, making a stale pointer a *detected*, logged loss (`tier_lost`), never garbage.
+Still 100% dependency-free.
+
+- **Semantics:** tiered = archived. A tiered geo key leaves the live spatial index (returns on thaw);
+  tiering emits no changefeed event (bytes moved, meaning unchanged); `WATCH`ers are dirtied
+  conservatively. `TIER` on a missing key → `:0`; idempotent on a stub.
+- **Durability:** the value-log *is* the tiered value's durability (fsync per append). RDB snapshots
+  carry stubs (tag 12); AOF logs `TIER` live and folds stubs as `TIERREF` (a local log reference —
+  valid forever because segments never move) on rewrite; kill-9 tested for both paths.
+- **Replication/cluster:** stubs never cross the wire — full-syncs and slot migrations ship full
+  values (read-through); `TIER` replicates as the command, so each node tiers into its own log.
+- **Config:** `LOCUS_TIER` (path, or `1` = beside the RDB), `LOCUS_TIER_SEG_MB` (segment size,
+  default 512). INFO: `tier_enabled/segments/log_bytes/keys/lost`.
+- **Why:** at delivery-scale (e.g. 250k orders/day) a 30-day archive is ~540 GB — that now costs
+  NVMe, not RAM. The live working set stays in memory; the server class drops accordingly.
+
 ## [0.4.0] — 2026-07-02
 
 The **adversarial-hardening** release. Three independent reviewers read Locus end-to-end; every

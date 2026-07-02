@@ -166,6 +166,8 @@ Configured entirely through environment variables (minimal config by design):
 | `LOCUS_AOF_ON_WRITE_ERROR` | `stop` | On a failed AOF append/fsync, reject writes until a recovery rewrite succeeds; `continue` to keep serving (durability at risk) |
 | `LOCUS_AOF_LOAD_TRUNCATED` | `no` | `yes` loads everything up to a mid-file corruption instead of refusing to start (a torn tail is always tolerated) |
 | `LOCUS_MAXMEMORY` | _(unlimited)_ | Soft cap; `kb`/`mb`/`gb` (e.g. `256mb`). Master evicts; `OOM` if still over |
+| `LOCUS_TIER` | _(off)_ | Disk tier: path (or `1` = beside the RDB). `TIER key` moves a value to an on-disk value-log, leaving a stub; reads thaw it back — RAM for live data, NVMe for archives |
+| `LOCUS_TIER_SEG_MB` | `512` | Value-log segment size; segments are immutable and deleted whole when their last live entry dies |
 | `LOCUS_OUTBUF_NORMAL` / `_REPLICA` / `_PUBSUB` | `0` / `256mb` / `32mb` | Per-client output-buffer cap; a client over its cap is disconnected (slow-consumer OOM guard) |
 | `LOCUS_QUERYBUF_LIMIT` | `1gb` | Max bytes a connection may buffer assembling one command (pre-`AUTH` memory guard) |
 | `LOCUS_HUB_QUEUE` | `65536` | Bounded hub input queue — a pipelining flood backpressures its reader instead of growing memory |

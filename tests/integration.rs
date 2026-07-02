@@ -896,6 +896,150 @@ fn aof_write_status_is_reported_in_info() {
     let _ = std::fs::remove_file(&aof);
 }
 
+// === disk tier ==============================================================
+
+/// Remove a test's tier segment files ({base}.NNNNNN).
+fn cleanup_tier(base: &str) {
+    if let Some(dir) = std::path::Path::new(base).parent()
+        && let Ok(entries) = std::fs::read_dir(dir)
+    {
+        let prefix = format!(
+            "{}.",
+            std::path::Path::new(base)
+                .file_name()
+                .unwrap()
+                .to_string_lossy()
+        );
+        for e in entries.flatten() {
+            if e.file_name().to_string_lossy().starts_with(&prefix) {
+                let _ = std::fs::remove_file(e.path());
+            }
+        }
+    }
+}
+
+#[test]
+fn disk_tier_thaws_reads_and_survives_restart() {
+    let rdb = format!(
+        "{}/locus-tier-int-{}.rdb",
+        std::env::temp_dir().display(),
+        std::process::id()
+    );
+    let tier_base = format!("{rdb}.tier");
+    let _ = std::fs::remove_file(&rdb);
+    cleanup_tier(&tier_base);
+    let env: &[(&str, &str)] = &[("LOCUS_TIER", "1")];
+
+    let mut s = Server::spawn_at(rdb.clone(), env);
+    let mut c = s.connect();
+    let big = "x".repeat(50_000);
+    c.cmd(&["SET", "archive", &big]);
+    c.cmd(&["SET", "hot", "stay"]);
+    let before = info_field(&mut c, "used_memory");
+
+    // TIER moves the value to disk; RAM drops; TYPE/EXISTS stay disk-free.
+    assert_eq!(c.cmd(&["TIER", "archive"]), "1");
+    assert_eq!(c.cmd(&["TIER", "archive"]), "1"); // idempotent
+    assert_eq!(c.cmd(&["TIER", "missing"]), "0");
+    assert!(info_field(&mut c, "used_memory") < before - 40_000);
+    assert_eq!(info_field(&mut c, "tier_keys"), 1);
+    assert_eq!(c.cmd(&["TYPE", "archive"]), "string");
+    assert_eq!(c.cmd(&["EXISTS", "archive"]), "1");
+
+    // A read transparently thaws it.
+    assert_eq!(c.cmd(&["GET", "archive"]), big);
+    assert_eq!(info_field(&mut c, "tier_keys"), 0);
+
+    // Tier again, restart gracefully (RDB carries the stub), thaw after boot.
+    assert_eq!(c.cmd(&["TIER", "archive"]), "1");
+    c.send(&["SHUTDOWN"]);
+    s.wait_exit();
+    let s2 = Server::spawn_at(rdb.clone(), env);
+    let mut c2 = s2.connect();
+    assert_eq!(info_field(&mut c2, "tier_keys"), 1, "stub survives restart");
+    assert_eq!(
+        c2.cmd(&["GET", "archive"]),
+        big,
+        "thaw from the log after boot"
+    );
+    assert_eq!(c2.cmd(&["GET", "hot"]), "stay");
+    assert_eq!(info_field(&mut c2, "tier_lost"), 0);
+    drop(s2);
+    cleanup_tier(&tier_base);
+}
+
+#[test]
+fn disk_tier_survives_kill9_with_aof_and_rewrite() {
+    let tmp = std::env::temp_dir();
+    let pid = std::process::id();
+    let rdb = format!("{}/locus-tier-aof-{pid}.rdb", tmp.display());
+    let aof = format!("{}/locus-tier-aof-{pid}.aof", tmp.display());
+    let tier_base = format!("{rdb}.tier");
+    for f in [&rdb, &aof] {
+        let _ = std::fs::remove_file(f);
+    }
+    cleanup_tier(&tier_base);
+    let env: &[(&str, &str)] = &[("LOCUS_TIER", "1"), ("LOCUS_AOF", aof.as_str())];
+
+    let mut s = Server::spawn_at(rdb.clone(), env);
+    let mut c = s.connect();
+    let big = "y".repeat(30_000);
+    c.cmd(&["SET", "cold", &big]);
+    assert_eq!(c.cmd(&["TIER", "cold"]), "1");
+    // Rewrite folds the stub as a TIERREF (a local value-log reference).
+    c.cmd(&["BGREWRITEAOF"]);
+    sleep(Duration::from_millis(300));
+    c.cmd(&["SET", "after", "rewrite"]);
+
+    s.child.kill().unwrap(); // ungraceful — AOF replay must rebuild everything
+    let _ = s.child.wait();
+    let s2 = Server::spawn_at(rdb.clone(), env);
+    let mut c2 = s2.connect();
+    assert_eq!(
+        info_field(&mut c2, "tier_keys"),
+        1,
+        "TIERREF replay restores the stub"
+    );
+    assert_eq!(c2.cmd(&["GET", "cold"]), big);
+    assert_eq!(c2.cmd(&["GET", "after"]), "rewrite");
+    assert_eq!(info_field(&mut c2, "tier_lost"), 0);
+    drop(s2);
+    let _ = std::fs::remove_file(&aof);
+    cleanup_tier(&tier_base);
+}
+
+#[test]
+fn disk_tier_replicates_as_a_command() {
+    // TIER replicates AS the command: each node tiers into its OWN local log
+    // (stubs never cross the wire; a full sync ships full values).
+    let m = Server::start_inner(&[("LOCUS_TIER", "1")]);
+    let r = Server::start_inner(&[("LOCUS_TIER", "1")]);
+    let (mut cm, mut cr) = (m.connect(), r.connect());
+    cm.cmd(&["SET", "seed", "before-sync"]);
+    assert_eq!(cm.cmd(&["TIER", "seed"]), "1"); // tiered BEFORE the replica joins
+    cr.cmd(&["REPLICAOF", "127.0.0.1", &m.port.to_string()]);
+    wait_info(&mut cr, "master_link_status", "up", "never synced");
+    // The full sync shipped the FULL value (a stub is meaningless off-node).
+    assert_eq!(cr.cmd(&["GET", "seed"]), "before-sync");
+
+    cm.cmd(&["SET", "arch", "tier-me"]);
+    let deadline = Instant::now() + Duration::from_secs(3);
+    while cr.cmd(&["GET", "arch"]) != "tier-me" {
+        assert!(Instant::now() < deadline, "write never replicated");
+        sleep(Duration::from_millis(30));
+    }
+    assert_eq!(cm.cmd(&["TIER", "arch"]), "1");
+    let deadline = Instant::now() + Duration::from_secs(3);
+    loop {
+        if info_field(&mut cr, "tier_keys") == 1 {
+            break; // the replica tiered its own copy into its own log
+        }
+        assert!(Instant::now() < deadline, "TIER never replicated");
+        sleep(Duration::from_millis(30));
+    }
+    assert_eq!(cr.cmd(&["GET", "arch"]), "tier-me"); // thaw on the replica
+}
+
 // === blocking XREAD =========================================================
 
 #[test]

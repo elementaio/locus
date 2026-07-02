@@ -124,6 +124,17 @@ pub enum Value {
     TopK(crate::sketch::TopK),
     /// A t-digest (streaming quantiles / percentiles).
     TDigest(crate::sketch::TDigest),
+    /// A TIERED value: the real bytes live in the on-disk value-log (see
+    /// `tier`); RAM keeps only this stub — key identity, TTL (in `expires`,
+    /// as usual), the disk address, and the original type tag so TYPE answers
+    /// without a disk read. Any access that needs the value transparently
+    /// thaws it back into RAM.
+    Tiered {
+        seg: u32,
+        off: u64,
+        len: u32,
+        vtag: u8,
+    },
 }
 
 /// A stream entry id: (milliseconds, sequence).
@@ -161,6 +172,8 @@ impl Value {
             Value::Cms(_) => "cms",
             Value::TopK(_) => "topk",
             Value::TDigest(_) => "tdigest",
+            // The stub remembers its original type, so TYPE stays disk-free.
+            Value::Tiered { vtag, .. } => crate::rdb::tag_type_name(*vtag),
         }
     }
 
@@ -176,7 +189,8 @@ impl Value {
             | Value::Bloom(_)
             | Value::Cms(_)
             | Value::TopK(_)
-            | Value::TDigest(_) => false,
+            | Value::TDigest(_)
+            | Value::Tiered { .. } => false,
         }
     }
 }
@@ -203,6 +217,17 @@ pub struct Db {
     /// it locally (clock skew ahead of the master) then having the master
     /// extend its TTL leaves the two permanently diverged.
     replica_mode: bool,
+    /// The disk tier (None = disabled). Attached by the hub from LOCUS_TIER;
+    /// carried across a full-resync dataset swap (the tier is node-local).
+    tier: Option<crate::tier::TierStore>,
+    /// key → segment, for every tiered stub — the accounting that lets a
+    /// segment be deleted the moment its last live stub dies.
+    tiered_keys: HashMap<Vec<u8>, u32>,
+    /// segment → live stub count.
+    seg_live: HashMap<u32, u64>,
+    /// Tiered entries that could not be read back (deleted/corrupt segment) —
+    /// detected losses, surfaced in INFO. Should stay 0 in a healthy system.
+    tier_lost: u64,
     /// Approximate memory accounting for `maxmemory`. `mem_used` is the running
     /// total; `sizes` is the last-known estimate per key so removals/updates can
     /// be applied as deltas. Estimates are deliberately coarse (see
@@ -226,6 +251,10 @@ impl Db {
             expiry_pool: Vec::new(),
             evict_pool: Vec::new(),
             replica_mode: false,
+            tier: None,
+            tiered_keys: HashMap::new(),
+            seg_live: HashMap::new(),
+            tier_lost: 0,
             mem_used: 0,
             sizes: HashMap::new(),
             geo_index: BTreeMap::new(),
@@ -275,6 +304,150 @@ impl Db {
     /// keys on its own — only the master's streamed DELs remove them.
     pub fn set_replica_mode(&mut self, on: bool) {
         self.replica_mode = on;
+    }
+
+    // --- the disk tier (hot in RAM, warm on disk) ---------------------------
+
+    /// Attach the node-local disk tier. The hub does this at boot (LOCUS_TIER)
+    /// and re-attaches it across a full-resync dataset swap.
+    pub fn attach_tier(&mut self, t: Option<crate::tier::TierStore>) {
+        self.tier = t;
+    }
+
+    /// Detach the tier (to carry it across a dataset swap).
+    pub fn take_tier(&mut self) -> Option<crate::tier::TierStore> {
+        self.tier.take()
+    }
+
+    /// (enabled, segments, log bytes, live tiered keys, detected losses).
+    pub fn tier_stats(&self) -> (bool, usize, u64, usize, u64) {
+        match &self.tier {
+            None => (false, 0, 0, 0, self.tier_lost),
+            Some(t) => {
+                let (segs, bytes) = t.stats();
+                (true, segs, bytes, self.tiered_keys.len(), self.tier_lost)
+            }
+        }
+    }
+
+    /// Move `key`'s value to the disk tier, leaving a stub. Ok(true) = tiered
+    /// (or already tiered — idempotent), Ok(false) = no such key.
+    pub fn tier_key(&mut self, key: &[u8]) -> Result<bool, &'static str> {
+        if self.tier.is_none() {
+            return Err("tiering disabled (set LOCUS_TIER)");
+        }
+        self.check_expiry(key);
+        if self.replica_mode && self.is_expired(key) {
+            return Ok(false);
+        }
+        let expire = self.expires.get(key).copied();
+        let entry = match self.data.get(key) {
+            None => return Ok(false),
+            Some(Value::Tiered { .. }) => return Ok(true),
+            Some(v) => crate::rdb::dump_entry(key, v, expire),
+        };
+        let vtag = entry[if expire.is_some() { 9 } else { 1 }]; // [expire?][tag]...
+        let (seg, off, len) = self
+            .tier
+            .as_mut()
+            .unwrap()
+            .append(&entry)
+            .map_err(|_| "tier append failed")?;
+        self.geo_unindex(key); // a tiered geo point leaves the spatial index
+        self.data.insert(
+            key.to_vec(),
+            Value::Tiered {
+                seg,
+                off,
+                len,
+                vtag,
+            },
+        );
+        self.note_tiered(key, seg);
+        self.resync_size(key); // the stub is ~bytes, not the value
+        Ok(true)
+    }
+
+    /// Recreate a stub directly (AOF-rewrite replay via TIERREF): the entry is
+    /// already in the local value-log at this address.
+    pub fn insert_tier_stub(&mut self, key: Vec<u8>, seg: u32, off: u64, len: u32, vtag: u8) {
+        self.geo_unindex(&key);
+        self.note_untiered(&key); // replacing whatever was there
+        self.data.insert(
+            key.clone(),
+            Value::Tiered {
+                seg,
+                off,
+                len,
+                vtag,
+            },
+        );
+        self.note_tiered(&key, seg);
+        self.resync_size(&key);
+    }
+
+    /// Decode a tiered key's value from the log WITHOUT caching it back —
+    /// for wire serialization (replication snapshots, slot migration), where a
+    /// node-local stub must never cross to another node.
+    pub fn tier_fetch(&self, key: &[u8], seg: u32, off: u64, len: u32) -> Option<Value> {
+        let entry = self.tier.as_ref()?.read(seg, off, len)?;
+        match crate::rdb::restore_entry(&entry) {
+            Ok((k, v, _)) if k == key => Some(v),
+            _ => None,
+        }
+    }
+
+    /// If `key` is a tiered stub, load its value back into RAM (thaw). A read
+    /// that can't be satisfied (deleted/corrupt segment) is a DETECTED loss:
+    /// the key is removed, counted, and logged — never silent garbage.
+    fn thaw_if_tiered(&mut self, key: &[u8]) {
+        let (seg, off, len) = match self.data.get(key) {
+            Some(Value::Tiered { seg, off, len, .. }) => (*seg, *off, *len),
+            _ => return,
+        };
+        match self.tier_fetch(key, seg, off, len) {
+            Some(v) => {
+                self.note_untiered(key);
+                if let Value::Geo(lon, lat, _) = &v {
+                    self.geo_reindex(key.to_vec(), *lon, *lat);
+                }
+                self.data.insert(key.to_vec(), v);
+                self.resync_size(key);
+            }
+            None => {
+                self.tier_lost += 1;
+                crate::log::error(&format!(
+                    "tier: entry for key {:?} unreadable (segment {seg}) — treating as lost",
+                    String::from_utf8_lossy(key)
+                ));
+                self.note_untiered(key);
+                self.data.remove(key);
+                self.expires.remove(key);
+                self.forget_size(key);
+            }
+        }
+    }
+
+    fn note_tiered(&mut self, key: &[u8], seg: u32) {
+        self.tiered_keys.insert(key.to_vec(), seg);
+        *self.seg_live.entry(seg).or_insert(0) += 1;
+    }
+
+    /// A tiered stub died (expired/deleted/overwritten/thawed): decrement its
+    /// segment's live count, and delete the segment the moment it empties.
+    fn note_untiered(&mut self, key: &[u8]) {
+        let Some(seg) = self.tiered_keys.remove(key) else {
+            return;
+        };
+        if let Some(n) = self.seg_live.get_mut(&seg) {
+            *n = n.saturating_sub(1);
+            if *n == 0 {
+                self.seg_live.remove(&seg);
+                if let Some(t) = self.tier.as_mut() {
+                    t.delete_segment(seg);
+                }
+            }
+        }
     }
 
     /// Is `key` logically expired right now (deadline passed)?
@@ -332,12 +505,14 @@ impl Db {
     }
 
     /// Drop per-key tracking when a key is removed (called from every removal
-    /// path): memory accounting and the geo-key index.
+    /// path): memory accounting, the geo-key index, and tier accounting (a
+    /// dead stub may empty — and thus delete — its log segment).
     fn forget_size(&mut self, key: &[u8]) {
         if let Some(sz) = self.sizes.remove(key) {
             self.mem_used = self.mem_used.saturating_sub(sz);
         }
         self.geo_unindex(key);
+        self.note_untiered(key);
     }
 
     /// Candidate keys for GEOSEARCH (those holding a geo point). The caller
@@ -377,6 +552,7 @@ impl Db {
         if self.replica_mode && self.is_expired(key) {
             return None; // hidden-but-present until the master's DEL
         }
+        self.thaw_if_tiered(key);
         self.data.get(key)
     }
 
@@ -385,11 +561,13 @@ impl Db {
         if self.replica_mode && self.is_expired(key) {
             return None;
         }
+        self.thaw_if_tiered(key);
         self.data.get_mut(key)
     }
 
     pub fn insert(&mut self, key: Vec<u8>, value: Value) {
         self.geo_unindex(&key); // drop any prior geo entry (overwrite/retype)
+        self.note_untiered(&key); // overwriting a stub kills its log entry
         if let Value::Geo(lon, lat, _) = &value {
             self.geo_reindex(key.clone(), *lon, *lat);
         }
@@ -424,6 +602,7 @@ impl Db {
     /// unchanged — callers must type-check the result.)
     pub fn get_or_insert_with(&mut self, key: &[u8], f: impl FnOnce() -> Value) -> &mut Value {
         self.check_expiry(key);
+        self.thaw_if_tiered(key); // mutating a tiered value rehydrates it
         self.data.entry(key.to_vec()).or_insert_with(f)
     }
 
@@ -539,6 +718,14 @@ impl Db {
         self.mem_used = 0;
         self.geo_index.clear();
         self.geo_cell.clear();
+        // Every tiered stub just died with the keyspace: the whole log is dead.
+        self.tiered_keys.clear();
+        self.seg_live.clear();
+        if let Some(t) = self.tier.as_mut()
+            && let Err(e) = t.delete_all()
+        {
+            crate::log::warn(&format!("tier: flush could not reset the log: {e}"));
+        }
     }
 
     // --- persistence support (used by the RDB snapshot module) ---
@@ -553,6 +740,7 @@ impl Db {
 
     pub fn insert_with_expire(&mut self, key: Vec<u8>, value: Value, expire: Option<u64>) {
         self.geo_unindex(&key); // drop any prior geo entry (overwrite/retype)
+        self.note_untiered(&key);
         if let Some(deadline) = expire
             && self.expires.insert(key.clone(), deadline).is_none()
         {
@@ -560,6 +748,15 @@ impl Db {
         }
         if let Value::Geo(lon, lat, _) = &value {
             self.geo_reindex(key.clone(), *lon, *lat);
+        }
+        // A stub loaded from a snapshot re-enters the tier accounting, so its
+        // segment's lifetime tracking survives a restart.
+        if let Value::Tiered { seg, .. } = &value {
+            let seg = *seg;
+            self.data.insert(key.clone(), value);
+            self.note_tiered(&key, seg);
+            self.resync_size(&key);
+            return;
         }
         self.data.insert(key.clone(), value);
         self.resync_size(&key); // loaded data counts toward used memory
@@ -610,6 +807,8 @@ fn estimate_size(key_len: usize, v: &Value, volatile: bool) -> usize {
             t.cms.counters.len() * 4 + t.top.iter().map(|(it, _)| it.len() + 16).sum::<usize>()
         }
         Value::TDigest(t) => t.centroids.len() * 16 + 32,
+        // The whole point: a tiered value costs RAM only for its stub.
+        Value::Tiered { .. } => 32,
     };
     // sizes-map entry (key copy + usize) always; expires entry when volatile.
     let side = key_len + 24 + if volatile { key_len + 32 } else { 0 };
@@ -661,6 +860,91 @@ mod tests {
         while db.evict_one().is_some() {}
         assert_eq!(db.mem_used(), 0);
         assert!(db.evict_one().is_none());
+    }
+
+    #[test]
+    fn tier_thaw_roundtrip_frees_and_restores_memory() {
+        let base = format!(
+            "{}/locus-dbtier-{}",
+            std::env::temp_dir().display(),
+            std::process::id()
+        );
+        let mut db = Db::new();
+        db.attach_tier(Some(crate::tier::TierStore::open(&base, 0).unwrap()));
+        let big = vec![b'x'; 10_000];
+        db.insert(b"k".to_vec(), Value::Str(big.clone()));
+        db.resync_size(b"k");
+        let hot = db.mem_used();
+
+        // TIER: memory drops to stub-size; TYPE still answers; EXISTS holds.
+        assert_eq!(db.tier_key(b"k"), Ok(true));
+        assert!(
+            db.mem_used() < hot / 10,
+            "stub should be tiny: {}",
+            db.mem_used()
+        );
+        assert_eq!(db.type_name(b"k"), Some("string"));
+        assert!(db.contains(b"k"));
+        let (_, _, log_bytes, keys, lost) = db.tier_stats();
+        assert!(log_bytes > 10_000 && keys == 1 && lost == 0);
+
+        // GET transparently thaws the value back.
+        match db.get(b"k") {
+            Some(Value::Str(s)) => assert_eq!(s, &big),
+            other => panic!("thaw failed: {:?}", other.map(|v| v.type_name())),
+        }
+        assert!(db.mem_used() >= hot, "thawed value costs RAM again");
+        let (_, _, _, keys, _) = db.tier_stats();
+        assert_eq!(keys, 0, "no tiered stubs after thaw");
+
+        // Idempotence + missing key.
+        assert_eq!(db.tier_key(b"k"), Ok(true));
+        assert_eq!(db.tier_key(b"k"), Ok(true));
+        assert_eq!(db.tier_key(b"absent"), Ok(false));
+        db.clear(); // deletes the log segments too
+    }
+
+    #[test]
+    fn tiered_geo_leaves_the_spatial_index_and_returns_on_thaw() {
+        let base = format!(
+            "{}/locus-dbtier-geo-{}",
+            std::env::temp_dir().display(),
+            std::process::id()
+        );
+        let mut db = Db::new();
+        db.attach_tier(Some(crate::tier::TierStore::open(&base, 0).unwrap()));
+        db.insert(b"g".to_vec(), Value::Geo(10.0, 10.0, vec![]));
+        assert_eq!(db.geo_candidates(9.9, 9.9, 10.1, 10.1).len(), 1);
+        // Tiered = archived: it leaves the live spatial index...
+        assert_eq!(db.tier_key(b"g"), Ok(true));
+        assert!(db.geo_candidates(9.9, 9.9, 10.1, 10.1).is_empty());
+        // ...and re-enters it when thawed by a read.
+        assert!(matches!(db.get(b"g"), Some(Value::Geo(..))));
+        assert_eq!(db.geo_candidates(9.9, 9.9, 10.1, 10.1).len(), 1);
+        db.clear();
+    }
+
+    #[test]
+    fn expired_tiered_stub_empties_and_deletes_its_segment() {
+        let base = format!(
+            "{}/locus-dbtier-exp-{}",
+            std::env::temp_dir().display(),
+            std::process::id()
+        );
+        let mut db = Db::new();
+        db.attach_tier(Some(crate::tier::TierStore::open(&base, 0).unwrap()));
+        db.insert(b"k".to_vec(), Value::Str(vec![b'v'; 500]));
+        db.set_expire(b"k", now_ms().saturating_sub(1));
+        assert_eq!(db.tier_key(b"k"), Ok(false), "expired key can't be tiered");
+
+        db.insert(b"k2".to_vec(), Value::Str(vec![b'v'; 500]));
+        assert_eq!(db.tier_key(b"k2"), Ok(true));
+        db.set_expire(b"k2", now_ms().saturating_sub(1));
+        db.active_expire(); // reaps the stub -> its segment's live count hits 0
+        let (_, _, _, keys, lost) = db.tier_stats();
+        assert_eq!((keys, lost), (0, 0));
+        assert!(db.get(b"k2").is_none());
+        db.clear();
     }
 
     #[test]

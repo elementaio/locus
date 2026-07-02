@@ -372,6 +372,9 @@ pub fn execute_proto(tokens: &[Vec<u8>], db: &mut Db, proto: u8) -> Vec<u8> {
         b"ZREMRANGEBYSCORE" => zremrangebyscore_cmd(db, tokens),
         b"ZUNIONSTORE" => zstore_cmd(db, tokens, false),
         b"ZINTERSTORE" => zstore_cmd(db, tokens, true),
+        // disk tier: hot in RAM, warm on disk (see tier.rs)
+        b"TIER" => tier_cmd(db, tokens),
+        b"TIERREF" => tierref_cmd(db, tokens),
         // geo (geo-first: each object is its own key)
         b"GEOSET" => geoset_cmd(db, tokens),
         b"GEOPOS" => geopos_cmd(db, tokens),
@@ -433,7 +436,7 @@ pub fn command_meta(cmd: &[u8]) -> Option<CmdMeta> {
         | b"AUTH" | b"SCAN" | b"OBJECT" | b"CLIENT" | b"SLOWLOG" | b"ACL" => (2, false),
         // arity 2 writes
         b"PERSIST" | b"INCR" | b"DECR" | b"GETDEL" | b"LPOP" | b"RPOP" | b"SPOP" | b"ZPOPMIN"
-        | b"ZPOPMAX" | b"DEL" | b"UNLINK" | b"GETEX" => (2, true),
+        | b"ZPOPMAX" | b"DEL" | b"UNLINK" | b"GETEX" | b"TIER" => (2, true),
         // arity 3 reads
         b"LINDEX" | b"HGET" | b"HEXISTS" | b"HMGET" | b"SISMEMBER" | b"SMISMEMBER" | b"ZSCORE"
         | b"ZMSCORE" | b"ZRANK" | b"ZREVRANK" | b"PUBLISH" | b"REPLICAOF" | b"SLAVEOF"
@@ -457,6 +460,8 @@ pub fn command_meta(cmd: &[u8]) -> Option<CmdMeta> {
         | b"GEOSET" | b"CAS" | b"INCRCAP" | b"CMSINCRBY" => (4, true),
         // arity 5 writes
         b"XADD" | b"LINSERT" | b"LMOVE" | b"BFLOAD" | b"CMSLOAD" => (5, true),
+        // arity 6 writes (internal: AOF-rewrite stub restore)
+        b"TIERREF" => (6, true),
         // geosearch: GEOSEARCH FROMKEY k BYRADIUS r unit (6) is the shortest form
         b"GEOSEARCH" => (6, false),
         _ => return None,
@@ -645,6 +650,8 @@ static COMMAND_NAMES: &[&[u8]] = &[
     b"TDADD",
     b"TDLOAD",
     b"TDQUANTILE",
+    b"TIER",
+    b"TIERREF",
     b"TOPKADD",
     b"TOPKCOUNT",
     b"TOPKLIST",
@@ -3785,6 +3792,44 @@ fn geo_point(db: &mut Db, key: &[u8]) -> Result<Option<(f64, f64)>, ()> {
         Some(Value::Geo(lon, lat, _)) => Ok(Some((*lon, *lat))),
         Some(_) => Err(()),
     }
+}
+
+/// TIER key — move the key's value to the disk tier, leaving a stub in RAM.
+/// `:1` tiered (idempotent), `:0` no such key. The value transparently thaws
+/// back on the next access that needs it.
+fn tier_cmd(db: &mut Db, tokens: &[Vec<u8>]) -> Vec<u8> {
+    if tokens.len() != 2 {
+        return wrong_args("tier");
+    }
+    match db.tier_key(&tokens[1]) {
+        Ok(true) => integer(1),
+        Ok(false) => integer(0),
+        Err(e) => error(&format!("ERR {e}")),
+    }
+}
+
+/// TIERREF key seg off len vtag — internal: recreate a stub pointing at an
+/// existing LOCAL value-log entry. Emitted by AOF rewrites (never replicated;
+/// the live TIER command replicates instead, so each node tiers its own log).
+fn tierref_cmd(db: &mut Db, tokens: &[Vec<u8>]) -> Vec<u8> {
+    if tokens.len() != 6 {
+        return wrong_args("tierref");
+    }
+    let (seg, off, len, vtag) = match (
+        parse_u64(&tokens[2]),
+        parse_u64(&tokens[3]),
+        parse_u64(&tokens[4]),
+        parse_u64(&tokens[5]),
+    ) {
+        (Some(s), Some(o), Some(l), Some(t))
+            if s <= u32::MAX as u64 && l <= u32::MAX as u64 && t <= u8::MAX as u64 =>
+        {
+            (s as u32, o, l as u32, t as u8)
+        }
+        _ => return not_integer(),
+    };
+    db.insert_tier_stub(tokens[1].clone(), seg, off, len, vtag);
+    simple_string("OK")
 }
 
 fn geoset_cmd(db: &mut Db, tokens: &[Vec<u8>]) -> Vec<u8> {

@@ -24,6 +24,7 @@ mod resp;
 mod sentinel;
 mod sketch;
 mod streams;
+mod tier;
 #[cfg(feature = "tls")]
 mod tls;
 
@@ -328,6 +329,19 @@ fn new_replid() -> String {
         SEQ.fetch_add(1, Ordering::Relaxed)
     );
     acl::hex32(&acl::sha256(seed.as_bytes()))[..40].to_string()
+}
+
+/// The disk-tier value-log base path from LOCUS_TIER ("1"/"on" = beside the
+/// RDB file), or None when tiering is disabled.
+fn tier_base_from_env() -> Option<String> {
+    match std::env::var("LOCUS_TIER") {
+        Ok(v) if !v.trim().is_empty() => Some(if matches!(v.trim(), "1" | "on" | "yes" | "true") {
+            format!("{}.tier", rdb::configured_path())
+        } else {
+            v
+        }),
+        _ => None,
+    }
 }
 
 /// Where the node's role (master / replicaof host port) is persisted across
@@ -1010,6 +1024,21 @@ impl Hub {
             waiting: Vec::new(),
         };
         hub.apply_extras(extras);
+        // The disk tier (LOCUS_TIER=path|1): tiered values live in a segmented
+        // value-log on disk; RAM keeps stubs. RAM is for LIVE data.
+        if let Some(base) = tier_base_from_env() {
+            let seg_mb: u64 = std::env::var("LOCUS_TIER_SEG_MB")
+                .ok()
+                .and_then(|s| s.trim().parse().ok())
+                .unwrap_or(0);
+            match tier::TierStore::open(&base, seg_mb * 1024 * 1024) {
+                Ok(t) => {
+                    hub.db.attach_tier(Some(t));
+                    log::info(&format!("disk tier enabled at {base}"));
+                }
+                Err(e) => log::error(&format!("disk tier disabled: could not open {base}: {e}")),
+            }
+        }
         hub.config_epoch = boot_epoch();
         // Resume the persisted role: a crashed replica must come back AS a
         // replica (read-only, re-syncing from its master) — not as a writable
@@ -1979,11 +2008,16 @@ impl Hub {
                 } else {
                     let s = slot.unwrap();
                     let slot_s = s.to_string();
+                    // dump_entry_full: tiered values are read through for the
+                    // wire (a stub is meaningless on the destination node).
                     let dumps: Vec<(Vec<u8>, Vec<u8>)> = self
                         .db
                         .entries()
                         .filter(|(k, _)| commands::hash_slot(k) as usize == s)
-                        .map(|(k, v)| (k.clone(), rdb::dump_entry(k, v, self.db.raw_expire(k))))
+                        .filter_map(|(k, v)| {
+                            rdb::dump_entry_full(&self.db, k, v, self.db.raw_expire(k))
+                                .map(|d| (k.clone(), d))
+                        })
                         .collect();
                     // Phase 0: purge any zombies a prior failed attempt left.
                     let purged =
@@ -2391,6 +2425,11 @@ impl Hub {
             if self.aof_unhealthy() { "err" } else { "ok" }
         ));
         s.push_str("rdb_last_bgsave_status:ok\r\n");
+        let (tier_on, tier_segs, tier_bytes, tier_keys, tier_lost) = self.db.tier_stats();
+        s.push_str(&format!(
+            "tier_enabled:{}\r\ntier_segments:{tier_segs}\r\ntier_log_bytes:{tier_bytes}\r\ntier_keys:{tier_keys}\r\ntier_lost:{tier_lost}\r\n",
+            tier_on as u8
+        ));
         s.push_str("# Stats\r\n");
         s.push_str(&format!(
             "total_commands_processed:{}\r\n",
@@ -2811,7 +2850,10 @@ impl Hub {
                         )
                         .into_bytes(),
                     );
-                    let mut snap = rdb::serialize(&self.db);
+                    // serialize_wire: tiered stubs are read through and shipped
+                    // as full values — a stub addresses OUR value-log, not the
+                    // replica's.
+                    let mut snap = rdb::serialize_wire(&self.db);
                     rdb::append_extras(&mut snap, &self.build_extras());
                     let mut bulk = format!("${}\r\n", snap.len()).into_bytes();
                     bulk.extend_from_slice(&snap);
@@ -3914,12 +3956,18 @@ impl Hub {
                 self.reindex_key(&key);
             }
         }
+        // Tiering moves bytes, not meaning: the value is logically unchanged,
+        // so no changefeed event — and no index touch, which READS the value
+        // and would thaw the stub right back.
+        let is_tiering = matches!(cmd.as_slice(), b"TIER" | b"TIERREF");
         if !errored && is_write {
             // Keep the memory estimate in sync with whatever the command changed
             // (including in-place collection growth like LPUSH/SADD).
             for key in write_keys(&tokens) {
                 self.db.resync_size(key);
-                self.reindex_key(key); // keep secondary indexes in sync (no drift)
+                if !is_tiering {
+                    self.reindex_key(key); // keep secondary indexes in sync (no drift)
+                }
             }
             // A write only counts as a modification if it actually changed the
             // dataset. A no-op write (e.g. DEL of a missing key) is not logged,
@@ -3942,7 +3990,9 @@ impl Hub {
                     self.replicate(resp::command(e));
                 }
                 // Feed the changefeed (same modified-key set as WATCH/AOF).
-                self.emit_write_changes(&tokens);
+                if !is_tiering {
+                    self.emit_write_changes(&tokens);
+                }
             }
         }
         if let Some(a) = self.aof.as_mut() {
@@ -4289,7 +4339,7 @@ fn write_modified(cmd: &[u8], reply: &[u8]) -> bool {
         b"DEL" | b"UNLINK" | b"SREM" | b"HDEL" | b"ZREM" | b"SADD" | b"HSETNX" | b"LPUSHX"
         | b"RPUSHX" | b"PERSIST" | b"EXPIRE" | b"PEXPIRE" | b"EXPIREAT" | b"PEXPIREAT"
         | b"SETNX" | b"MSETNX" | b"RENAMENX" | b"LREM" | b"SMOVE" | b"ZREMRANGEBYRANK"
-        | b"ZREMRANGEBYSCORE" | b"CAS" | b"CADEL" | b"SETMAX" | b"BFADD" => !zero,
+        | b"ZREMRANGEBYSCORE" | b"CAS" | b"CADEL" | b"SETMAX" | b"BFADD" | b"TIER" => !zero,
         // ZADD: 0 added/changed, or nil from an aborted INCR (NX/XX/GT/LT).
         b"ZADD" => !(zero || nil),
         // LINSERT: 0 (no key) or -1 (pivot not found) means nothing was inserted.
@@ -4421,7 +4471,12 @@ fn run_hub(rx: mpsc::Receiver<Msg>, tx: mpsc::SyncSender<Msg>) {
                     log::warn("discarded a stale full-sync snapshot (replication was repointed)");
                     continue;
                 }
+                // The disk tier is NODE-LOCAL: carry it across the dataset
+                // swap. The incoming snapshot holds full values (the master
+                // thaws stubs for the wire), so no stub can dangle.
+                let tier_store = hub.db.take_tier();
                 hub.db = *db;
+                hub.db.attach_tier(tier_store);
                 hub.apply_extras(*extras); // CDC offsets/log/groups + rebuilt indexes
                 // Adopt the master's replication id + offset (Redis semantics) so
                 // our INFO and future reconnects line up with the master's stream.
