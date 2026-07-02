@@ -543,6 +543,11 @@ struct Hub {
     changefeeds: HashMap<u64, CdcFilter>,
     // retained change-log (for CDCREAD catch-up); empty/unused when maxlen == 0
     cdc_log: VecDeque<ChangeRecord>,
+    // cdc_log's estimated bytes: counted toward used_memory/maxmemory and
+    // capped by cdc_max_bytes — a count-only bound with large values is an
+    // invisible multi-GB buffer.
+    cdc_bytes: usize,
+    cdc_max_bytes: usize,
     cdc_next_offset: u64,
     hlc_last: u64, // last hybrid-logical-clock stamp issued (cross-shard CDC order)
     // Last HLC floor we heard from each peer shard during CLUSTER CDCMERGE. A peer
@@ -618,6 +623,12 @@ struct ChangeRecord {
     event: Vec<u8>, // "write" | "del" | "expire"
     key: Vec<u8>,
     value: Option<Vec<u8>>, // new value for string writes; None otherwise
+}
+
+/// Estimated retained bytes for one changefeed record (payload + bookkeeping),
+/// for the cdc_log byte budget and its share of used_memory.
+fn cdc_rec_bytes(r: &ChangeRecord) -> usize {
+    48 + r.event.len() + r.key.len() + r.value.as_ref().map(|v| v.len()).unwrap_or(0)
 }
 
 /// One changefeed record for the cross-shard merge: `(hlc, event, key, value)`
@@ -726,6 +737,11 @@ impl Hub {
                 .filter(|&m| m > 0),
             changefeeds: HashMap::new(),
             cdc_log: VecDeque::new(),
+            cdc_bytes: 0,
+            cdc_max_bytes: std::env::var("LOCUS_CDC_MAXBYTES")
+                .ok()
+                .and_then(|s| parse_mem(&s))
+                .unwrap_or(64 * 1024 * 1024),
             cdc_next_offset: 1, // offset 0 means "nothing yet"
             hlc_last: 0,
             cdc_peer_floors: HashMap::new(),
@@ -800,6 +816,7 @@ impl Hub {
                 value: r.value,
             })
             .collect();
+        self.cdc_bytes = self.cdc_log.iter().map(cdc_rec_bytes).sum();
         self.cdc_groups = x
             .cdc_groups
             .into_iter()
@@ -1785,9 +1802,15 @@ impl Hub {
         }
     }
 
+    /// Total tracked memory: keyspace estimate + the retained changefeed log
+    /// (which would otherwise be invisible to maxmemory).
+    fn mem_used_total(&self) -> usize {
+        self.db.mem_used() + self.cdc_bytes
+    }
+
     /// Build the INFO report (the sections redis_exporter and clients expect).
     fn render_info(&self) -> Vec<u8> {
-        let used = self.db.mem_used();
+        let used = self.mem_used_total();
         let role = if self.master.is_some() {
             "slave"
         } else {
@@ -1929,8 +1952,7 @@ impl Hub {
                 );
             }
             if (class == acl::CLASS_READ || class == acl::CLASS_WRITE)
-                && tokens.len() >= 2
-                && !user.allows_key(&tokens[1])
+                && !acl_keys_allowed(user, &cmd, &tokens)
             {
                 return self.send(id, resp::error("NOPERM No permissions to access a key"));
             }
@@ -2004,6 +2026,19 @@ impl Hub {
                 if !self.txs.get(&id).is_some_and(|t| t.in_multi) {
                     return self.send(id, resp::error("ERR EXEC without MULTI"));
                 }
+                // A watched key that lapsed by pure wall-clock — never sampled
+                // by the reaper, never touched since WATCH — must abort EXEC
+                // like any modification. Probing it here runs passive expiry,
+                // and the drain below dirties this transaction if it fired.
+                let watched: Vec<Vec<u8>> = self
+                    .txs
+                    .get(&id)
+                    .map(|t| t.watched.clone())
+                    .unwrap_or_default();
+                for key in &watched {
+                    let _ = self.db.get(key);
+                }
+                self.dirty_expired_watchers();
                 let t = self.txs.remove(&id).unwrap();
                 self.unwatch_keys(&t.watched, id);
                 if t.aborted {
@@ -2167,10 +2202,14 @@ impl Hub {
                     .get(1)
                     .is_some_and(|s| s.eq_ignore_ascii_case(b"ACK"))
                 {
-                    if let Some(off) = tokens
-                        .get(2)
-                        .and_then(|t| std::str::from_utf8(t).ok())
-                        .and_then(|s| s.parse::<u64>().ok())
+                    // Only connections that actually PSYNCed count: any client
+                    // could otherwise forge `REPLCONF ACK <huge>` and satisfy
+                    // WAIT quorums for data no replica has.
+                    if self.replicas.contains(&id)
+                        && let Some(off) = tokens
+                            .get(2)
+                            .and_then(|t| std::str::from_utf8(t).ok())
+                            .and_then(|s| s.parse::<u64>().ok())
                     {
                         self.replica_acks.insert(id, off);
                         self.check_waits();
@@ -2226,7 +2265,11 @@ impl Hub {
                     bulk.extend_from_slice(&snap);
                     self.send(id, bulk);
                     self.replicas.insert(id);
-                    self.replica_acks.insert(id, self.master_repl_offset);
+                    // Seed the ack at 0, NOT the current offset: the replica
+                    // hasn't read a byte of the snapshot yet, and pre-crediting
+                    // it would satisfy `WAIT 1` for writes that exist nowhere
+                    // else. Its first real REPLCONF ACK sets the true position.
+                    self.replica_acks.insert(id, 0);
                     // Activate the backlog at the current offset on the first attach.
                     if !self.repl_active {
                         self.repl_active = true;
@@ -2511,15 +2554,24 @@ impl Hub {
             }
         }
         if self.cdc_maxlen > 0 {
-            self.cdc_log.push_back(ChangeRecord {
+            let rec = ChangeRecord {
                 offset,
                 hlc,
                 event: event.to_vec(),
                 key: key.to_vec(),
                 value,
-            });
-            while self.cdc_log.len() > self.cdc_maxlen {
-                self.cdc_log.pop_front();
+            };
+            self.cdc_bytes += cdc_rec_bytes(&rec);
+            self.cdc_log.push_back(rec);
+            // Trim by count AND bytes: 100k retained 1MB values is 100GB the
+            // count cap alone would happily hold.
+            while self.cdc_log.len() > self.cdc_maxlen
+                || (self.cdc_max_bytes > 0 && self.cdc_bytes > self.cdc_max_bytes)
+            {
+                match self.cdc_log.pop_front() {
+                    Some(old) => self.cdc_bytes -= cdc_rec_bytes(&old).min(self.cdc_bytes),
+                    None => break,
+                }
             }
         }
     }
@@ -3086,16 +3138,26 @@ impl Hub {
 
     /// Authenticate as a named ACL user and bind the connection to it.
     fn auth_named_user(&mut self, id: u64, name: &[u8], pass: &[u8]) {
-        match self.users.get(name) {
-            Some(u) if u.enabled && u.check_password(pass) => {
-                self.authed.insert(id);
-                self.current_user.insert(id, name.to_vec());
-                self.send(id, resp::simple_string("OK"));
+        let ok = match self.users.get(name) {
+            // check_password first: it hashes unconditionally, so a disabled
+            // user costs the same as a wrong password.
+            Some(u) => u.check_password(pass) && u.enabled,
+            None => {
+                // Constant work for unknown users: hash the password anyway so
+                // response timing doesn't reveal which usernames exist.
+                let _ = acl::sha256(pass);
+                false
             }
-            _ => self.send(
+        };
+        if ok {
+            self.authed.insert(id);
+            self.current_user.insert(id, name.to_vec());
+            self.send(id, resp::simple_string("OK"));
+        } else {
+            self.send(
                 id,
                 resp::error("WRONGPASS invalid username-password pair or user is disabled."),
-            ),
+            );
         }
     }
 
@@ -3319,7 +3381,7 @@ impl Hub {
             Some(m) => m,
             None => return true,
         };
-        while self.db.mem_used() > max {
+        while self.mem_used_total() > max {
             match self.db.evict_one() {
                 Some(key) => {
                     self.dirty_watchers(&key);
@@ -3330,7 +3392,7 @@ impl Hub {
                 None => break, // keyspace empty — nothing left to evict
             }
         }
-        self.db.mem_used() <= max
+        self.mem_used_total() <= max
     }
 
     /// Append one command to the AOF and stream it to every replica.
@@ -3431,6 +3493,57 @@ impl Hub {
         };
         self.send(id, reply);
     }
+}
+
+/// Key-scope check for a READ/WRITE-class command under a prefix-restricted
+/// user. EVERY key the command addresses must fall inside the prefix — the old
+/// first-key-only check let `MSET app:x 1 secret:y 2` (and MGET/RENAME/DEL/…)
+/// cross tenant namespaces on keys past the first.
+fn acl_keys_allowed(user: &acl::User, cmd: &[u8], tokens: &[Vec<u8>]) -> bool {
+    if user.unrestricted_keys() {
+        return true;
+    }
+    // Changefeed commands are gated by the PREFIX they subscribe to / read:
+    // in-scope iff that prefix sits inside the user's own. The group family
+    // and REGION subscriptions span the whole keyspace — scoped users don't
+    // get them.
+    if cmd.starts_with(b"CDC") {
+        return match cmd {
+            b"CDCSUBSCRIBE" | b"CDCUNSUBSCRIBE" => match tokens.get(1) {
+                Some(arg) => user.allows_key(arg), // REGION fails this — intended
+                None => cmd == b"CDCUNSUBSCRIBE",  // bare subscribe = all keys
+            },
+            b"CDCREAD" => {
+                // Only in scope with an explicit PREFIX inside the user's own.
+                let mut i = 2;
+                while i + 1 < tokens.len() {
+                    if tokens[i].eq_ignore_ascii_case(b"PREFIX") {
+                        return user.allows_key(&tokens[i + 1]);
+                    }
+                    i += 1;
+                }
+                false
+            }
+            _ => false, // groups/ack/pending stream every key
+        };
+    }
+    let keys = commands::command_keys(tokens);
+    if keys.is_empty() {
+        // Keyspace-wide readers (and index queries) can't be prefix-filtered —
+        // a scoped user is denied outright. Anything else keyless (WAIT,
+        // malformed arity that execution will reject) passes.
+        return !matches!(
+            cmd,
+            b"KEYS"
+                | b"SCAN"
+                | b"RANDOMKEY"
+                | b"GEOSEARCH"
+                | b"GEOSEARCHSHARD"
+                | b"IDXGET"
+                | b"IDXRANGE"
+        );
+    }
+    keys.iter().all(|k| user.allows_key(k))
 }
 
 fn allowed_in_push_mode(cmd: &[u8]) -> bool {

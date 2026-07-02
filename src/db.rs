@@ -291,10 +291,11 @@ impl Db {
     /// The hub calls this after every write so in-place collection growth
     /// (LPUSH, SADD, …) is accounted for, not just whole-value inserts.
     pub fn resync_size(&mut self, key: &[u8]) {
+        let volatile = self.expires.contains_key(key);
         let new = self
             .data
             .get(key)
-            .map(|v| estimate_size(key.len(), v))
+            .map(|v| estimate_size(key.len(), v, volatile))
             .unwrap_or(0);
         let old = self.sizes.get(key).copied().unwrap_or(0);
         if new == old {
@@ -467,12 +468,16 @@ impl Db {
     /// Live (non-expired) keys, for KEYS/DBSIZE. Lazy: doesn't delete the
     /// expired keys it skips (the active reaper handles reclamation).
     pub fn live_keys(&self) -> Vec<Vec<u8>> {
+        self.live_keys_iter().cloned().collect()
+    }
+
+    /// Borrowing iterator over live keys — lets SCAN walk the keyspace without
+    /// cloning every key per call.
+    pub fn live_keys_iter(&self) -> impl Iterator<Item = &Vec<u8>> + '_ {
         let now = now_ms();
         self.data
             .keys()
-            .filter(|k| self.expires.get(*k).is_none_or(|&d| d > now))
-            .cloned()
-            .collect()
+            .filter(move |k| self.expires.get(*k).is_none_or(|&d| d > now))
     }
 
     /// Count of live (non-expired) keys.
@@ -527,8 +532,12 @@ impl Db {
 /// A coarse estimate of a key+value's memory footprint, in bytes. Not byte-exact
 /// (no allocator introspection in zero-deps `std`); a fixed per-key and
 /// per-element overhead approximates allocation bookkeeping well enough to bound
-/// growth under `maxmemory`.
-fn estimate_size(key_len: usize, v: &Value) -> usize {
+/// growth under `maxmemory`. Deliberately estimates HIGH rather than low: the
+/// side-tables (`sizes`, `expires`), the zset's ordered index (a second copy of
+/// every member), the geo spatial index, and HashMap load-factor slack all cost
+/// real bytes — leaving them out makes eviction fire late and hands the finish
+/// to the OOM killer.
+fn estimate_size(key_len: usize, v: &Value, volatile: bool) -> usize {
     const KEY_OVH: usize = 64; // HashMap entry + key/value headers
     const ELEM_OVH: usize = 16; // per collection element
     let val = match v {
@@ -536,7 +545,9 @@ fn estimate_size(key_len: usize, v: &Value) -> usize {
         Value::List(l) => l.iter().map(|e| e.len() + ELEM_OVH).sum(),
         Value::Hash(h) => h.iter().map(|(k, vv)| k.len() + vv.len() + ELEM_OVH).sum(),
         Value::Set(s) => s.iter().map(|e| e.len() + ELEM_OVH).sum(),
-        Value::ZSet(z) => z.iter().map(|(m, _)| m.len() + 8 + ELEM_OVH).sum(),
+        // Both halves of the ZSet: the member->score map AND the (score, member)
+        // ordered index, which duplicates every member's bytes.
+        Value::ZSet(z) => z.iter().map(|(m, _)| 2 * (m.len() + 8 + ELEM_OVH)).sum(),
         Value::Stream(st) => st
             .entries
             .iter()
@@ -548,7 +559,14 @@ fn estimate_size(key_len: usize, v: &Value) -> usize {
                     + 24
             })
             .sum(),
-        Value::Geo(_, _, attrs) => 16 + attrs.iter().map(|(f, v)| f.len() + v.len()).sum::<usize>(),
+        // A geo point also lives in geo_cell (key copy + cell id) and in a
+        // geo_index cell set (another key copy) — the product's hottest type
+        // must not be its most under-counted.
+        Value::Geo(_, _, attrs) => {
+            16 + 2 * (key_len + ELEM_OVH)
+                + 24
+                + attrs.iter().map(|(f, v)| f.len() + v.len()).sum::<usize>()
+        }
         Value::Bloom(b) => b.bits.len(),
         Value::Cms(c) => c.counters.len() * 4,
         Value::TopK(t) => {
@@ -556,7 +574,11 @@ fn estimate_size(key_len: usize, v: &Value) -> usize {
         }
         Value::TDigest(t) => t.centroids.len() * 16 + 32,
     };
-    KEY_OVH + key_len + val
+    // sizes-map entry (key copy + usize) always; expires entry when volatile.
+    let side = key_len + 24 + if volatile { key_len + 32 } else { 0 };
+    let total = KEY_OVH + key_len + val + side;
+    // HashMap load-factor / allocator slack: ~1.5x on average.
+    total + total / 2
 }
 
 #[cfg(test)]

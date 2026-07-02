@@ -1371,6 +1371,97 @@ fn acl_user_least_privilege() {
 }
 
 #[test]
+fn acl_checks_every_key_not_just_the_first() {
+    let s = Server::start();
+    let mut admin = s.connect();
+    assert_eq!(
+        admin.cmd(&[
+            "ACL", "SETUSER", "bob", "on", ">pw", "+@read", "+@write", "~app:"
+        ]),
+        "OK"
+    );
+    admin.cmd(&["SET", "secret:x", "s3cr3t"]);
+
+    let mut b = s.connect();
+    assert_eq!(b.cmd(&["AUTH", "bob", "pw"]), "OK");
+    // Every key past the first used to be unchecked — cross-tenant write/read.
+    assert!(
+        b.cmd(&["MSET", "app:a", "1", "secret:y", "2"])
+            .starts_with("-NOPERM")
+    );
+    assert!(b.cmd(&["MGET", "app:a", "secret:x"]).starts_with("-NOPERM"));
+    assert!(
+        b.cmd(&["RENAME", "app:a", "secret:x"])
+            .starts_with("-NOPERM")
+    );
+    assert!(b.cmd(&["DEL", "app:a", "secret:x"]).starts_with("-NOPERM"));
+    assert!(
+        b.cmd(&["SINTERSTORE", "app:dst", "app:s1", "secret:x"])
+            .starts_with("-NOPERM")
+    );
+    // Fully in-prefix multi-key commands still work.
+    assert_eq!(b.cmd(&["MSET", "app:a", "1", "app:b", "2"]), "OK");
+    assert_eq!(b.cmd(&["MGET", "app:a", "app:b"]), "[1, 2]");
+    // Keyspace-wide readers can't be prefix-filtered: scoped users are denied.
+    assert!(b.cmd(&["KEYS", "*"]).starts_with("-NOPERM"));
+    assert!(b.cmd(&["SCAN", "0"]).starts_with("-NOPERM"));
+    assert!(b.cmd(&["RANDOMKEY"]).starts_with("-NOPERM"));
+    // And the secret is still there, unread and unrenamed.
+    assert_eq!(admin.cmd(&["GET", "secret:x"]), "s3cr3t");
+}
+
+#[test]
+fn cdc_requires_read_class_and_respects_key_prefix() {
+    let s = Server::start_inner(&[("LOCUS_CDC_MAXLEN", "100")]);
+    let mut admin = s.connect();
+    admin.cmd(&["SET", "secret:x", "classified"]);
+    // A pubsub-only user: CDC used to class as pubsub and stream the whole
+    // keyspace (snapshot + live values) to exactly this kind of user.
+    assert_eq!(
+        admin.cmd(&[
+            "ACL", "SETUSER", "pubber", "on", ">pw", "+@pubsub", "allkeys"
+        ]),
+        "OK"
+    );
+    let mut p = s.connect();
+    assert_eq!(p.cmd(&["AUTH", "pubber", "pw"]), "OK");
+    assert!(p.cmd(&["CDCSUBSCRIBE"]).starts_with("-NOPERM"));
+
+    // A read user scoped to app:* may follow app:* changes — nothing wider.
+    assert_eq!(
+        admin.cmd(&["ACL", "SETUSER", "watcher", "on", ">pw", "+@read", "~app:"]),
+        "OK"
+    );
+    let mut w = s.connect();
+    assert_eq!(w.cmd(&["AUTH", "watcher", "pw"]), "OK");
+    assert!(w.cmd(&["CDCSUBSCRIBE"]).starts_with("-NOPERM")); // all keys
+    assert!(w.cmd(&["CDCSUBSCRIBE", "sec"]).starts_with("-NOPERM")); // outside
+    assert!(
+        w.cmd(&["CDCSUBSCRIBE", "REGION", "10", "10", "5", "km"])
+            .starts_with("-NOPERM")
+    ); // regions span the keyspace
+    assert!(w.cmd(&["CDCREAD", "0"]).starts_with("-NOPERM")); // unfiltered read
+    let sub = w.cmd(&["CDCSUBSCRIBE", "app:orders:"]); // inside: allowed
+    assert!(
+        sub.contains("cdc-snapshot-done"),
+        "expected snapshot: {sub}"
+    );
+}
+
+#[test]
+fn wait_ignores_forged_replconf_acks() {
+    let s = Server::start();
+    let mut writer = s.connect();
+    writer.cmd(&["SET", "k", "v"]);
+    // A plain client forges a huge ack; WAIT must not count it (it never
+    // PSYNCed — only real replicas' acks satisfy quorums).
+    let mut forger = s.connect();
+    forger.send(&["REPLCONF", "ACK", "999999999"]); // no reply by design
+    sleep(Duration::from_millis(100));
+    assert_eq!(writer.cmd(&["WAIT", "1", "150"]), "0");
+}
+
+#[test]
 fn replica_loses_keys_when_the_master_expires_them() {
     let master = Server::start();
     let replica = Server::start();

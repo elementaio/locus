@@ -59,10 +59,15 @@ pub fn crc16(data: &[u8]) -> u16 {
     crc
 }
 
-/// The key(s) a command addresses, for cluster routing. Empty = not routed
-/// (connection/admin/pubsub commands, and cluster-wide data commands like KEYS /
-/// SCAN / GEOSEARCH that aren't pinned to one slot). Complex store commands route
-/// on their first key (use a `{hashtag}` to co-locate sources in a cluster).
+/// The key(s) a command addresses — the shared source of truth for cluster
+/// routing (MOVED/CROSSSLOT) and per-key ACL checks. Empty = not keyed
+/// (connection/admin/pubsub commands, and keyspace-wide data commands like
+/// KEYS / SCAN / GEOSEARCH that aren't pinned to one slot).
+///
+/// Completeness matters twice over: a source key missing here executes as
+/// "empty" on the wrong shard instead of returning CROSSSLOT, and skips its
+/// ACL prefix check. Every multi-key layout (incl. the store variants and the
+/// numkeys forms) is spelled out.
 pub fn command_keys(tokens: &[Vec<u8>]) -> Vec<&[u8]> {
     if tokens.len() < 2 {
         return vec![];
@@ -70,7 +75,9 @@ pub fn command_keys(tokens: &[Vec<u8>]) -> Vec<&[u8]> {
     let cmd = tokens[0].to_ascii_uppercase();
     match cmd.as_slice() {
         b"DEL" | b"UNLINK" | b"EXISTS" | b"TOUCH" | b"MGET" | b"SINTER" | b"SUNION" | b"SDIFF"
-        | b"PFCOUNT" => return tokens[1..].iter().map(|k| k.as_slice()).collect(),
+        | b"PFCOUNT" | b"SINTERSTORE" | b"SUNIONSTORE" | b"SDIFFSTORE" | b"WATCH" => {
+            return tokens[1..].iter().map(|k| k.as_slice()).collect();
+        }
         b"MSET" | b"MSETNX" => {
             return tokens[1..]
                 .iter()
@@ -84,11 +91,34 @@ pub fn command_keys(tokens: &[Vec<u8>]) -> Vec<&[u8]> {
                 .map(|k| k.as_slice())
                 .collect();
         }
+        // BITOP op dest src [src ...] — destination AND every source.
         b"BITOP" => {
             return tokens
-                .get(2)
-                .map(|k| vec![k.as_slice()])
+                .get(2..)
+                .map(|ks| ks.iter().map(|k| k.as_slice()).collect())
                 .unwrap_or_default();
+        }
+        // ZUNIONSTORE/ZINTERSTORE dest numkeys key [key ...] [...]
+        b"ZUNIONSTORE" | b"ZINTERSTORE" => {
+            let mut keys = vec![tokens[1].as_slice()];
+            keys.extend(numkeys_keys(tokens, 2));
+            return keys;
+        }
+        // SINTERCARD numkeys key [key ...] [LIMIT n]
+        b"SINTERCARD" => return numkeys_keys(tokens, 1),
+        // XREAD [COUNT n] [BLOCK ms] STREAMS key [key ...] id [id ...]
+        b"XREAD" => {
+            if let Some(pos) = tokens
+                .iter()
+                .position(|t| t.eq_ignore_ascii_case(b"STREAMS"))
+            {
+                let rest = &tokens[pos + 1..];
+                return rest[..rest.len() / 2]
+                    .iter()
+                    .map(|k| k.as_slice())
+                    .collect();
+            }
+            return vec![];
         }
         // Cluster-wide / cross-key data commands: not addressed to a single slot.
         b"KEYS" | b"SCAN" | b"RANDOMKEY" | b"WAIT" | b"GEOSEARCH" | b"GEOSEARCHSHARD"
@@ -97,12 +127,32 @@ pub fn command_keys(tokens: &[Vec<u8>]) -> Vec<&[u8]> {
         }
         _ => {}
     }
+    // Changefeed commands carry prefixes/offsets/groups, not keys, and are
+    // node-local — never routed. (Their ACL gating is prefix-based, in the hub.)
+    if cmd.starts_with(b"CDC") {
+        return vec![];
+    }
     // Otherwise a single-key data command keys on tokens[1]; non-data commands
     // (connection/admin/pubsub) don't route.
     match command_class(&cmd) {
         crate::acl::CLASS_READ | crate::acl::CLASS_WRITE => vec![tokens[1].as_slice()],
         _ => vec![],
     }
+}
+
+/// The keys of a `numkeys key [key ...]` form, with `numkeys` at `tokens[at]`.
+/// Empty on a malformed count (execution will reject it anyway).
+fn numkeys_keys(tokens: &[Vec<u8>], at: usize) -> Vec<&[u8]> {
+    let n = tokens
+        .get(at)
+        .and_then(|t| parse_int(t))
+        .filter(|&n| n > 0)
+        .map(|n| n as usize)
+        .unwrap_or(0);
+    tokens
+        .get(at + 1..(at + 1 + n).min(tokens.len()))
+        .map(|ks| ks.iter().map(|k| k.as_slice()).collect())
+        .unwrap_or_default()
 }
 
 /// Number of hash slots in the keyspace (Redis Cluster's fixed 16384).
@@ -438,7 +488,9 @@ pub fn command_class(cmd: &[u8]) -> u8 {
         }
         b"SUBSCRIBE" | b"UNSUBSCRIBE" | b"PSUBSCRIBE" | b"PUNSUBSCRIBE" | b"PUBLISH"
         | b"PUBSUB" => CLASS_PUBSUB,
-        c if c.starts_with(b"CDC") => CLASS_PUBSUB,
+        // Changefeed commands READ keyspace data (snapshot + values), so they
+        // class as reads — `+@pubsub` alone must not stream the whole keyspace.
+        c if c.starts_with(b"CDC") => CLASS_READ,
         _ if command_meta(cmd).is_some_and(|m| m.write) => CLASS_WRITE,
         _ => CLASS_READ,
     }
@@ -741,7 +793,11 @@ fn keys_cmd(db: &mut Db, tokens: &[Vec<u8>]) -> Vec<u8> {
 // stable FNV-1a hash and use a hash value as the (stateless, integer) cursor:
 // each call returns elements with hash >= cursor, advancing past the last hash
 // group. This preserves Redis's guarantee — every element present for the whole
-// scan is returned at least once — at O(n) work per call (COUNT is a hint).
+// scan is returned at least once. HONEST COST: each keyspace SCAN call still
+// hashes every live key (O(N) probes — unavoidable without a bucket cursor),
+// but clones/sorts only the returned batch. A full scan is O(N²/COUNT) probes
+// total, so use a generous COUNT on big keyspaces. HSCAN/SSCAN/ZSCAN operate
+// within one value and keep the simpler collect+select path.
 
 /// (field, value) for HSCAN; (member, score) for ZSCAN — named so the
 /// scan_select item types stay readable (and clippy's type-complexity lint quiet).
@@ -854,26 +910,52 @@ fn scan_cmd(db: &mut Db, tokens: &[Vec<u8>]) -> Vec<u8> {
         Ok(v) => v,
         Err(e) => return e,
     };
-    let items: Vec<(u64, Vec<u8>)> = db
-        .live_keys()
-        .into_iter()
-        .map(|k| (scan_hash(&k), k))
-        .collect();
-    let (next, batch) = scan_select(items, cursor, opts.count);
-    let mut out = Vec::new();
-    for k in batch {
-        if let Some(p) = &opts.pattern
-            && !crate::pubsub::glob_match(p, &k)
-        {
+    // Two borrowing passes, no full clone and no full sort (both used to
+    // happen on EVERY call — a big-keyspace SCAN loop was O(N log N) per call
+    // plus an allocation of every key). Pass 1: a bounded max-heap finds the
+    // batch's upper hash bound. Pass 2: collect just that hash window, whole
+    // hash groups included. Per call: O(N) hash probes, O(batch) clones.
+    let count = opts.count.max(1);
+    let mut heap: std::collections::BinaryHeap<u64> = std::collections::BinaryHeap::new();
+    for k in db.live_keys_iter() {
+        let h = scan_hash(k);
+        if h < cursor {
             continue;
         }
-        if let Some(t) = &opts.typ
-            && db.type_name(&k).map(|s| s.as_bytes()) != Some(t.as_slice())
+        if heap.len() < count {
+            heap.push(h);
+        } else if let Some(&top) = heap.peek()
+            && h < top
         {
-            continue;
+            heap.pop();
+            heap.push(h);
         }
-        out.push(k);
     }
+    let Some(&bound) = heap.peek() else {
+        return scan_reply(0, &[]); // nothing at or past the cursor
+    };
+    let mut out: Vec<Vec<u8>> = Vec::new();
+    let mut beyond = false;
+    for k in db.live_keys_iter() {
+        let h = scan_hash(k);
+        if h < cursor {
+            continue;
+        }
+        if h > bound {
+            beyond = true;
+            continue;
+        }
+        if let Some(p) = &opts.pattern
+            && !crate::pubsub::glob_match(p, k)
+        {
+            continue;
+        }
+        out.push(k.clone());
+    }
+    if let Some(t) = &opts.typ {
+        out.retain(|k| db.type_name(k).map(|s| s.as_bytes()) == Some(t.as_slice()));
+    }
+    let next = if beyond { bound.saturating_add(1) } else { 0 };
     scan_reply(next, &out)
 }
 
@@ -4963,11 +5045,46 @@ mod tests {
             command_keys(&to(&[b"DEL", b"a", b"b"])),
             vec![b"a".as_slice(), b"b"]
         );
+        // Store variants enumerate destination AND every source — a missing
+        // source silently executes against empty keys on the wrong shard
+        // (CROSSSLOT gap) and dodges its ACL prefix check.
+        assert_eq!(
+            command_keys(&to(&[b"SINTERSTORE", b"dst", b"s1", b"s2"])),
+            vec![b"dst".as_slice(), b"s1", b"s2"]
+        );
+        assert_eq!(
+            command_keys(&to(&[
+                b"ZUNIONSTORE",
+                b"dst",
+                b"2",
+                b"z1",
+                b"z2",
+                b"WEIGHTS"
+            ])),
+            vec![b"dst".as_slice(), b"z1", b"z2"]
+        );
+        assert_eq!(
+            command_keys(&to(&[b"BITOP", b"AND", b"dst", b"a", b"b"])),
+            vec![b"dst".as_slice(), b"a", b"b"]
+        );
+        assert_eq!(
+            command_keys(&to(&[b"SINTERCARD", b"2", b"s1", b"s2", b"LIMIT", b"1"])),
+            vec![b"s1".as_slice(), b"s2"]
+        );
+        assert_eq!(
+            command_keys(&to(&[
+                b"XREAD", b"COUNT", b"5", b"STREAMS", b"st1", b"st2", b"0", b"0"
+            ])),
+            vec![b"st1".as_slice(), b"st2"]
+        );
         // Non-key / cluster-wide commands don't route.
         assert!(command_keys(&to(&[b"PING"])).is_empty());
         assert!(command_keys(&to(&[b"KEYS", b"*"])).is_empty());
         assert!(command_keys(&to(&[b"SUBSCRIBE", b"ch"])).is_empty());
         assert!(command_keys(&to(&[b"GEOSEARCH", b"FROMLONLAT"])).is_empty());
+        // Changefeed commands carry prefixes, not keys — never routed.
+        assert!(command_keys(&to(&[b"CDCSUBSCRIBE", b"app:"])).is_empty());
+        assert!(command_keys(&to(&[b"CDCREAD", b"0"])).is_empty());
     }
 
     #[test]

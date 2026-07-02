@@ -177,6 +177,13 @@ impl User {
         }
     }
 
+    /// True when the user may touch the whole keyspace — required for the
+    /// keyspace-wide data commands (KEYS/SCAN/GEOSEARCH/…) that a key prefix
+    /// can't meaningfully filter.
+    pub fn unrestricted_keys(&self) -> bool {
+        self.key_prefix.is_none()
+    }
+
     /// Apply one `ACL SETUSER` rule. Returns Err on an unrecognized rule.
     pub fn apply(&mut self, rule: &[u8]) -> Result<(), ()> {
         let lower = rule.to_ascii_lowercase();
