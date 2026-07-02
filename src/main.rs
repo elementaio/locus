@@ -498,12 +498,62 @@ impl Cluster {
             .ok()
             .and_then(|s| s.trim().parse().ok())
             .unwrap_or(0);
-        Some(Cluster {
+        let mut cluster = Cluster {
             my_addr,
             owner,
             cell_bits,
             epoch: vec![0; commands::CLUSTER_SLOTS],
-        })
+        };
+        // Env gives the SEED topology at epoch 0; a persisted state file carries
+        // the runtime result of past SETSLOT/MIGRATESLOT/REASSIGN (higher epoch),
+        // so a full-cluster restart doesn't revert ownership to env while the
+        // data already reflects migrations (which would MOVED clients at nodes
+        // that no longer hold the keys). Higher-epoch entries win the merge.
+        cluster.load_persisted();
+        Some(cluster)
+    }
+
+    /// Path of the persisted slot-topology file (beside the RDB, or the
+    /// LOCUS_CLUSTER_STATE override).
+    fn state_path() -> String {
+        std::env::var("LOCUS_CLUSTER_STATE")
+            .unwrap_or_else(|_| format!("{}.cluster", rdb::configured_path()))
+    }
+
+    /// Merge the persisted `(start,end,owner,epoch)` runs into the env seed
+    /// (higher epoch wins), so runtime ownership survives a restart.
+    fn load_persisted(&mut self) {
+        let Ok(content) = std::fs::read_to_string(Self::state_path()) else {
+            return;
+        };
+        for line in content.lines() {
+            let mut f = line.split_whitespace();
+            if let (Some(s), Some(e), Some(owner), Some(ep)) =
+                (f.next(), f.next(), f.next(), f.next())
+                && let (Ok(s), Ok(e), Ok(ep)) =
+                    (s.parse::<usize>(), e.parse::<usize>(), ep.parse::<u64>())
+            {
+                for slot in s..=e.min(commands::CLUSTER_SLOTS - 1) {
+                    if ep > self.epoch[slot] {
+                        self.owner[slot] = Some(owner.to_string());
+                        self.epoch[slot] = ep;
+                    }
+                }
+            }
+        }
+    }
+
+    /// Persist the current topology (run-length encoded with epochs). Called
+    /// after any ownership change so it survives a restart.
+    fn persist(&self) {
+        let body: String = self
+            .ranges_with_epoch()
+            .into_iter()
+            .map(|(s, e, owner, ep)| format!("{s} {e} {owner} {ep}\n"))
+            .collect();
+        if let Err(e) = std::fs::write(Self::state_path(), body) {
+            log::warn(&format!("could not persist cluster topology: {e}"));
+        }
     }
 
     /// Contiguous (start, end, owner, epoch) runs — like `ranges` but also broken
@@ -1313,13 +1363,57 @@ impl Hub {
         self.send(id, resp::integer(total));
     }
 
+    /// Remove every local key in `slot`, durably + replicated + coherent (the
+    /// same path a client DEL takes). Returns the count. Used to purge zombie
+    /// copies on a migration destination before a fresh copy.
+    fn flush_slot(&mut self, slot: usize) -> i64 {
+        let keys: Vec<Vec<u8>> = self
+            .db
+            .live_keys_iter()
+            .filter(|k| commands::hash_slot(k) as usize == slot)
+            .cloned()
+            .collect();
+        let n = keys.len() as i64;
+        for k in keys {
+            self.dirty_watchers(&k);
+            self.db.remove(&k);
+            self.record_change(b"del", &k, None);
+            self.reindex_key(&k);
+            self.propagate(&[b"DEL".to_vec(), k]);
+        }
+        if let Some(a) = self.aof.as_mut() {
+            a.maybe_fsync();
+        }
+        n
+    }
+
+    /// Does this node currently OWN the slot for `key`? True when cluster mode
+    /// is off (single owner of everything). Used to keep a shard from serving
+    /// keys it merely holds a leftover/in-flight copy of (a failed or in-progress
+    /// migration) — only the slot owner answers for them.
+    fn owns_key(&self, key: &[u8]) -> bool {
+        match &self.cluster {
+            None => true,
+            Some(c) => {
+                let slot = commands::hash_slot(key) as usize;
+                c.owner[slot].as_deref() == Some(c.my_addr.as_str())
+            }
+        }
+    }
+
     /// Internal: compute this node's GEOSEARCH matches and return them as a flat
-    /// array of 4 bulks per hit (key, dist_m, lon, lat) for the coordinator to merge.
+    /// array of 4 bulks per hit (key, dist_m, lon, lat) for the coordinator to
+    /// merge. Only keys in slots THIS node owns are returned — a stale copy left
+    /// by a failed migration (or one still being copied) must not surface as a
+    /// duplicate or a ghost hit.
     fn handle_geosearch_shard(&mut self, id: u64, tokens: &[Vec<u8>]) {
         match commands::geosearch_collect(&mut self.db, tokens) {
             Ok((_, hits)) => {
                 let mut flat: Vec<Vec<u8>> = Vec::with_capacity(hits.len() * 4);
                 for (k, d, lon, lat) in hits {
+                    if !self.owns_key(&k) {
+                        continue;
+                    }
                     flat.push(resp::bulk_string(&k));
                     flat.push(resp::bulk_string(format!("{d}").as_bytes()));
                     flat.push(resp::bulk_string(format!("{lon}").as_bytes()));
@@ -1331,12 +1425,34 @@ impl Hub {
         }
     }
 
-    /// Internal: install a key/value/expire migrated from another node (the receive
-    /// side of slot migration). Reindexes geo + memory like any insert. Replies `:1`.
+    /// Internal: install a key/value/expire migrated from another node (the
+    /// receive side of slot migration). Made DURABLE and REPLICATED like any
+    /// client write — logged to the AOF and streamed to this node's replicas as
+    /// the reconstructed command — so a dst crash after migration can't lose the
+    /// keys, and the dst's replicas learn them. Also fires the changefeed +
+    /// secondary-index maintenance (region subscribers see arrivals, indexes
+    /// learn the key). Replies `:1`.
     fn handle_xrestore(&mut self, id: u64, tokens: &[Vec<u8>]) {
         match tokens.get(1).map(|p| rdb::restore_entry(p)) {
             Some(Ok((key, value, expire))) => {
-                self.db.insert_with_expire(key, value, expire);
+                self.db.insert_with_expire(key.clone(), value, expire);
+                self.db.resync_size(&key);
+                self.dirty_watchers(&key);
+                self.reindex_key(&key);
+                // Durability + replication: log/stream the deterministic form.
+                let expire = self.db.raw_expire(&key);
+                let entries = match self.db.get(&key) {
+                    Some(v) => aof::restore_entries(&key, v, expire),
+                    None => vec![],
+                };
+                for e in &entries {
+                    self.propagate(e);
+                }
+                // Changefeed: an arrival on this shard (region enter, prefix write).
+                self.emit_write_changes(&[b"GEOSET".to_vec(), key.clone()]);
+                if let Some(a) = self.aof.as_mut() {
+                    a.maybe_fsync();
+                }
                 self.send(id, resp::integer(1));
             }
             _ => self.send(id, resp::error("ERR bad XRESTORE payload")),
@@ -1373,10 +1489,16 @@ impl Hub {
     /// to every peer, merge the raw hits, then sort/count/format once. Peer calls
     /// are bounded by short timeouts (they run synchronously on the hub for now).
     fn cluster_geosearch(&mut self, tokens: &[Vec<u8>]) -> Vec<u8> {
-        let (q, mut hits) = match commands::geosearch_collect(&mut self.db, tokens) {
+        let (q, local) = match commands::geosearch_collect(&mut self.db, tokens) {
             Ok(v) => v,
             Err(e) => return e,
         };
+        // Only our OWNED matches (a leftover copy from a failed migration must
+        // not double-count).
+        let mut hits: Vec<commands::GeoHit> = local
+            .into_iter()
+            .filter(|(k, ..)| self.owns_key(k))
+            .collect();
         let shard = q.shard_query();
         let shard_args: Vec<&[u8]> = shard.iter().map(|t| t.as_slice()).collect();
         let parse = |b: &[u8]| std::str::from_utf8(b).ok().and_then(|s| s.parse().ok());
@@ -1391,6 +1513,10 @@ impl Hub {
                 ));
             }
         }
+        // Dedup by key (keep the nearest) so a key mid-migration — briefly held
+        // by two shards — appears once, at one position.
+        hits.sort_by(|a, b| a.0.cmp(&b.0).then(a.1.total_cmp(&b.1)));
+        hits.dedup_by(|a, b| a.0 == b.0);
         q.format(hits)
     }
 
@@ -1584,13 +1710,18 @@ impl Hub {
         let Some(c) = self.cluster.as_mut() else {
             return;
         };
+        let mut changed = false;
         for (start, end, owner, ep) in ranges {
             for slot in (start as usize)..=(end as usize).min(c.epoch.len() - 1) {
                 if ep > c.epoch[slot] {
                     c.owner[slot] = Some(owner.clone());
                     c.epoch[slot] = ep;
+                    changed = true;
                 }
             }
+        }
+        if changed {
+            c.persist(); // adopted topology survives a restart
         }
     }
 
@@ -1715,6 +1846,7 @@ impl Hub {
                     (Some(c), Some(s)) if s < commands::CLUSTER_SLOTS => {
                         c.owner[s] = Some(addr);
                         c.epoch[s] = ep;
+                        c.persist();
                         self.send(id, resp::simple_string("OK"));
                     }
                     (Some(_), _) => self.send(id, resp::error("ERR Invalid or out of range slot")),
@@ -1724,13 +1856,31 @@ impl Hub {
                     ),
                 }
             }
+            // CLUSTER FLUSHSLOT <slot> — internal: drop every local key in the
+            // slot (durably + replicated). The source calls this on the dst
+            // before a migration so leftovers from a previous FAILED attempt
+            // can't survive as zombies once the dst takes ownership.
+            Some(b"FLUSHSLOT") if tokens.len() == 3 => {
+                let slot = std::str::from_utf8(&tokens[2])
+                    .ok()
+                    .and_then(|s| s.trim().parse::<usize>().ok());
+                match slot {
+                    Some(s) if s < commands::CLUSTER_SLOTS => {
+                        let n = self.flush_slot(s);
+                        self.send(id, resp::integer(n));
+                    }
+                    _ => self.send(id, resp::error("ERR Invalid or out of range slot")),
+                }
+            }
             // CLUSTER MIGRATESLOT <slot> <dst-addr> — move every local key in the
-            // slot to dst, then hand it ownership locally. Two-phase for zero loss:
-            // copy all keys (XRESTORE) first; only on full success delete them here
-            // and flip ownership (a failed copy leaves source + ownership untouched;
-            // dst keeps harmless duplicates a retry overwrites). Run CLUSTER SETSLOT
-            // NODE on the other nodes to propagate ownership. Blocks the hub for the
-            // duration (operator action) — fine for now.
+            // slot to dst, then hand it ownership. Zero-loss two-phase, made
+            // crash-safe: purge any leftover copies on dst first (a prior failed
+            // attempt), copy all keys (XRESTORE — each durably logged+replicated
+            // on dst), fsync the dst before committing, then delete locals
+            // (each durably logged+replicated) and fsync BEFORE flipping
+            // ownership so a source crash can't leave the keys gone here while
+            // dst never persisted them. Run CLUSTER SETSLOT NODE on other nodes
+            // to propagate ownership (gossip also converges it).
             Some(b"MIGRATESLOT") if tokens.len() == 4 => {
                 let slot = std::str::from_utf8(&tokens[2])
                     .ok()
@@ -1748,16 +1898,22 @@ impl Hub {
                     self.send(id, resp::error("ERR can't MIGRATESLOT to self"));
                 } else {
                     let s = slot.unwrap();
+                    let slot_s = s.to_string();
                     let dumps: Vec<(Vec<u8>, Vec<u8>)> = self
                         .db
                         .entries()
                         .filter(|(k, _)| commands::hash_slot(k) as usize == s)
                         .map(|(k, v)| (k.clone(), rdb::dump_entry(k, v, self.db.raw_expire(k))))
                         .collect();
+                    // Phase 0: purge any zombies a prior failed attempt left.
+                    let purged =
+                        cluster_call_int(&dst, &[b"CLUSTER", b"FLUSHSLOT", slot_s.as_bytes()])
+                            .is_some();
                     // Phase 1: copy every key to dst (no deletes yet).
-                    let copied = dumps
-                        .iter()
-                        .all(|(_, p)| cluster_call_int(&dst, &[b"XRESTORE", p]) == Some(1));
+                    let copied = purged
+                        && dumps
+                            .iter()
+                            .all(|(_, p)| cluster_call_int(&dst, &[b"XRESTORE", p]) == Some(1));
                     if !copied {
                         self.send(
                             id,
@@ -1766,18 +1922,37 @@ impl Hub {
                             ),
                         );
                     } else {
-                        // Phase 2: commit — drop locals and hand dst the slot.
+                        // Ask dst to make its copies durable before we drop ours.
+                        let _ = cluster_call_int(&dst, &[b"CLUSTER", b"FSYNC"]);
+                        // Phase 2: commit — drop locals durably+replicated+coherent.
                         for (k, _) in &dumps {
+                            self.dirty_watchers(k);
                             self.db.remove(k);
+                            self.record_change(b"del", k, None);
+                            self.reindex_key(k);
+                            self.propagate(&[b"DEL".to_vec(), k.clone()]);
+                        }
+                        // The deletes must be durable before we stop owning the
+                        // slot: else a crash here loses them here AND dst owns.
+                        if let Some(a) = self.aof.as_mut() {
+                            a.fsync();
                         }
                         let ep = self.hlc_now();
                         if let Some(c) = self.cluster.as_mut() {
                             c.owner[s] = Some(dst);
                             c.epoch[s] = ep;
+                            c.persist();
                         }
                         self.send(id, resp::integer(dumps.len() as i64));
                     }
                 }
+            }
+            // CLUSTER FSYNC — internal: flush the AOF now (migration handshake).
+            Some(b"FSYNC") => {
+                if let Some(a) = self.aof.as_mut() {
+                    a.fsync();
+                }
+                self.send(id, resp::integer(1));
             }
             // CLUSTER REASSIGN <old-addr> <new-addr> — repoint every slot owned by
             // old to new in one shot. The sentinel broadcasts this after promoting a
@@ -1796,6 +1971,9 @@ impl Hub {
                                 c.epoch[s] = ep;
                                 n += 1;
                             }
+                        }
+                        if n > 0 {
+                            c.persist();
                         }
                         self.send(id, resp::integer(n));
                     }

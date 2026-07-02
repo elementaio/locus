@@ -375,6 +375,17 @@ pub fn finalize_rewrite(tmp: &str, path: &str, tail: &[u8]) -> io::Result<()> {
     Ok(())
 }
 
+/// Deterministic command(s) that rebuild `key` = `value` (+ absolute TTL) — the
+/// durable/replicable form of a migrated key, so slot migration flows through
+/// the same AOF + replication path as a client write instead of a raw insert.
+pub fn restore_entries(key: &[u8], value: &Value, expire: Option<u64>) -> Vec<Vec<Vec<u8>>> {
+    let mut cmds = reconstruct(key, value);
+    if let Some(t) = expire {
+        cmds.push(pexpireat(key, t));
+    }
+    cmds
+}
+
 fn reconstruct(key: &[u8], value: &Value) -> Vec<Vec<Vec<u8>>> {
     let k = key.to_vec();
     match value {

@@ -2426,6 +2426,74 @@ fn cluster_migrateslot_moves_keys_zero_loss() {
 }
 
 #[test]
+fn cluster_migrated_keys_survive_a_destination_restart() {
+    // Migration durability (T3-5): a key moved into a shard is logged to that
+    // shard's AOF, so a dst crash after the migration doesn't lose it. Topology
+    // is re-learned from the surviving source's gossip after restart.
+    let (p1, p2) = (free_port(), free_port());
+    let nodes = format!("127.0.0.1:{p1} 0-8191;127.0.0.1:{p2} 8192-16383");
+    let aof2 = format!(
+        "{}/locus-migdur-{}-{}.aof",
+        std::env::temp_dir().display(),
+        std::process::id(),
+        p2
+    );
+    let _ = std::fs::remove_file(&aof2);
+    let env2: &[(&str, &str)] = &[("LOCUS_AOF", aof2.as_str())];
+    let mut n1 = spawn_cluster_node(p1, &nodes);
+    let mut n2 = spawn_cluster_node_env(p2, &nodes, env2);
+    let mut c1 = conn_to(p1);
+    let mut c2 = conn_to(p2);
+
+    // A node1-owned key, migrated to node2 (which has AOF on).
+    let (mut k, mut slot) = (String::new(), 0i64);
+    for i in 0..300 {
+        let key = format!("d{i}");
+        let s: i64 = c1.cmd(&["CLUSTER", "KEYSLOT", &key]).parse().unwrap();
+        if s <= 8191 {
+            k = key;
+            slot = s;
+            break;
+        }
+    }
+    c1.cmd(&["SET", &k, "durable"]);
+    let dst = format!("127.0.0.1:{p2}");
+    let moved: i64 = c1
+        .cmd(&["CLUSTER", "MIGRATESLOT", &slot.to_string(), &dst])
+        .parse()
+        .unwrap();
+    assert!(moved >= 1);
+    c2.cmd(&["CLUSTER", "SETSLOT", &slot.to_string(), "NODE", &dst]);
+    assert_eq!(c2.cmd(&["GET", &k]), "durable");
+
+    // kill -9 node2 and restart it on the same AOF. Its topology reverts to env
+    // (node1 owns the slot) but node1's gossip re-teaches it that it owns the
+    // migrated slot; the migrated key must still be present from the AOF.
+    n2.kill().unwrap();
+    let _ = n2.wait();
+    let mut n2b = spawn_cluster_node_env(p2, &nodes, env2);
+    let mut c2b = conn_to(p2);
+    let deadline = Instant::now() + Duration::from_secs(5);
+    loop {
+        let r = c2b.cmd(&["GET", &k]);
+        if r == "durable" {
+            break; // gossip re-taught ownership + AOF preserved the value
+        }
+        assert!(
+            Instant::now() < deadline,
+            "migrated key lost or ownership never reconverged: {r}"
+        );
+        sleep(Duration::from_millis(150));
+    }
+
+    let _ = n1.kill();
+    let _ = n1.wait();
+    let _ = n2b.kill();
+    let _ = n2b.wait();
+    let _ = std::fs::remove_file(&aof2);
+}
+
+#[test]
 fn cluster_reassign_repoints_a_nodes_slots() {
     let (p1, p2) = (free_port(), free_port());
     // node1 owns 0-8191, node2 owns 8192-16383. Only node1 is run here; REASSIGN
