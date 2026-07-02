@@ -52,54 +52,105 @@ fn read_count(buf: &[u8], pos: usize) -> Count {
     }
 }
 
+/// Resumable validation state for one in-progress multibulk command. The reader
+/// keeps one per connection so re-checking an incomplete command after each read
+/// costs O(new bytes), not a re-scan (and re-copy) of the whole prefix — without
+/// it, dribbling a huge multibulk in makes parsing O(N²) and pins a core.
+///
+/// Invariants the caller upholds: between `Incomplete` results the buffer is
+/// only APPENDED to; after `Complete`/`Error` the cursor is reset (the parser
+/// does this itself) and the consumed bytes may be drained.
+#[derive(Default)]
+pub struct Cursor {
+    total: Option<i64>, // multibulk arg count, once its header line is complete
+    done: i64,          // args fully validated so far
+    pos: usize,         // byte offset where the next unvalidated element starts
+}
+
 /// Try to parse exactly one command from the front of `buf`.
 pub fn parse_command(buf: &[u8]) -> Parsed {
+    parse_command_cursor(buf, &mut Cursor::default())
+}
+
+/// [`parse_command`] with resumable state: validation progress survives an
+/// `Incomplete` result, so the next call (after more bytes arrive) picks up
+/// where this one stopped. Two phases: an arithmetic-only scan that validates
+/// framing without copying, then — only once the whole command is present — one
+/// pass that materializes the tokens.
+pub fn parse_command_cursor(buf: &[u8], cur: &mut Cursor) -> Parsed {
     if buf.is_empty() {
         return Parsed::Incomplete;
     }
     if buf[0] != b'*' {
         return parse_inline(buf);
     }
-    let (count, mut pos) = match read_count(buf, 0) {
-        Count::Ok(n, p) => (n, p),
-        Count::Incomplete => return Parsed::Incomplete,
-        Count::Bad => return Parsed::Error("invalid multibulk length".into()),
+    let fail = |cur: &mut Cursor, msg: &str| {
+        *cur = Cursor::default();
+        Parsed::Error(msg.into())
     };
-    if count <= 0 {
-        return Parsed::Complete(Vec::new(), pos);
-    }
-    if count > MAX_ARRAY {
-        return Parsed::Error("invalid multibulk length".into());
-    }
-    let mut tokens: Vec<Vec<u8>> = Vec::with_capacity((count as usize).min(ALLOC_CAP));
-    for _ in 0..count {
-        if pos >= buf.len() {
+    let total = match cur.total {
+        Some(t) => t,
+        None => match read_count(buf, 0) {
+            Count::Ok(n, p) => {
+                if n <= 0 {
+                    return Parsed::Complete(Vec::new(), p);
+                }
+                if n > MAX_ARRAY {
+                    return fail(cur, "invalid multibulk length");
+                }
+                cur.total = Some(n);
+                cur.pos = p;
+                n
+            }
+            Count::Incomplete => return Parsed::Incomplete,
+            Count::Bad => return fail(cur, "invalid multibulk length"),
+        },
+    };
+    while cur.done < total {
+        if cur.pos >= buf.len() {
             return Parsed::Incomplete;
         }
-        if buf[pos] != b'$' {
-            return Parsed::Error(format!("expected '$', got '{}'", buf[pos] as char));
+        if buf[cur.pos] != b'$' {
+            let msg = format!("expected '$', got '{}'", buf[cur.pos] as char);
+            *cur = Cursor::default();
+            return Parsed::Error(msg);
         }
-        let (len, after_len) = match read_count(buf, pos) {
+        let (len, after_len) = match read_count(buf, cur.pos) {
             Count::Ok(n, p) => (n, p),
             Count::Incomplete => return Parsed::Incomplete,
-            Count::Bad => return Parsed::Error("invalid bulk length".into()),
+            Count::Bad => return fail(cur, "invalid bulk length"),
         };
         if !(0..=MAX_BULK_LEN).contains(&len) {
-            return Parsed::Error("invalid bulk length".into());
+            return fail(cur, "invalid bulk length");
         }
         let len = len as usize;
         if after_len + len + 2 > buf.len() {
             return Parsed::Incomplete;
         }
-        let data = buf[after_len..after_len + len].to_vec();
-        let crlf_at = after_len + len;
-        if &buf[crlf_at..crlf_at + 2] != b"\r\n" {
-            return Parsed::Error("expected CRLF after bulk string".into());
+        if &buf[after_len + len..after_len + len + 2] != b"\r\n" {
+            return fail(cur, "expected CRLF after bulk string");
         }
-        tokens.push(data);
-        pos = crlf_at + 2;
+        cur.pos = after_len + len + 2;
+        cur.done += 1;
     }
-    Parsed::Complete(tokens, pos)
+    // Fully validated: materialize the tokens in one pass. The re-walk is header
+    // jumps only (offsets computed from the declared lengths), so it's O(args).
+    let consumed = cur.pos;
+    let mut tokens: Vec<Vec<u8>> = Vec::with_capacity((total as usize).min(ALLOC_CAP));
+    let mut pos = match read_count(buf, 0) {
+        Count::Ok(_, p) => p,
+        _ => return fail(cur, "internal parse inconsistency"), // validated above
+    };
+    for _ in 0..total {
+        let (len, after_len) = match read_count(buf, pos) {
+            Count::Ok(n, p) => (n as usize, p),
+            _ => return fail(cur, "internal parse inconsistency"), // validated above
+        };
+        tokens.push(buf[after_len..after_len + len].to_vec());
+        pos = after_len + len + 2;
+    }
+    *cur = Cursor::default();
+    Parsed::Complete(tokens, consumed)
 }
 
 fn parse_inline(buf: &[u8]) -> Parsed {
@@ -332,6 +383,82 @@ mod tests {
                     consumed > 0 && consumed <= buf.len(),
                     "consumed {consumed} out of bounds for {buf:?}"
                 );
+            }
+        }
+    }
+
+    #[test]
+    fn cursor_resumes_and_matches_one_shot_parse() {
+        // Feeding a command byte-by-byte through one cursor must land on exactly
+        // the one-shot result, with validation progress carried between calls.
+        let full = b"*3\r\n$3\r\nSET\r\n$3\r\nfoo\r\n$3\r\nbar\r\n";
+        let mut cur = Cursor::default();
+        for i in 0..full.len() {
+            assert!(matches!(
+                parse_command_cursor(&full[..i], &mut cur),
+                Parsed::Incomplete
+            ));
+        }
+        match parse_command_cursor(full, &mut cur) {
+            Parsed::Complete(tokens, n) => {
+                assert_eq!(
+                    tokens,
+                    vec![b"SET".to_vec(), b"foo".to_vec(), b"bar".to_vec()]
+                );
+                assert_eq!(n, full.len());
+            }
+            other => panic!("expected Complete, got {other:?}"),
+        }
+        // The cursor reset on Complete: it can parse a second command cleanly.
+        match parse_command_cursor(b"*1\r\n$4\r\nPING\r\n", &mut cur) {
+            Parsed::Complete(tokens, _) => assert_eq!(tokens, vec![b"PING".to_vec()]),
+            other => panic!("expected Complete, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn fuzz_cursor_incremental_matches_one_shot() {
+        // For random buffers, incrementally feeding prefixes through a cursor
+        // must classify the full buffer identically to the stateless parser.
+        let mut state: u64 = 0x1234_5678_9abc_def0;
+        let mut rng = || {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            state
+        };
+        for _ in 0..20_000 {
+            let len = (rng() % 64) as usize;
+            let buf: Vec<u8> = (0..len)
+                .map(|_| match rng() % 8 {
+                    0 => b'*',
+                    1 => b'$',
+                    2 => b'\r',
+                    3 => b'\n',
+                    4 | 5 => b"0123456789"[(rng() % 10) as usize],
+                    _ => (rng() % 256) as u8,
+                })
+                .collect();
+            let mut cur = Cursor::default();
+            let mut incremental = Parsed::Incomplete;
+            for i in 1..=buf.len() {
+                incremental = parse_command_cursor(&buf[..i], &mut cur);
+                if !matches!(incremental, Parsed::Incomplete) {
+                    break;
+                }
+            }
+            let one_shot = parse_command(&buf);
+            match (&incremental, &one_shot) {
+                (Parsed::Complete(a, n), Parsed::Complete(b, m)) => {
+                    assert_eq!(a, b);
+                    assert_eq!(n, m);
+                }
+                (Parsed::Error(_), Parsed::Error(_)) => {}
+                // One-shot may see an error only visible past the point where
+                // incremental completed a shorter prefix — impossible here since
+                // both scan from offset 0; require the same classification.
+                (Parsed::Incomplete, Parsed::Incomplete) => {}
+                (a, b) => panic!("incremental {a:?} != one-shot {b:?} for {buf:?}"),
             }
         }
     }

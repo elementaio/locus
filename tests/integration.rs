@@ -728,6 +728,94 @@ fn pubsub_delivers_to_subscribers() {
     assert_eq!(sub.read_reply(), "[message, ch, hello]");
 }
 
+// === resource limits (output buffer / query buffer / hub backpressure) ======
+
+#[test]
+fn slow_pubsub_consumer_is_disconnected_not_oom() {
+    // Tiny pubsub output cap: a subscriber that stops reading must be dropped
+    // once its queued bytes exceed the cap, instead of growing server memory.
+    let s = Server::start_inner(&[("LOCUS_OUTBUF_PUBSUB", "64kb")]);
+    let mut stalled = s.connect();
+    assert_eq!(
+        stalled.cmd(&["SUBSCRIBE", "flood"]),
+        "[subscribe, flood, 1]"
+    );
+    // From here on the subscriber never reads — its queue can only grow.
+
+    let mut publisher = s.connect();
+    let payload = "x".repeat(4096);
+    for _ in 0..200 {
+        // Publishing must keep succeeding regardless of the stalled subscriber.
+        let n = publisher.cmd(&["PUBLISH", "flood", &payload]);
+        assert!(n == "0" || n == "1", "PUBLISH failed: {n}");
+    }
+    // The hub shuts the slow consumer's socket; once its reader files the
+    // disconnect, the channel has no subscribers left.
+    let deadline = Instant::now() + Duration::from_secs(5);
+    loop {
+        let numsub = publisher.cmd(&["PUBSUB", "NUMSUB", "flood"]);
+        if numsub.contains(", 0") {
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "slow consumer never dropped: {numsub}"
+        );
+        sleep(Duration::from_millis(50));
+    }
+    assert_eq!(publisher.cmd(&["PING"]), "PONG"); // server healthy throughout
+}
+
+#[test]
+fn query_buffer_limit_closes_oversized_command() {
+    // A client dribbling one huge command may buffer at most the query-buffer
+    // limit; past it the server replies with a protocol error and disconnects.
+    let s = Server::start_inner(&[("LOCUS_QUERYBUF_LIMIT", "128kb")]);
+    let mut c = s.connect();
+    let mut buf = b"*3\r\n$3\r\nSET\r\n$1\r\nk\r\n$524288\r\n".to_vec(); // declares 512 KiB
+    buf.extend(vec![b'x'; 200_000]); // over the 128 KiB cap, still incomplete
+    c.stream.write_all(&buf).unwrap();
+    let reply = c.read_reply();
+    assert!(
+        reply.contains("query buffer"),
+        "expected query-buffer error, got: {reply}"
+    );
+    // The connection is then closed (EOF, possibly after a reset).
+    let mut tmp = [0u8; 16];
+    let n = c.stream.read(&mut tmp).unwrap_or(0);
+    assert_eq!(n, 0, "connection should be closed after the limit error");
+    // And the server is unharmed.
+    let mut c2 = s.connect();
+    assert_eq!(c2.cmd(&["PING"]), "PONG");
+}
+
+#[test]
+fn bounded_hub_queue_backpressures_pipeline_without_loss() {
+    // With a tiny hub input queue, a huge one-shot pipeline must still execute
+    // fully and in order — producers block (backpressure), nothing is dropped.
+    let s = Server::start_inner(&[("LOCUS_HUB_QUEUE", "64")]);
+    let mut c = s.connect();
+    let mut buf = Vec::new();
+    for i in 0..10_000 {
+        let (k, v) = (format!("k{i}"), format!("v{i}"));
+        buf.extend_from_slice(
+            format!(
+                "*3\r\n$3\r\nSET\r\n${}\r\n{}\r\n${}\r\n{}\r\n",
+                k.len(),
+                k,
+                v.len(),
+                v
+            )
+            .as_bytes(),
+        );
+    }
+    c.stream.write_all(&buf).unwrap();
+    for i in 0..10_000 {
+        assert_eq!(c.read_reply(), "OK", "SET #{i} failed");
+    }
+    assert_eq!(c.cmd(&["GET", "k9999"]), "v9999");
+}
+
 // === blocking XREAD =========================================================
 
 #[test]

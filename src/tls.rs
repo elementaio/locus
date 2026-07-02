@@ -16,6 +16,7 @@
 
 use std::io::{self, Read, Write};
 use std::net::TcpStream;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, mpsc};
 use std::time::Duration;
 
@@ -24,7 +25,7 @@ use rustls::pki_types::{
 };
 use rustls::{ServerConfig, ServerConnection, StreamOwned};
 
-use crate::{Dispatch, Msg, dispatch_commands, log};
+use crate::{Dispatch, Msg, OutBytes, dispatch_commands, log, query_buf_limit, resp};
 
 /// Build a rustls server config from the PEM cert/key named by LOCUS_TLS_CERT /
 /// LOCUS_TLS_KEY. Returns a human error (logged by the caller) on any problem.
@@ -52,7 +53,7 @@ pub fn server_config() -> Result<Arc<ServerConfig>, String> {
 pub fn handle_tls_conn(
     tcp: TcpStream,
     id: u64,
-    tx: mpsc::Sender<Msg>,
+    tx: mpsc::SyncSender<Msg>,
     config: Arc<ServerConfig>,
 ) -> io::Result<()> {
     let peer = tcp.peer_addr()?;
@@ -60,15 +61,19 @@ pub fn handle_tls_conn(
     let _ = tcp.set_nodelay(true);
     // A short read timeout lets us interleave reply/push draining with reads.
     let _ = tcp.set_read_timeout(Some(Duration::from_millis(50)));
+    let kill = tcp.try_clone().ok(); // hub-held handle to force-disconnect
     let conn = ServerConnection::new(config).map_err(io::Error::other)?;
     let mut tls = StreamOwned::new(conn, tcp);
 
-    let (out_tx, out_rx) = mpsc::channel::<Vec<u8>>();
+    let (out_tx, out_rx) = mpsc::channel::<OutBytes>();
+    let queued = Arc::new(AtomicUsize::new(0));
     if tx
         .send(Msg::Connect {
             id,
             out: out_tx.clone(),
             loopback: is_loopback,
+            queued: queued.clone(),
+            kill,
         })
         .is_err()
     {
@@ -77,13 +82,17 @@ pub fn handle_tls_conn(
     log::debug(&format!("tls client connected: {peer}"));
 
     let mut inbuf: Vec<u8> = Vec::new();
+    let mut cursor = resp::Cursor::default();
     let mut chunk = [0u8; 4096];
+    let querybuf_max = query_buf_limit();
     'main: loop {
         // 1. Flush replies / server-initiated pushes (non-blocking).
         loop {
             match out_rx.try_recv() {
                 Ok(b) => {
-                    if tls.write_all(&b).is_err() {
+                    let ok = tls.write_all(&b).is_ok();
+                    queued.fetch_sub(b.len(), Ordering::Relaxed);
+                    if !ok {
                         break 'main;
                     }
                 }
@@ -98,11 +107,17 @@ pub fn handle_tls_conn(
             Ok(0) => break,
             Ok(n) => {
                 inbuf.extend_from_slice(&chunk[..n]);
-                match dispatch_commands(&mut inbuf, id, &tx) {
+                if inbuf.len() > querybuf_max {
+                    let _ = tls.write_all(&crate::resp::error(
+                        "ERR Protocol error: query buffer exceeds the client-query-buffer limit",
+                    ));
+                    break;
+                }
+                match dispatch_commands(&mut inbuf, id, &tx, &mut cursor) {
                     Dispatch::Ok { dispatched } => {
                         // Deliver this batch's replies promptly (hub round-trip is
                         // ~µs) rather than waiting for the next poll tick.
-                        if dispatched && !drain_replies(&out_rx, &mut tls) {
+                        if dispatched && !drain_replies(&out_rx, &queued, &mut tls) {
                             break;
                         }
                     }
@@ -131,12 +146,15 @@ pub fn handle_tls_conn(
 /// rest. Returns false if the socket died. (Every client command replies, so the
 /// timeout is a safety cap, not the common path.)
 fn drain_replies(
-    out_rx: &mpsc::Receiver<Vec<u8>>,
+    out_rx: &mpsc::Receiver<OutBytes>,
+    queued: &AtomicUsize,
     tls: &mut StreamOwned<ServerConnection, TcpStream>,
 ) -> bool {
     match out_rx.recv_timeout(Duration::from_millis(250)) {
         Ok(b) => {
-            if tls.write_all(&b).is_err() {
+            let ok = tls.write_all(&b).is_ok();
+            queued.fetch_sub(b.len(), Ordering::Relaxed);
+            if !ok {
                 return false;
             }
         }
@@ -144,7 +162,9 @@ fn drain_replies(
         Err(mpsc::RecvTimeoutError::Disconnected) => return false,
     }
     while let Ok(b) = out_rx.try_recv() {
-        if tls.write_all(&b).is_err() {
+        let ok = tls.write_all(&b).is_ok();
+        queued.fetch_sub(b.len(), Ordering::Relaxed);
+        if !ok {
             return false;
         }
     }

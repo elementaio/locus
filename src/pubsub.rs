@@ -4,9 +4,12 @@
 //! writer thread); PUBLISH routes a message to every subscriber's channel.
 
 use std::collections::{HashMap, HashSet};
-use std::sync::mpsc::Sender;
+use std::sync::Arc;
 
 use crate::resp::bulk_string;
+
+/// An encoded push frame shared across every subscriber it's delivered to.
+pub type Frame = Arc<Vec<u8>>;
 
 pub struct PubSub {
     channels: HashMap<Vec<u8>, HashSet<u64>>, // channel -> subscriber ids
@@ -104,41 +107,44 @@ impl PubSub {
         self.counts.remove(&id);
     }
 
-    /// Deliver to channel subscribers and matching pattern subscribers; returns
-    /// how many clients received it.
-    pub fn publish(
+    /// The `(subscriber, frame)` deliveries for a publish: channel subscribers
+    /// plus matching pattern subscribers. Each frame is encoded ONCE per RESP
+    /// proto in use and shared via `Arc` — never re-encoded per subscriber, so
+    /// a large payload with many subscribers costs one allocation, not O(subs),
+    /// on the single-threaded hub.
+    pub fn deliveries(
         &self,
         channel: &[u8],
         payload: &[u8],
-        clients: &HashMap<u64, Sender<Vec<u8>>>,
         protos: &HashMap<u64, u8>,
-    ) -> i64 {
-        let mut n = 0i64;
+    ) -> Vec<(u64, Frame)> {
         let proto_of = |id: &u64| protos.get(id).copied().unwrap_or(2);
+        let mut out: Vec<(u64, Frame)> = Vec::new();
         if let Some(subs) = self.channels.get(channel) {
+            let (mut m2, mut m3): (Option<Frame>, Option<Frame>) = (None, None);
             for id in subs {
-                // Encode per subscriber so RESP3 clients get a push frame.
-                if let Some(out) = clients.get(id)
-                    && out.send(message(channel, payload, proto_of(id))).is_ok()
-                {
-                    n += 1;
-                }
+                let frame = if proto_of(id) >= 3 {
+                    m3.get_or_insert_with(|| Arc::new(message(channel, payload, 3)))
+                } else {
+                    m2.get_or_insert_with(|| Arc::new(message(channel, payload, 2)))
+                };
+                out.push((*id, frame.clone()));
             }
         }
         for (pat, subs) in &self.patterns {
             if glob_match(pat, channel) {
+                let (mut m2, mut m3): (Option<Frame>, Option<Frame>) = (None, None);
                 for id in subs {
-                    if let Some(out) = clients.get(id)
-                        && out
-                            .send(pmessage(pat, channel, payload, proto_of(id)))
-                            .is_ok()
-                    {
-                        n += 1;
-                    }
+                    let frame = if proto_of(id) >= 3 {
+                        m3.get_or_insert_with(|| Arc::new(pmessage(pat, channel, payload, 3)))
+                    } else {
+                        m2.get_or_insert_with(|| Arc::new(pmessage(pat, channel, payload, 2)))
+                    };
+                    out.push((*id, frame.clone()));
                 }
             }
         }
-        n
+        out
     }
 
     pub fn active_channels(&self) -> Vec<Vec<u8>> {

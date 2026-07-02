@@ -51,11 +51,43 @@ const REPL_BACKLOG_MAX: usize = 4 * 1024 * 1024;
 /// set). Mirrors Redis's protected-mode guidance.
 const PROTECTED_MODE_MSG: &str = "DENIED Locus is running in protected mode because protected mode is enabled and no password is set. To use Locus from a non-loopback address, set a password (LOCUS_REQUIREPASS / requirepass), or disable protected mode with LOCUS_PROTECTED_MODE=no — only on a trusted network or behind TLS.";
 
+/// Bytes queued for a client's writer: either owned by this client or shared
+/// (one encode, many subscribers — pub/sub, changefeed, replication fan-out).
+pub(crate) enum OutBytes {
+    One(Vec<u8>),
+    Shared(Arc<Vec<u8>>),
+}
+
+impl OutBytes {
+    fn as_slice(&self) -> &[u8] {
+        match self {
+            OutBytes::One(v) => v,
+            OutBytes::Shared(a) => a,
+        }
+    }
+    pub(crate) fn len(&self) -> usize {
+        self.as_slice().len()
+    }
+}
+
+impl std::ops::Deref for OutBytes {
+    type Target = [u8];
+    fn deref(&self) -> &[u8] {
+        self.as_slice()
+    }
+}
+
 enum Msg {
     Connect {
         id: u64,
-        out: mpsc::Sender<Vec<u8>>,
+        out: mpsc::Sender<OutBytes>,
         loopback: bool,
+        /// Bytes queued to this client's writer but not yet written (the writer
+        /// subtracts as it drains) — drives the output-buffer limit.
+        queued: Arc<AtomicUsize>,
+        /// Raw socket handle so the hub can force-disconnect a slow consumer
+        /// (shutdown unblocks both the reader and a mid-write writer).
+        kill: Option<TcpStream>,
     },
     Command {
         id: u64,
@@ -149,7 +181,15 @@ fn main() -> io::Result<()> {
     if std::env::var("LOCUS_SENTINEL").is_ok_and(|v| !v.is_empty()) {
         return sentinel::run();
     }
-    let (tx, rx) = mpsc::channel::<Msg>();
+    // Bounded hub input: when the single hub can't keep up, tx.send blocks the
+    // producing reader thread (per-connection backpressure) instead of letting
+    // one fast pipeliner grow the queue without bound and OOM the process.
+    let hub_queue: usize = std::env::var("LOCUS_HUB_QUEUE")
+        .ok()
+        .and_then(|s| s.trim().parse().ok())
+        .filter(|&n| n > 0)
+        .unwrap_or(65_536);
+    let (tx, rx) = mpsc::sync_channel::<Msg>(hub_queue);
     let hub_tx = tx.clone();
     thread::spawn(move || run_hub(rx, hub_tx));
     install_signal_handlers();
@@ -243,7 +283,7 @@ impl Drop for ConnGuard {
 #[cfg(feature = "tls")]
 fn spawn_tls_listener(
     bind: &str,
-    tx: &mpsc::Sender<Msg>,
+    tx: &mpsc::SyncSender<Msg>,
     conns: &Arc<AtomicUsize>,
     next_id: &Arc<AtomicU64>,
     max_clients: usize,
@@ -417,6 +457,43 @@ fn parse_slot_range(s: &str) -> Option<(u16, u16)> {
 
 // === the hub ================================================================
 
+/// A connected client's output path: its writer channel, the shared count of
+/// queued-but-unwritten bytes, a "stop sending" flag set when the client blows
+/// its output-buffer limit, and the socket handle used to force-disconnect it.
+struct OutChan {
+    tx: mpsc::Sender<OutBytes>,
+    queued: Arc<AtomicUsize>,
+    doomed: AtomicBool,
+    kill: Option<TcpStream>,
+}
+
+/// Per-class output-buffer caps in bytes (0 = unlimited). A client whose queued
+/// bytes exceed its cap is disconnected — one stalled subscriber/replica must
+/// never grow server memory without bound. Defaults mirror Redis's hard limits:
+/// normal 0 (replies are demand-driven and bounded by input backpressure),
+/// replica 256mb, pubsub (incl. changefeed) 32mb.
+struct OutLimits {
+    normal: usize,
+    replica: usize,
+    pubsub: usize,
+}
+
+impl OutLimits {
+    fn from_env() -> OutLimits {
+        let get = |var: &str, default: usize| {
+            std::env::var(var)
+                .ok()
+                .and_then(|s| parse_mem(&s))
+                .unwrap_or(default)
+        };
+        OutLimits {
+            normal: get("LOCUS_OUTBUF_NORMAL", 0),
+            replica: get("LOCUS_OUTBUF_REPLICA", 256 * 1024 * 1024),
+            pubsub: get("LOCUS_OUTBUF_PUBSUB", 32 * 1024 * 1024),
+        }
+    }
+}
+
 struct Hub {
     db: Db,
     // cluster routing topology (None = cluster mode off)
@@ -426,13 +503,14 @@ struct Hub {
     // Some(buf) while an async BGREWRITEAOF runs: captures writes that land
     // during the rewrite so they can be folded into the new file (no loss).
     aof_rewrite_buf: Option<Vec<u8>>,
-    clients: HashMap<u64, mpsc::Sender<Vec<u8>>>,
+    clients: HashMap<u64, OutChan>,
+    outbuf: OutLimits,
     pubsub: PubSub,
     // replication
     replicas: HashSet<u64>,           // client ids receiving our write stream
     master: Option<(String, String)>, // (host, port) if we are a replica
     replica_stop: Option<Arc<AtomicBool>>,
-    tx: mpsc::Sender<Msg>, // so we can spawn a replica sync thread
+    tx: mpsc::SyncSender<Msg>, // so we can spawn a replica sync thread
     // transactions
     txs: HashMap<u64, TxState>,
     watched_keys: HashMap<Vec<u8>, HashSet<u64>>,
@@ -575,7 +653,7 @@ struct TxState {
 }
 
 impl Hub {
-    fn new(tx: mpsc::Sender<Msg>) -> Hub {
+    fn new(tx: mpsc::SyncSender<Msg>) -> Hub {
         let aof_path = aof::configured_path();
         let (db, aof, extras) = match &aof_path {
             Some(path) => {
@@ -609,6 +687,7 @@ impl Hub {
             aof_path,
             aof_rewrite_buf: None,
             clients: HashMap::new(),
+            outbuf: OutLimits::from_env(),
             pubsub: PubSub::new(),
             replicas: HashSet::new(),
             master: None,
@@ -770,8 +849,52 @@ impl Hub {
     }
 
     fn send(&self, id: u64, bytes: Vec<u8>) {
-        if let Some(out) = self.clients.get(&id) {
-            let _ = out.send(bytes);
+        self.send_out(id, OutBytes::One(bytes));
+    }
+
+    /// Send an already-shared frame (pub/sub, changefeed, replication fan-out) —
+    /// one encode + one allocation regardless of the subscriber count.
+    fn send_shared(&self, id: u64, bytes: Arc<Vec<u8>>) {
+        self.send_out(id, OutBytes::Shared(bytes));
+    }
+
+    /// Queue bytes to a client's writer, enforcing its class's output-buffer
+    /// limit. A client over the cap is a slow consumer whose queue would grow
+    /// without bound: stop sending to it and shut its socket down (both its
+    /// threads unblock; the reader files the Disconnect that cleans it up).
+    fn send_out(&self, id: u64, bytes: OutBytes) {
+        let Some(out) = self.clients.get(&id) else {
+            return;
+        };
+        if out.doomed.load(Ordering::Relaxed) {
+            return;
+        }
+        let n = bytes.len();
+        let queued = out.queued.fetch_add(n, Ordering::Relaxed) + n;
+        let limit = self.outbuf_limit(id);
+        if limit > 0 && queued > limit {
+            out.queued.fetch_sub(n, Ordering::Relaxed);
+            out.doomed.store(true, Ordering::Relaxed);
+            if let Some(k) = &out.kill {
+                let _ = k.shutdown(std::net::Shutdown::Both);
+            }
+            log::warn(&format!(
+                "client {id} disconnected: output buffer over limit ({queued} > {limit} bytes) — slow consumer"
+            ));
+            return;
+        }
+        let _ = out.tx.send(bytes);
+    }
+
+    /// The output-buffer cap that applies to this client right now: replicas
+    /// get the replica cap; pub/sub + changefeed subscribers the pubsub cap.
+    fn outbuf_limit(&self, id: u64) -> usize {
+        if self.replicas.contains(&id) {
+            self.outbuf.replica
+        } else if self.pubsub.total(id) > 0 || self.changefeeds.contains_key(&id) {
+            self.outbuf.pubsub
+        } else {
+            self.outbuf.normal
         }
     }
 
@@ -1930,9 +2053,16 @@ impl Hub {
                         resp::error("ERR wrong number of arguments for 'publish' command"),
                     );
                 }
-                let n = self
-                    .pubsub
-                    .publish(&tokens[1], &tokens[2], &self.clients, &self.protos);
+                // Frames are encoded once per RESP proto in use and shared
+                // across subscribers (no per-subscriber re-encode on the hub).
+                let deliveries = self.pubsub.deliveries(&tokens[1], &tokens[2], &self.protos);
+                let mut n = 0i64;
+                for (cid, frame) in deliveries {
+                    if self.clients.contains_key(&cid) {
+                        self.send_shared(cid, frame);
+                        n += 1;
+                    }
+                }
                 self.send(id, resp::integer(n));
             }
             b"PUBSUB" => self.handle_pubsub_introspect(id, &tokens),
@@ -2290,17 +2420,20 @@ impl Hub {
                 Some(v) => resp::bulk_string(v),
                 None => resp::null_bulk(),
             };
-            let msg = resp::array(&[
+            // One shared frame for every prefix subscriber.
+            let msg = Arc::new(resp::array(&[
                 resp::bulk_string(b"cdc-change"),
                 resp::integer(offset as i64),
                 resp::bulk_string(event),
                 resp::bulk_string(key),
                 val,
-            ]);
+            ]));
             let mut has_region = false;
             for (cid, filter) in &self.changefeeds {
                 match filter {
-                    CdcFilter::Prefix(p) if key.starts_with(p) => self.send(*cid, msg.clone()),
+                    CdcFilter::Prefix(p) if key.starts_with(p) => {
+                        self.send_shared(*cid, msg.clone())
+                    }
                     CdcFilter::Prefix(_) => {}
                     CdcFilter::Region { .. } => has_region = true,
                 }
@@ -3136,10 +3269,10 @@ impl Hub {
             self.repl_backlog.pop_front();
             self.repl_backlog_start += 1;
         }
-        for rid in self.replicas.iter() {
-            if let Some(out) = self.clients.get(rid) {
-                let _ = out.send(bytes.clone());
-            }
+        // One shared frame for every replica — no per-replica copy.
+        let shared = Arc::new(bytes);
+        for rid in &self.replicas {
+            self.send_shared(*rid, shared.clone());
         }
     }
 
@@ -3357,12 +3490,26 @@ fn slowlog_snapshot(tokens: &[Vec<u8>]) -> Vec<Vec<u8>> {
         .collect()
 }
 
-fn run_hub(rx: mpsc::Receiver<Msg>, tx: mpsc::Sender<Msg>) {
+fn run_hub(rx: mpsc::Receiver<Msg>, tx: mpsc::SyncSender<Msg>) {
     let mut hub = Hub::new(tx);
     loop {
         match rx.recv_timeout(Duration::from_millis(100)) {
-            Ok(Msg::Connect { id, out, loopback }) => {
-                hub.clients.insert(id, out);
+            Ok(Msg::Connect {
+                id,
+                out,
+                loopback,
+                queued,
+                kill,
+            }) => {
+                hub.clients.insert(
+                    id,
+                    OutChan {
+                        tx: out,
+                        queued,
+                        doomed: AtomicBool::new(false),
+                        kill,
+                    },
+                );
                 if loopback {
                     hub.loopback.insert(id);
                 }
@@ -3475,7 +3622,7 @@ fn parse_fullresync(line: &[u8]) -> (String, u64) {
 fn replica_sync(
     addr: String,
     masterauth: Option<Vec<u8>>,
-    hub_tx: mpsc::Sender<Msg>,
+    hub_tx: mpsc::SyncSender<Msg>,
     stop: Arc<AtomicBool>,
 ) {
     // Remembered (replid, processed-offset) so a reconnect can PSYNC for a partial
@@ -3500,7 +3647,7 @@ fn replica_sync(
 fn try_sync(
     addr: &str,
     masterauth: Option<&[u8]>,
-    hub_tx: &mpsc::Sender<Msg>,
+    hub_tx: &mpsc::SyncSender<Msg>,
     stop: &Arc<AtomicBool>,
     known: &mut Option<(String, u64)>,
 ) -> io::Result<()> {
@@ -3694,7 +3841,7 @@ fn cluster_gossip_peers_from_env() -> Option<Vec<String>> {
 /// to merge (adopt higher-epoch slot owners). Anti-entropy: topology changes
 /// converge without the operator pushing to every node. Each round is bounded by
 /// `cluster_call_array`'s timeouts; a down peer is skipped and retried next round.
-fn run_gossip(tx: mpsc::Sender<Msg>, peers: Vec<String>, interval: Duration) {
+fn run_gossip(tx: mpsc::SyncSender<Msg>, peers: Vec<String>, interval: Duration) {
     loop {
         thread::sleep(interval);
         for peer in &peers {
@@ -3869,12 +4016,18 @@ pub(crate) enum Dispatch {
 }
 
 /// Parse every complete command in `inbuf`, forward each to the hub, and drain
-/// what was consumed. O(batch), not O(batch^2), under heavy pipelining.
-pub(crate) fn dispatch_commands(inbuf: &mut Vec<u8>, id: u64, tx: &mpsc::Sender<Msg>) -> Dispatch {
+/// what was consumed. O(batch), not O(batch^2), under heavy pipelining — and,
+/// via `cursor`, O(new bytes) for a command still arriving across many reads.
+pub(crate) fn dispatch_commands(
+    inbuf: &mut Vec<u8>,
+    id: u64,
+    tx: &mpsc::SyncSender<Msg>,
+    cursor: &mut resp::Cursor,
+) -> Dispatch {
     let mut pos = 0;
     let mut dispatched = false;
     let result = loop {
-        match parse_command(&inbuf[pos..]) {
+        match resp::parse_command_cursor(&inbuf[pos..], cursor) {
             Parsed::Incomplete => break Dispatch::Ok { dispatched },
             Parsed::Error(msg) => {
                 break Dispatch::ProtocolError(resp::error(&format!("ERR Protocol error: {msg}")));
@@ -3896,7 +4049,21 @@ pub(crate) fn dispatch_commands(inbuf: &mut Vec<u8>, id: u64, tx: &mpsc::Sender<
     result
 }
 
-fn handle_conn(conn: TcpStream, id: u64, tx: mpsc::Sender<Msg>) -> io::Result<()> {
+/// Max bytes a connection may buffer while assembling one command
+/// (client-query-buffer-limit): a client dribbling a huge multibulk in can't
+/// hold unbounded memory pre-dispatch (and pre-AUTH). Default 1 GiB, as Redis.
+pub(crate) fn query_buf_limit() -> usize {
+    static LIMIT: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    *LIMIT.get_or_init(|| {
+        std::env::var("LOCUS_QUERYBUF_LIMIT")
+            .ok()
+            .and_then(|s| parse_mem(&s))
+            .filter(|&n| n > 0)
+            .unwrap_or(1 << 30)
+    })
+}
+
+fn handle_conn(conn: TcpStream, id: u64, tx: mpsc::SyncSender<Msg>) -> io::Result<()> {
     let peer = conn.peer_addr()?;
     let is_loopback = peer.ip().is_loopback();
     // Commands/replies are small — disable Nagle for latency. An optional idle
@@ -3908,15 +4075,23 @@ fn handle_conn(conn: TcpStream, id: u64, tx: mpsc::Sender<Msg>) -> io::Result<()
     log::debug(&format!("client connected: {peer}"));
 
     let mut write_half = conn.try_clone()?;
-    let (out_tx, out_rx) = mpsc::channel::<Vec<u8>>();
+    let kill = conn.try_clone().ok(); // hub-held handle to force-disconnect
+    let (out_tx, out_rx) = mpsc::channel::<OutBytes>();
+    let queued = Arc::new(AtomicUsize::new(0));
+    let wq = queued.clone();
     // Builder::spawn so hitting the process thread limit fails THIS connection
     // with an error instead of panicking the server.
     let writer = thread::Builder::new().spawn(move || {
         while let Ok(bytes) = out_rx.recv() {
-            if write_half.write_all(&bytes).is_err() {
+            let ok = write_half.write_all(&bytes).is_ok();
+            wq.fetch_sub(bytes.len(), Ordering::Relaxed);
+            if !ok {
                 break;
             }
         }
+        // The writer is this connection's only egress: once it stops (channel
+        // closed or write error) shut the socket down so the reader unblocks.
+        let _ = write_half.shutdown(std::net::Shutdown::Both);
     })?;
 
     if tx
@@ -3924,25 +4099,42 @@ fn handle_conn(conn: TcpStream, id: u64, tx: mpsc::Sender<Msg>) -> io::Result<()
             id,
             out: out_tx.clone(),
             loopback: is_loopback,
+            queued: queued.clone(),
+            kill,
         })
         .is_err()
     {
         return Ok(());
     }
 
+    // Direct-to-writer send (bypasses the hub), keeping the byte accounting the
+    // writer decrements in balance.
+    let push = |bytes: Vec<u8>| {
+        queued.fetch_add(bytes.len(), Ordering::Relaxed);
+        let _ = out_tx.send(OutBytes::One(bytes));
+    };
+
     let mut conn = conn;
     let mut inbuf: Vec<u8> = Vec::new();
+    let mut cursor = resp::Cursor::default();
     let mut chunk = [0u8; 4096];
+    let querybuf_max = query_buf_limit();
     loop {
         let n = match conn.read(&mut chunk) {
             Ok(0) | Err(_) => break,
             Ok(n) => n,
         };
         inbuf.extend_from_slice(&chunk[..n]);
-        match dispatch_commands(&mut inbuf, id, &tx) {
+        if inbuf.len() > querybuf_max {
+            push(resp::error(
+                "ERR Protocol error: query buffer exceeds the client-query-buffer limit",
+            ));
+            break;
+        }
+        match dispatch_commands(&mut inbuf, id, &tx, &mut cursor) {
             Dispatch::Ok { .. } => {}
             Dispatch::ProtocolError(e) => {
-                let _ = out_tx.send(e);
+                push(e);
                 break;
             }
             Dispatch::HubGone => break,
