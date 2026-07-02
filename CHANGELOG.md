@@ -6,6 +6,18 @@ All notable changes to Locus are documented here. The format is based on
 
 ## [Unreleased]
 
+## [0.5.1] — 2026-07-03
+
+Stream command parity — two standard Redis features go-redis emits that Locus rejected:
+
+- **`XADD key [MAXLEN [=|~] count] …`** — trims the oldest entries to `count` after appending
+  (both markers honored by exact trimming). Bounded streams without a separate `XTRIM` pass.
+- **`XRANGE`/`XREVRANGE` `(id` exclusive bounds** — `(N-M` excludes that id, the cursor-paging idiom
+  ("everything after this id").
+
+Both surfaced building a bounded, cursor-paged event log on top of Locus; they make real stream
+clients work unmodified.
+
 ## [0.5.0] — 2026-07-02
 
 **The disk tier: RAM is for LIVE data.** New `TIER key` moves a key's value into a segmented,
