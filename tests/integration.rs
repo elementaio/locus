@@ -2126,6 +2126,45 @@ fn spawn_cluster_node(port: u16, nodes: &str) -> Child {
     spawn_cluster_node_cells(port, nodes, 0)
 }
 
+/// Spawn a cluster node with extra env (for cluster-secret / peer-timeout tests).
+fn spawn_cluster_node_env(port: u16, nodes: &str, extra: &[(&str, &str)]) -> Child {
+    let rdb = format!(
+        "{}/locus-clue-{}-{}.rdb",
+        std::env::temp_dir().display(),
+        std::process::id(),
+        port
+    );
+    let _ = std::fs::remove_file(&rdb);
+    let mut cmd = Command::new(env!("CARGO_BIN_EXE_locus"));
+    cmd.env("LOCUS_PORT", port.to_string())
+        .env("LOCUS_RDB", &rdb)
+        .env_remove("LOCUS_AOF")
+        .env("LOCUS_CLUSTER_ENABLED", "1")
+        .env("LOCUS_CLUSTER_ANNOUNCE", format!("127.0.0.1:{port}"))
+        .env("LOCUS_CLUSTER_NODES", nodes)
+        .env("LOCUS_CDC_MAXLEN", "1000")
+        .env("LOCUS_CLUSTER_GOSSIP_MS", "200")
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null());
+    for (k, v) in extra {
+        cmd.env(k, v);
+    }
+    let mut child = cmd.spawn().expect("spawn cluster node");
+    let mut reader = BufReader::new(child.stdout.take().unwrap());
+    loop {
+        let mut l = String::new();
+        assert!(reader.read_line(&mut l).unwrap() > 0, "node exited early");
+        if l.contains("listening on") {
+            break;
+        }
+    }
+    std::thread::spawn(move || {
+        let mut sink = Vec::new();
+        let _ = reader.read_to_end(&mut sink);
+    });
+    child
+}
+
 /// Spawn a cluster node on a fixed port with the given topology; wait until it
 /// listens. `cell_bits > 0` turns on cell-in-key sharding (bounded GEOSEARCH).
 fn spawn_cluster_node_cells(port: u16, nodes: &str, cell_bits: u32) -> Child {
@@ -2579,6 +2618,57 @@ fn cluster_cdcmerge_holds_watermark_for_downed_shard() {
         !r1.contains(late.as_str()),
         "late write must be held below the downed shard's watermark: {r1}"
     );
+
+    let _ = n1.kill();
+    let _ = n1.wait();
+}
+
+#[test]
+fn cluster_cdcmerge_releases_watermark_after_peer_timeout() {
+    // A shard held the watermark while down (previous test). But it must not
+    // stall the global feed FOREVER: past LOCUS_CDC_PEER_TIMEOUT_MS the merge
+    // releases it so writes on the surviving shard keep flowing (the dead
+    // shard's buffered changes rejoin best-effort when it returns).
+    let (p1, p2) = (free_port(), free_port());
+    let nodes = format!("127.0.0.1:{p1} 0-8191;127.0.0.1:{p2} 8192-16383");
+    let env: &[(&str, &str)] = &[("LOCUS_CDC_PEER_TIMEOUT_MS", "300")];
+    let mut n1 = spawn_cluster_node_env(p1, &nodes, env);
+    let mut n2 = spawn_cluster_node_env(p2, &nodes, env);
+    let mut c1 = conn_to(p1);
+
+    let mut keys = Vec::new();
+    for i in 0..400 {
+        let k = format!("t{i}");
+        let s: i64 = c1.cmd(&["CLUSTER", "KEYSLOT", &k]).parse().unwrap();
+        if s <= 8191 {
+            keys.push(k);
+        }
+        if keys.len() == 2 {
+            break;
+        }
+    }
+    let (early, late) = (&keys[0], &keys[1]);
+
+    c1.cmd(&["SET", early, "1"]);
+    let _ = c1.cmd(&["CLUSTER", "CDCMERGE", "0", "COUNT", "10"]); // learn n2's floor
+    let _ = n2.kill();
+    let _ = n2.wait();
+    sleep(Duration::from_millis(25));
+    c1.cmd(&["SET", late, "2"]);
+
+    // Wait past the peer timeout, then the withheld `late` write is released.
+    let deadline = Instant::now() + Duration::from_secs(3);
+    loop {
+        let r = c1.cmd(&["CLUSTER", "CDCMERGE", "0", "COUNT", "10"]);
+        if r.contains(late.as_str()) {
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "dead shard stalled the feed past its timeout: {r}"
+        );
+        sleep(Duration::from_millis(100));
+    }
 
     let _ = n1.kill();
     let _ = n1.wait();

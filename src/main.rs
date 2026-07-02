@@ -288,6 +288,26 @@ fn main() -> io::Result<()> {
     Ok(())
 }
 
+/// This shard's node id (0..=255) for globally-unique HLC stamps. Explicit
+/// LOCUS_NODE_ID wins; otherwise it's derived from the cluster announce address
+/// (or bind:port) so co-located config gives distinct ids without extra setup.
+/// Operators running many shards should set it explicitly to avoid a hash
+/// collision silently tying two shards' clocks.
+fn node_id_from_env() -> u64 {
+    if let Ok(v) = std::env::var("LOCUS_NODE_ID")
+        && let Ok(n) = v.trim().parse::<u64>()
+    {
+        return n & 0xFF;
+    }
+    let addr = std::env::var("LOCUS_CLUSTER_ANNOUNCE").unwrap_or_else(|_| {
+        let bind = std::env::var("LOCUS_BIND").unwrap_or_else(|_| "127.0.0.1".to_string());
+        let port = std::env::var("LOCUS_PORT").unwrap_or_else(|_| "6379".to_string());
+        format!("{bind}:{port}")
+    });
+    // Fold the SHA-256 of the address into 8 bits — stable per node.
+    acl::sha256(addr.as_bytes())[0] as u64
+}
+
 /// A fresh 40-hex replication id — minted at boot and rotated on promotion
 /// (a promoted replica embodies a NEW stream history).
 fn new_replid() -> String {
@@ -633,10 +653,14 @@ struct Hub {
     cdc_max_bytes: usize,
     cdc_next_offset: u64,
     hlc_last: u64, // last hybrid-logical-clock stamp issued (cross-shard CDC order)
-    // Last HLC floor we heard from each peer shard during CLUSTER CDCMERGE. A peer
-    // that was seen then goes unreachable holds the merge watermark here, so the
-    // global feed never advances past a change it might still be ahead of.
-    cdc_peer_floors: HashMap<String, u64>,
+    hlc_node: u64, // this shard's node id (low 8 HLC bits) — globally unique stamps
+    // Last HLC floor we heard from each peer shard during CLUSTER CDCMERGE, plus
+    // when we last heard it. A seen-then-unreachable peer holds the merge
+    // watermark at its last floor so the global feed never advances past a
+    // change it might still be ahead of — but only up to cdc_peer_timeout_ms,
+    // after which we stop letting one dead shard stall the whole feed forever.
+    cdc_peer_floors: HashMap<String, (u64, u64)>, // addr -> (floor, last_seen_ms)
+    cdc_peer_timeout_ms: u64,
     cdc_maxlen: usize,
     // changefeed consumer groups (load-balanced read mode), by group name
     cdc_groups: HashMap<Vec<u8>, CdcGroup>,
@@ -837,7 +861,13 @@ impl Hub {
                 .unwrap_or(64 * 1024 * 1024),
             cdc_next_offset: 1, // offset 0 means "nothing yet"
             hlc_last: 0,
+            hlc_node: node_id_from_env(),
             cdc_peer_floors: HashMap::new(),
+            cdc_peer_timeout_ms: std::env::var("LOCUS_CDC_PEER_TIMEOUT_MS")
+                .ok()
+                .and_then(|s| s.trim().parse().ok())
+                .filter(|&n| n > 0)
+                .unwrap_or(30_000),
             cdc_maxlen: std::env::var("LOCUS_CDC_MAXLEN")
                 .ok()
                 .and_then(|s| s.trim().parse::<usize>().ok())
@@ -1365,9 +1395,10 @@ impl Hub {
     }
 
     /// Advance and return this node's hybrid logical clock — the monotonic stamp
-    /// for CDC records and slot-ownership epochs.
+    /// for CDC records and slot-ownership epochs. The low 8 bits carry this
+    /// shard's node id, so stamps are globally unique across the cluster.
     fn hlc_now(&mut self) -> u64 {
-        self.hlc_last = hlc::tick(self.hlc_last);
+        self.hlc_last = hlc::tick(self.hlc_last, self.hlc_node);
         self.hlc_last
     }
 
@@ -1398,18 +1429,34 @@ impl Hub {
             .and_then(|s| s.parse::<u64>().ok())
             .unwrap_or(0);
         let count = cdc_count_arg(tokens);
-        let mut out = vec![resp::bulk_string(
-            hlc::floor(self.hlc_last).to_string().as_bytes(),
-        )];
-        for (h, e, k, v) in self.cdc_since(since) {
-            out.push(resp::bulk_string(h.to_string().as_bytes()));
-            out.push(resp::bulk_string(&e));
-            out.push(resp::bulk_string(&k));
-            out.push(resp::bulk_string(&v));
-            if count.is_some_and(|c| c > 0 && (out.len() - 1) / 4 >= c) {
+        // Reserve slot 0 for the floor; fill records first so we know whether we
+        // truncated before reporting it.
+        let mut recs: Vec<Vec<u8>> = Vec::new();
+        let mut last_returned = 0u64;
+        let mut truncated = false;
+        let all = self.cdc_since(since);
+        for (h, e, k, v) in all {
+            if count.is_some_and(|c| c > 0 && recs.len() / 4 >= c) {
+                truncated = true;
                 break;
             }
+            last_returned = h; // records come in ascending hlc order on one shard
+            recs.push(resp::bulk_string(h.to_string().as_bytes()));
+            recs.push(resp::bulk_string(&e));
+            recs.push(resp::bulk_string(&k));
+            recs.push(resp::bulk_string(&v));
         }
+        // The floor is our "delivered everything up to here" promise. If COUNT
+        // truncated, we did NOT deliver past last_returned, so we must report
+        // last_returned — reporting the full (idle-advancing) floor would let
+        // the coordinator's watermark pass the un-returned tail and drop it.
+        let floor = if truncated {
+            last_returned
+        } else {
+            hlc::floor(self.hlc_last)
+        };
+        let mut out = vec![resp::bulk_string(floor.to_string().as_bytes())];
+        out.extend(recs);
         self.send(id, resp::array(&out));
     }
 
@@ -1419,6 +1466,7 @@ impl Hub {
     /// back records above the watermark is what bounds staleness — no later read
     /// can surface an earlier-stamped change. Returns `[hlc, event, key, value]`*.
     fn cluster_cdcmerge(&mut self, since: u64, count: Option<usize>) -> Vec<u8> {
+        let now = now_ms();
         let mut watermark = hlc::floor(self.hlc_last);
         let mut recs = self.cdc_since(since);
         let peers = match &self.cluster {
@@ -1434,12 +1482,23 @@ impl Hub {
         );
         for (addr, reply) in peers.iter().zip(replies) {
             let Some(flat) = reply else {
-                // Unreachable: if we've heard from this shard before, hold the
-                // watermark at its last floor so we don't emit past it. A shard
-                // never yet seen is skipped, so a boot-time outage can't stall the
-                // whole merge; its changes join once it's first reached.
-                if let Some(&known) = self.cdc_peer_floors.get(addr) {
-                    watermark = watermark.min(known);
+                // Unreachable: hold the watermark at this shard's last floor so
+                // we don't emit past a change it might still be ahead of — but
+                // only up to cdc_peer_timeout_ms. A shard never yet seen is
+                // skipped (a boot-time outage can't stall the merge); a shard
+                // down LONGER than the timeout is released (one dead shard must
+                // not stall the whole global feed forever — its buffered
+                // changes rejoin best-effort once it returns), with a warning.
+                if let Some(&(known, seen)) = self.cdc_peer_floors.get(addr) {
+                    if now.saturating_sub(seen) <= self.cdc_peer_timeout_ms {
+                        watermark = watermark.min(known);
+                    } else {
+                        log::warn(&format!(
+                            "cdcmerge: shard {addr} unreachable > {}ms — releasing the watermark it held (its buffered changes will rejoin when it returns)",
+                            self.cdc_peer_timeout_ms
+                        ));
+                        self.cdc_peer_floors.remove(addr);
+                    }
                 }
                 continue;
             };
@@ -1448,7 +1507,7 @@ impl Hub {
                 .ok()
                 .and_then(|s| s.parse::<u64>().ok())
             {
-                self.cdc_peer_floors.insert(addr.clone(), pf);
+                self.cdc_peer_floors.insert(addr.clone(), (pf, now));
                 watermark = watermark.min(pf);
             }
             for g in flat[1..].chunks_exact(4) {
@@ -1459,6 +1518,13 @@ impl Hub {
                 recs.push((h, g[1].clone(), g[2].clone(), g[3].clone()));
             }
         }
+        // Emit up to AND INCLUDING the watermark. The fix that closes the
+        // off-by-one is in hlc::floor (a shard's reported floor is now strictly
+        // below every stamp it could next issue) plus the node id that makes
+        // every stamp globally unique — so a record at exactly the watermark is
+        // genuinely the last of a past millisecond that no shard will reissue,
+        // and holding it back (`<`) would instead risk stalling it forever
+        // behind a peer idle at that same boundary.
         recs.retain(|(h, ..)| *h > since && *h <= watermark);
         recs.sort_by_key(|(h, ..)| *h);
         if let Some(c) = count
