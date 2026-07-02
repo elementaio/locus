@@ -96,11 +96,29 @@ enum Msg {
     Disconnect {
         id: u64,
     },
+    /// One command from the master's replication stream (replica side), tagged
+    /// with the sync session that read it: a superseded session's stream must
+    /// not be applied on top of a newer sync's dataset (a fast REPLICAOF A→B
+    /// leaves the old thread alive for up to one poll interval).
+    MasterCommand {
+        session: u64,
+        tokens: Vec<Vec<u8>>,
+    },
     /// Replica received a full-sync snapshot; replace the whole dataset plus the
     /// CDC / secondary-index state carried in the snapshot trailer.
-    ReplaceDb(Box<Db>, Box<rdb::Extras>, String, u64),
+    ReplaceDb {
+        session: u64,
+        db: Box<Db>,
+        extras: Box<rdb::Extras>,
+        replid: String,
+        offset: u64,
+    },
     /// The replica's link to its master dropped (clear master_link_status).
-    MasterLinkDown,
+    MasterLinkDown(u64),
+    /// The link is (re)established — sent on a partial resync (+CONTINUE),
+    /// which never passes through ReplaceDb and used to leave the status
+    /// stuck "down", poisoning sentinel corroboration.
+    MasterLinkUp(u64),
     /// An async BGREWRITEAOF finished writing its base image off-thread; carries
     /// the generation it was started under (a full resync invalidates in-flight
     /// rewrites) and the temp path on success (to finalize) or an error string.
@@ -268,6 +286,19 @@ fn main() -> io::Result<()> {
         }
     }
     Ok(())
+}
+
+/// A fresh 40-hex replication id — minted at boot and rotated on promotion
+/// (a promoted replica embodies a NEW stream history).
+fn new_replid() -> String {
+    static SEQ: AtomicU64 = AtomicU64::new(0);
+    let seed = format!(
+        "{}-{}-{}",
+        std::process::id(),
+        now_ms(),
+        SEQ.fetch_add(1, Ordering::Relaxed)
+    );
+    acl::hex32(&acl::sha256(seed.as_bytes()))[..40].to_string()
 }
 
 /// Where the node's role (master / replicaof host port) is persisted across
@@ -559,6 +590,9 @@ struct Hub {
     replicas: HashSet<u64>,           // client ids receiving our write stream
     master: Option<(String, String)>, // (host, port) if we are a replica
     replica_stop: Option<Arc<AtomicBool>>,
+    // Monotonic id of the CURRENT sync session; stream/snapshot/link messages
+    // from any other session are stale and dropped (see Msg::MasterCommand).
+    repl_session: u64,
     tx: mpsc::SyncSender<Msg>, // so we can spawn a replica sync thread
     // transactions
     txs: HashMap<u64, TxState>,
@@ -757,6 +791,7 @@ impl Hub {
             replicas: HashSet::new(),
             master: None,
             replica_stop: None,
+            repl_session: 0,
             tx,
             txs: HashMap::new(),
             watched_keys: HashMap::new(),
@@ -816,10 +851,7 @@ impl Hub {
                 .unwrap_or(128),
             users: HashMap::new(),
             current_user: HashMap::new(),
-            replid: acl::hex32(&acl::sha256(
-                format!("{}-{}", std::process::id(), now_ms()).as_bytes(),
-            ))[..40]
-                .to_string(),
+            replid: new_replid(),
             master_repl_offset: 0,
             master_link_up: false,
             repl_backlog: VecDeque::new(),
@@ -1074,12 +1106,44 @@ impl Hub {
         }
     }
 
+    /// Fence the master-side replication machinery at a role boundary. A node
+    /// changing what stream it embodies must not keep the previous stream's
+    /// backlog (a PSYNC CONTINUE would serve bytes from a different history),
+    /// its attached replicas (their stream ends here — they must resync from
+    /// whoever is authoritative now), or its acks/WAITers.
+    fn reset_master_repl_state(&mut self) {
+        self.repl_active = false;
+        self.repl_backlog.clear();
+        self.repl_backlog_start = self.master_repl_offset;
+        // Answer parked WAITs with what was acked up to the boundary — their
+        // quorum can no longer be satisfied by a stream that just ended.
+        let waiting = std::mem::take(&mut self.waiting);
+        for w in waiting {
+            let acked = self.count_acked(w.target);
+            self.send(w.id, resp::integer(acked as i64));
+        }
+        self.replica_acks.clear();
+        for rid in std::mem::take(&mut self.replicas) {
+            if let Some(out) = self.clients.get(&rid) {
+                out.doomed.store(true, Ordering::Relaxed);
+                if let Some(k) = &out.kill {
+                    let _ = k.shutdown(std::net::Shutdown::Both);
+                }
+            }
+            log::info(&format!(
+                "replication: disconnected replica {rid} at a role boundary (it must resync)"
+            ));
+        }
+    }
+
     /// Point this node at a master and start the sync thread. Shared by the
     /// REPLICAOF command and boot-time role resumption.
     fn start_replication(&mut self, host: String, port: String) {
         if let Some(flag) = self.replica_stop.take() {
             flag.store(true, Ordering::Relaxed);
         }
+        self.reset_master_repl_state();
+        self.repl_session += 1; // orphan any still-running sync thread's stream
         self.master = Some((host.clone(), port.clone()));
         self.master_link_up = false; // until the full sync completes
         let stop = Arc::new(AtomicBool::new(false));
@@ -1087,7 +1151,8 @@ impl Hub {
         let addr = format!("{host}:{port}");
         let txc = self.tx.clone();
         let masterauth = self.masterauth.clone();
-        thread::spawn(move || replica_sync(addr, masterauth, txc, stop));
+        let session = self.repl_session;
+        thread::spawn(move || replica_sync(addr, masterauth, txc, stop, session));
         self.persist_role();
         log::info(&format!("replication: now replicating from {host}:{port}"));
     }
@@ -2322,6 +2387,18 @@ impl Hub {
             }
             b"WAIT" => self.handle_wait(id, &tokens),
             b"PSYNC" | b"SYNC" => {
+                // Chained replication (a replica serving replicas) is not
+                // supported: the rewritten stream this node applies has its own
+                // byte numbering, so sub-replica offsets/acks would be fiction.
+                // Refuse loudly instead of half-working.
+                if self.master.is_some() {
+                    return self.send(
+                        id,
+                        resp::error(
+                            "ERR Can't SYNC from a replica (chained replication is not supported); replicate from the master",
+                        ),
+                    );
+                }
                 // PSYNC <replid> <offset>: a partial resync is possible iff the
                 // replid matches ours and the requested offset is still covered by
                 // the backlog. Otherwise fall back to a full snapshot.
@@ -3512,6 +3589,13 @@ impl Hub {
     /// advancing + buffering even with no replica currently connected, so a
     /// reconnecting replica's offset still reflects what it missed.
     fn replicate(&mut self, bytes: Vec<u8>) {
+        if self.master.is_some() {
+            // Replicas never stream out (PSYNC is refused on a replica) — and
+            // advancing the offset here would DOUBLE-COUNT every master-applied
+            // command on top of the apply-path advance, inflating this node's
+            // reported offset so a sentinel prefers the wrong candidate.
+            return;
+        }
         if !self.repl_active {
             return; // replication never started; nothing to track yet
         }
@@ -3551,9 +3635,21 @@ impl Hub {
             if let Some(flag) = self.replica_stop.take() {
                 flag.store(true, Ordering::Relaxed);
             }
-            self.master = None;
+            self.repl_session += 1; // any straggling stream messages are stale
+            if self.master.take().is_some() {
+                // ROTATE the replication id: our history may diverge from the
+                // old master's unseen tail from this point on, so a downstream
+                // PSYNC quoting the old replid must FULLRESYNC — a CONTINUE
+                // would serve bytes from a different stream numbering.
+                self.replid = new_replid();
+                self.reset_master_repl_state();
+                self.master_link_up = false;
+                log::info(&format!(
+                    "replication: promoted to master (new replid {})",
+                    self.replid
+                ));
+            }
             self.persist_role();
-            log::info("replication: promoted to master");
             return self.send(id, resp::simple_string("OK"));
         }
         let host = String::from_utf8_lossy(&tokens[1]).to_string();
@@ -3790,6 +3886,22 @@ fn slowlog_snapshot(tokens: &[Vec<u8>]) -> Vec<Vec<u8>> {
 /// WAIT deadlines, everysec fsync, shutdown), busy or idle.
 const MAINT_EVERY: Duration = Duration::from_millis(100);
 
+/// Run one command through the hub with slow-log timing — shared by client
+/// commands and the master's replicated stream.
+fn dispatch_hub_command(hub: &mut Hub, id: u64, tokens: Vec<Vec<u8>>) {
+    if hub.slowlog_threshold_us >= 0 {
+        let snap = slowlog_snapshot(&tokens);
+        let t0 = Instant::now();
+        hub.handle_command(id, tokens);
+        let us = t0.elapsed().as_micros() as i64;
+        if us >= hub.slowlog_threshold_us {
+            hub.push_slowlog(us as u64, snap);
+        }
+    } else {
+        hub.handle_command(id, tokens);
+    }
+}
+
 fn run_hub(rx: mpsc::Receiver<Msg>, tx: mpsc::SyncSender<Msg>) {
     let mut hub = Hub::new(tx);
     let mut last_maint = Instant::now();
@@ -3832,20 +3944,26 @@ fn run_hub(rx: mpsc::Receiver<Msg>, tx: mpsc::SyncSender<Msg>) {
                 hub.client_names.remove(&id);
                 hub.current_user.remove(&id);
             }
-            Ok(Msg::Command { id, tokens }) => {
-                if hub.slowlog_threshold_us >= 0 {
-                    let snap = slowlog_snapshot(&tokens);
-                    let t0 = Instant::now();
-                    hub.handle_command(id, tokens);
-                    let us = t0.elapsed().as_micros() as i64;
-                    if us >= hub.slowlog_threshold_us {
-                        hub.push_slowlog(us as u64, snap);
-                    }
-                } else {
-                    hub.handle_command(id, tokens);
+            Ok(Msg::Command { id, tokens }) => dispatch_hub_command(&mut hub, id, tokens),
+            Ok(Msg::MasterCommand { session, tokens }) => {
+                // Only the CURRENT sync session's stream applies — a superseded
+                // thread still draining its socket must not write A's commands
+                // over B's dataset.
+                if session == hub.repl_session {
+                    dispatch_hub_command(&mut hub, MASTER_ID, tokens);
                 }
             }
-            Ok(Msg::ReplaceDb(db, extras, replid, offset)) => {
+            Ok(Msg::ReplaceDb {
+                session,
+                db,
+                extras,
+                replid,
+                offset,
+            }) => {
+                if session != hub.repl_session {
+                    log::warn("discarded a stale full-sync snapshot (replication was repointed)");
+                    continue;
+                }
                 hub.db = *db;
                 hub.apply_extras(*extras); // CDC offsets/log/groups + rebuilt indexes
                 // Adopt the master's replication id + offset (Redis semantics) so
@@ -3853,6 +3971,9 @@ fn run_hub(rx: mpsc::Receiver<Msg>, tx: mpsc::SyncSender<Msg>) {
                 hub.replid = replid;
                 hub.master_repl_offset = offset;
                 hub.master_link_up = true;
+                // Defensive fence: a replica embodies its master's stream now —
+                // no backlog/acks of its own may survive the boundary.
+                hub.reset_master_repl_state();
                 // An in-flight BGREWRITEAOF serialized the PRE-sync dataset —
                 // finalizing it would swap old-base + new-tail into place.
                 // Invalidate it by generation, then rebuild the AOF from the
@@ -3866,7 +3987,17 @@ fn run_hub(rx: mpsc::Receiver<Msg>, tx: mpsc::SyncSender<Msg>) {
                 // to satisfy readers parked on a blocking XREAD.
                 hub.serve_blocked();
             }
-            Ok(Msg::MasterLinkDown) => hub.master_link_up = false,
+            Ok(Msg::MasterLinkDown(session)) => {
+                // A stale session's death must not mark the NEW link down.
+                if session == hub.repl_session {
+                    hub.master_link_up = false;
+                }
+            }
+            Ok(Msg::MasterLinkUp(session)) => {
+                if session == hub.repl_session {
+                    hub.master_link_up = true;
+                }
+            }
             Ok(Msg::ClusterGossip(ranges)) => hub.merge_gossip(ranges),
             Ok(Msg::AofRewriteDone(rewrite_gen, res)) => {
                 if rewrite_gen != hub.aof_rewrite_gen {
@@ -3963,15 +4094,23 @@ fn replica_sync(
     masterauth: Option<Vec<u8>>,
     hub_tx: mpsc::SyncSender<Msg>,
     stop: Arc<AtomicBool>,
+    session: u64,
 ) {
     // Remembered (replid, processed-offset) so a reconnect can PSYNC for a partial
     // resync (CONTINUE) instead of pulling a full snapshot again.
     let mut known: Option<(String, u64)> = None;
     while !stop.load(Ordering::Relaxed) {
-        if let Err(e) = try_sync(&addr, masterauth.as_deref(), &hub_tx, &stop, &mut known) {
+        if let Err(e) = try_sync(
+            &addr,
+            masterauth.as_deref(),
+            &hub_tx,
+            stop.as_ref(),
+            &mut known,
+            session,
+        ) {
             log::warn(&format!("replication: link to {addr} dropped: {e}"));
         }
-        let _ = hub_tx.send(Msg::MasterLinkDown);
+        let _ = hub_tx.send(Msg::MasterLinkDown(session));
         // Reconnect after a short delay; the next try_sync will attempt a partial
         // resync using `known`.
         for _ in 0..10 {
@@ -3987,8 +4126,9 @@ fn try_sync(
     addr: &str,
     masterauth: Option<&[u8]>,
     hub_tx: &mpsc::SyncSender<Msg>,
-    stop: &Arc<AtomicBool>,
+    stop: &AtomicBool,
     known: &mut Option<(String, u64)>,
+    session: u64,
 ) -> io::Result<()> {
     let mut stream = TcpStream::connect(addr)?;
     // Bound the handshake + snapshot reads so a master that accepts the TCP
@@ -4041,6 +4181,10 @@ fn try_sync(
             cont_id.to_string()
         };
         applied = known.as_ref().map(|(_, o)| *o).unwrap_or(0);
+        // A CONTINUE reconnect never passes through ReplaceDb — report the
+        // link healthy explicitly, or sentinel corroboration reads a working
+        // replica as "down" forever and fails over a healthy master.
+        let _ = hub_tx.send(Msg::MasterLinkUp(session));
         log::info(&format!(
             "replication: partial resync (CONTINUE) at offset {applied}"
         ));
@@ -4052,12 +4196,13 @@ fn try_sync(
         stream.read_exact(&mut snap)?;
         let (db, extras) = rdb::deserialize_with_extras(&snap)?;
         if hub_tx
-            .send(Msg::ReplaceDb(
-                Box::new(db),
-                Box::new(extras),
-                replid.clone(),
+            .send(Msg::ReplaceDb {
+                session,
+                db: Box::new(db),
+                extras: Box::new(extras),
+                replid: replid.clone(),
                 offset,
-            ))
+            })
             .is_err()
         {
             return Ok(());
@@ -4087,12 +4232,7 @@ fn try_sync(
                             inbuf.drain(0..consumed);
                             applied += consumed as u64;
                             if !tokens.is_empty()
-                                && hub_tx
-                                    .send(Msg::Command {
-                                        id: MASTER_ID,
-                                        tokens,
-                                    })
-                                    .is_err()
+                                && hub_tx.send(Msg::MasterCommand { session, tokens }).is_err()
                             {
                                 return Ok(());
                             }

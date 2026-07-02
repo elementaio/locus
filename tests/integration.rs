@@ -1534,6 +1534,129 @@ fn replica_kill9_restarts_as_replica_with_exactly_the_masters_data() {
     }
 }
 
+/// Poll INFO until `field` equals `want` (or fail after the deadline).
+fn wait_info(c: &mut Conn, field: &str, want: &str, what: &str) {
+    let deadline = Instant::now() + Duration::from_secs(4);
+    loop {
+        let info = c.cmd(&["INFO"]);
+        let got = info
+            .split("\r\n")
+            .find_map(|l| l.strip_prefix(field)?.strip_prefix(':'))
+            .unwrap_or("")
+            .trim()
+            .to_string();
+        if got == want {
+            return;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "{what}: {field}={got}, want {want}"
+        );
+        sleep(Duration::from_millis(40));
+    }
+}
+
+#[test]
+fn demoted_master_neither_double_counts_nor_keeps_replicas() {
+    // A master with an attached replica gets demoted under a NEW master. Its
+    // old replica must be cut loose (that stream's history ended), and every
+    // command it now applies must advance its offset ONCE — the old code
+    // counted twice (apply path + leftover streaming path), inflating the
+    // offset sentinels use to pick promotion candidates.
+    let a = Server::start(); // master, then demoted
+    let b = Server::start(); // a's replica
+    let c = Server::start(); // the new master
+    let (mut ca, mut cb, mut cc) = (a.connect(), b.connect(), c.connect());
+
+    ca.cmd(&["SET", "seed", "1"]);
+    cb.cmd(&["REPLICAOF", "127.0.0.1", &a.port.to_string()]);
+    wait_info(&mut cb, "master_link_status", "up", "b never synced from a");
+    wait_info(&mut ca, "connected_slaves", "1", "a never saw its replica");
+
+    // Demote A under C. B must be disconnected by the role fence.
+    cc.cmd(&["SET", "c-seed", "1"]);
+    ca.cmd(&["REPLICAOF", "127.0.0.1", &c.port.to_string()]);
+    wait_info(&mut ca, "master_link_status", "up", "a never synced from c");
+    wait_info(&mut ca, "connected_slaves", "0", "a kept its old replica");
+
+    // Stream a batch through C and compare offsets: A's must track C's
+    // exactly (single-counted), never run ahead of it.
+    for i in 0..50 {
+        cc.cmd(&["SET", &format!("k{i}"), "v"]);
+    }
+    let deadline = Instant::now() + Duration::from_secs(4);
+    loop {
+        let (offa, offc) = (
+            info_field(&mut ca, "master_repl_offset"),
+            info_field(&mut cc, "master_repl_offset"),
+        );
+        assert!(
+            offa <= offc,
+            "demoted master's offset ({offa}) ran past its master's ({offc}) — double-counted"
+        );
+        if offa == offc && offc > 0 {
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "offsets never converged: a={offa} c={offc}"
+        );
+        sleep(Duration::from_millis(40));
+    }
+}
+
+#[test]
+fn promotion_rotates_the_replication_id() {
+    let m = Server::start();
+    let r = Server::start();
+    let (mut cm, mut cr) = (m.connect(), r.connect());
+    cm.cmd(&["SET", "k", "v"]);
+    cr.cmd(&["REPLICAOF", "127.0.0.1", &m.port.to_string()]);
+    wait_info(&mut cr, "master_link_status", "up", "never synced");
+    // After the full sync the replica carries the master's replid.
+    let synced = cr.cmd(&["INFO"]);
+    let old_id = synced
+        .split("\r\n")
+        .find_map(|l| l.strip_prefix("master_replid:"))
+        .unwrap()
+        .to_string();
+    // Promotion mints a NEW replid: this node's history diverges from the old
+    // master's unseen tail, so a downstream PSYNC quoting the old id must
+    // FULLRESYNC instead of getting a CONTINUE from a different stream.
+    assert_eq!(cr.cmd(&["REPLICAOF", "NO", "ONE"]), "OK");
+    let promoted = cr.cmd(&["INFO"]);
+    let new_id = promoted
+        .split("\r\n")
+        .find_map(|l| l.strip_prefix("master_replid:"))
+        .unwrap()
+        .to_string();
+    assert_ne!(old_id, new_id, "replid must rotate on promotion");
+    assert!(promoted.contains("role:master"));
+}
+
+#[test]
+fn chained_replication_is_refused() {
+    // C tries to replicate from B, which is itself a replica of A. B's applied
+    // stream has its own byte numbering, so sub-replica acks would be fiction:
+    // B must refuse the PSYNC and C's link must stay down.
+    let a = Server::start();
+    let b = Server::start();
+    let c = Server::start();
+    let (mut ca, mut cb, mut cc) = (a.connect(), b.connect(), c.connect());
+    ca.cmd(&["SET", "k", "v"]);
+    cb.cmd(&["REPLICAOF", "127.0.0.1", &a.port.to_string()]);
+    wait_info(&mut cb, "master_link_status", "up", "b never synced");
+
+    cc.cmd(&["REPLICAOF", "127.0.0.1", &b.port.to_string()]);
+    sleep(Duration::from_millis(700)); // give the sync loop a few attempts
+    let info = cc.cmd(&["INFO"]);
+    assert!(
+        info.contains("master_link_status:down"),
+        "chained sync should be refused: {info}"
+    );
+    wait_info(&mut cb, "connected_slaves", "0", "b accepted a sub-replica");
+}
+
 #[test]
 fn replica_loses_keys_when_the_master_expires_them() {
     let master = Server::start();
