@@ -2426,6 +2426,94 @@ fn cluster_migrateslot_moves_keys_zero_loss() {
 }
 
 #[test]
+fn cluster_works_with_requirepass_via_cluster_secret() {
+    // Secured + clustered must coexist (T3-8): with a client password set, the
+    // internal RPCs authenticate with the cluster secret, so a cross-shard
+    // GEOSEARCH still reaches every shard instead of going local-only.
+    let (p1, p2) = (free_port(), free_port());
+    let nodes = format!("127.0.0.1:{p1} 0-8191;127.0.0.1:{p2} 8192-16383");
+    let env: &[(&str, &str)] = &[
+        ("LOCUS_REQUIREPASS", "clientpw"),
+        ("LOCUS_CLUSTER_SECRET", "meshsecret"),
+    ];
+    let mut n1 = spawn_cluster_node_env(p1, &nodes, env);
+    let mut n2 = spawn_cluster_node_env(p2, &nodes, env);
+    let mut c1 = conn_to(p1);
+    let mut c2 = conn_to(p2);
+    assert_eq!(c1.cmd(&["AUTH", "clientpw"]), "OK");
+    assert_eq!(c2.cmd(&["AUTH", "clientpw"]), "OK");
+
+    // Put a geo point on whichever shard owns it (route via KEYSLOT).
+    let place = |c1: &mut Conn, c2: &mut Conn, k: &str, lon: &str, lat: &str| {
+        let s: i64 = c1.cmd(&["CLUSTER", "KEYSLOT", k]).parse().unwrap();
+        let c = if s <= 8191 { c1 } else { c2 };
+        assert_eq!(c.cmd(&["GEOSET", k, lon, lat]), "OK");
+    };
+    // Two nearby points that hash to different shards (try a handful).
+    place(&mut c1, &mut c2, "loc:a", "51.53", "25.28");
+    place(&mut c1, &mut c2, "loc:b", "51.531", "25.281");
+
+    // A cross-shard GEOSEARCH gathers from both shards (needs the mesh auth).
+    let r = c1.cmd(&[
+        "GEOSEARCH",
+        "FROMLONLAT",
+        "51.53",
+        "25.28",
+        "BYRADIUS",
+        "5",
+        "km",
+        "ASC",
+    ]);
+    assert!(
+        r.contains("loc:a") && r.contains("loc:b"),
+        "cross-shard GEOSEARCH under requirepass missed a shard: {r}"
+    );
+
+    // A wrong/absent mesh secret path: the client password alone still gates.
+    let mut bad = conn_to(p1);
+    assert!(bad.cmd(&["GET", "loc:a"]).starts_with("-NOAUTH"));
+
+    for n in [&mut n1, &mut n2] {
+        let _ = n.kill();
+        let _ = n.wait();
+    }
+}
+
+#[test]
+fn cluster_geosearch_errors_when_a_shard_is_down() {
+    // A silently partial "nearest" result is dangerous: with a shard
+    // unreachable, cross-shard GEOSEARCH errors (CLUSTERDOWN) by default rather
+    // than returning fewer hits (T3-9).
+    let (p1, p2) = (free_port(), free_port());
+    let nodes = format!("127.0.0.1:{p1} 0-8191;127.0.0.1:{p2} 8192-16383");
+    let mut n1 = spawn_cluster_node(p1, &nodes);
+    let mut n2 = spawn_cluster_node(p2, &nodes);
+    let mut c1 = conn_to(p1);
+    c1.cmd(&["GEOSET", "here", "51.53", "25.28"]);
+
+    // Kill shard 2, then a cross-shard GEOSEARCH from shard 1 must error.
+    let _ = n2.kill();
+    let _ = n2.wait();
+    sleep(Duration::from_millis(100));
+    let r = c1.cmd(&[
+        "GEOSEARCH",
+        "FROMLONLAT",
+        "51.53",
+        "25.28",
+        "BYRADIUS",
+        "5",
+        "km",
+    ]);
+    assert!(
+        r.starts_with("-CLUSTERDOWN"),
+        "expected CLUSTERDOWN with a shard down, got: {r}"
+    );
+
+    let _ = n1.kill();
+    let _ = n1.wait();
+}
+
+#[test]
 fn cluster_migrated_keys_survive_a_destination_restart() {
     // Migration durability (T3-5): a key moved into a shard is logged to that
     // shard's AOF, so a dst crash after the migration doesn't lose it. Topology

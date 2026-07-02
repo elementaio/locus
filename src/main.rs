@@ -288,6 +288,15 @@ fn main() -> io::Result<()> {
     Ok(())
 }
 
+/// Whether a clustered scatter-gather may return a partial result when a shard
+/// is unreachable (LOCUS_CLUSTER_ALLOW_PARTIAL). Off by default: a silently
+/// incomplete GEOSEARCH is worse than a clear error.
+fn cluster_allow_partial() -> bool {
+    std::env::var("LOCUS_CLUSTER_ALLOW_PARTIAL")
+        .map(|v| matches!(v.trim(), "1" | "yes" | "on" | "true"))
+        .unwrap_or(false)
+}
+
 /// This shard's node id (0..=255) for globally-unique HLC stamps. Explicit
 /// LOCUS_NODE_ID wins; otherwise it's derived from the cluster announce address
 /// (or bind:port) so co-located config gives distinct ids without extra setup.
@@ -510,7 +519,28 @@ impl Cluster {
         // data already reflects migrations (which would MOVED clients at nodes
         // that no longer hold the keys). Higher-epoch entries win the merge.
         cluster.load_persisted();
+        cluster.validate_boot();
         Some(cluster)
+    }
+
+    /// Boot sanity checks: our announce address MUST appear in the topology, or
+    /// cluster_peers() can't exclude us and we scatter queries to ourselves (and
+    /// block on our own join). Cell-sharded mode also relies on every node using
+    /// the same cell_bits — surface it so a mismatch is visible.
+    fn validate_boot(&self) {
+        let known = self.owner.iter().flatten().any(|a| a == &self.my_addr);
+        if !known {
+            log::warn(&format!(
+                "cluster: my announce address {} is not in LOCUS_CLUSTER_NODES — set LOCUS_CLUSTER_ANNOUNCE to exactly how peers list this node, else scatter-gather will target this node itself",
+                self.my_addr
+            ));
+        }
+        if self.cell_bits > 0 {
+            log::info(&format!(
+                "cluster: cell-sharded GEOSEARCH with cell_bits={} — EVERY node must use the same value (LOCUS_CLUSTER_CELL_BITS) or bounded scatter consults the wrong shards",
+                self.cell_bits
+            ));
+        }
     }
 
     /// Path of the persisted slot-topology file (beside the RDB, or the
@@ -726,6 +756,9 @@ struct Hub {
     loopback: HashSet<u64>, // client ids whose peer is a loopback address
     // password this node presents to its master (replica side); None = none.
     masterauth: Option<Vec<u8>>,
+    // an alternate secret accepted by AUTH for internal cluster RPCs, so a node
+    // can require a client password AND let peers authenticate separately.
+    cluster_auth_secret: Option<Vec<u8>>,
     // true while a background save's write+fsync is running off the hub thread.
     bgsave_in_progress: Arc<AtomicBool>,
     // observability: process start (uptime) + a cheap command counter for INFO.
@@ -939,6 +972,10 @@ impl Hub {
                 .unwrap_or(true),
             loopback: HashSet::new(),
             masterauth: std::env::var("LOCUS_MASTERAUTH")
+                .ok()
+                .map(String::into_bytes)
+                .filter(|p| !p.is_empty()),
+            cluster_auth_secret: std::env::var("LOCUS_CLUSTER_SECRET")
                 .ok()
                 .map(String::into_bytes)
                 .filter(|p| !p.is_empty()),
@@ -1503,7 +1540,17 @@ impl Hub {
         let shard_args: Vec<&[u8]> = shard.iter().map(|t| t.as_slice()).collect();
         let parse = |b: &[u8]| std::str::from_utf8(b).ok().and_then(|s| s.parse().ok());
         let targets = self.cluster_geo_targets(&q);
-        for flat in scatter_array(&targets, &shard_args).into_iter().flatten() {
+        let replies = scatter_array(&targets, &shard_args);
+        // A None reply is an unreachable shard: its matches are MISSING, not
+        // absent. Silently returning a partial result set is dangerous for a
+        // "nearest driver" query, so by default we error (CLUSTERDOWN) rather
+        // than lie. LOCUS_CLUSTER_ALLOW_PARTIAL=yes opts into best-effort.
+        if replies.iter().any(|r| r.is_none()) && !cluster_allow_partial() {
+            return resp::error(
+                "CLUSTERDOWN GEOSEARCH result is incomplete — one or more shards were unreachable (set LOCUS_CLUSTER_ALLOW_PARTIAL=yes for best-effort)",
+            );
+        }
+        for flat in replies.into_iter().flatten() {
             for g in flat.chunks_exact(4) {
                 hits.push((
                     g[0].clone(),
@@ -1713,7 +1760,14 @@ impl Hub {
         let mut changed = false;
         for (start, end, owner, ep) in ranges {
             for slot in (start as usize)..=(end as usize).min(c.epoch.len() - 1) {
-                if ep > c.epoch[slot] {
+                // Epochs are HLC stamps that now carry a node id in their low
+                // bits (see hlc), so two nodes' assignments are never exactly
+                // equal — the `>` gives a total order and MOVED can't ping-pong.
+                // The equal-epoch branch is a belt-and-braces deterministic
+                // tiebreak (higher owner address wins) for any legacy stamp.
+                let adopt = ep > c.epoch[slot]
+                    || (ep == c.epoch[slot] && c.owner[slot].as_deref() < Some(owner.as_str()));
+                if adopt && c.owner[slot].as_deref() != Some(owner.as_str()) {
                     c.owner[slot] = Some(owner.clone());
                     c.epoch[slot] = ep;
                     changed = true;
@@ -1743,12 +1797,14 @@ impl Hub {
                 };
                 // Step 1 always reports state ok (a partial slot assignment still
                 // serves its own keys); CLUSTERDOWN gating comes in a later step.
+                let cell_bits = self.cluster.as_ref().map(|c| c.cell_bits).unwrap_or(0);
                 let body = format!(
                     "cluster_enabled:{enabled}\r\ncluster_state:ok\r\n\
                      cluster_slots_assigned:{assigned}\r\ncluster_slots_ok:{assigned}\r\n\
                      cluster_slots_pfail:0\r\ncluster_slots_fail:0\r\n\
                      cluster_known_nodes:{nodes}\r\ncluster_size:{size}\r\n\
                      cluster_current_epoch:0\r\ncluster_my_epoch:0\r\n\
+                     cluster_cell_bits:{cell_bits}\r\n\
                      cluster_stats_messages_sent:0\r\ncluster_stats_messages_received:0\r\n"
                 );
                 self.send(id, resp::bulk_string(body.as_bytes()));
@@ -2359,6 +2415,7 @@ impl Hub {
             && self.requirepass.is_none()
             && id != MASTER_ID
             && !self.loopback.contains(&id)
+            && !self.authed.contains(&id) // a cluster-secret-authed peer is allowed
             && cmd.as_slice() != b"QUIT"
         {
             return self.send(id, resp::error(PROTECTED_MODE_MSG));
@@ -3589,7 +3646,19 @@ impl Hub {
                 );
             }
         };
+        // The cluster secret is accepted alongside requirepass, so a node can
+        // require a client password and still let peer nodes authenticate their
+        // internal RPCs (and so a cluster-secret-only node authenticates peers
+        // even with no client password set).
+        let cluster_ok = self
+            .cluster_auth_secret
+            .as_ref()
+            .is_some_and(|cs| ct_eq(cs, pass));
         match &self.requirepass {
+            _ if cluster_ok => {
+                self.authed.insert(id);
+                self.send(id, resp::simple_string("OK"));
+            }
             None => self.send(
                 id,
                 resp::error(
@@ -4581,6 +4650,47 @@ fn send_cmd(s: &mut TcpStream, parts: &[&[u8]]) -> io::Result<()> {
     s.write_all(&resp::command(&owned))
 }
 
+/// The password internal cluster RPCs present to peers: LOCUS_CLUSTER_SECRET,
+/// else LOCUS_MASTERAUTH, else LOCUS_REQUIREPASS. Without this a secured node
+/// (requirepass set) rejected every internal call — GEOSEARCH went local-only,
+/// gossip never converged, migration aborted — so "secure" and "clustered" were
+/// silently mutually exclusive.
+fn cluster_secret() -> Option<&'static [u8]> {
+    static SECRET: std::sync::OnceLock<Option<Vec<u8>>> = std::sync::OnceLock::new();
+    SECRET
+        .get_or_init(|| {
+            for var in ["LOCUS_CLUSTER_SECRET", "LOCUS_REQUIREPASS"] {
+                if let Ok(v) = std::env::var(var)
+                    && !v.is_empty()
+                {
+                    return Some(v.into_bytes());
+                }
+            }
+            None
+        })
+        .as_deref()
+}
+
+/// AUTH the internal connection with the cluster secret (if configured) before
+/// the real command. A rejected AUTH is an error, so a misconfigured secret
+/// surfaces instead of silently degrading.
+fn cluster_auth(s: &mut TcpStream) -> io::Result<()> {
+    if let Some(secret) = cluster_secret() {
+        send_cmd(s, &[b"AUTH", secret])?;
+        let reply = read_line(s)?;
+        if reply.first() == Some(&b'-') {
+            return Err(io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                format!(
+                    "peer rejected cluster AUTH: {}",
+                    String::from_utf8_lossy(&reply)
+                ),
+            ));
+        }
+    }
+    Ok(())
+}
+
 /// Node-to-node call returning an integer reply (`:N`). Bounded by short connect/IO
 /// timeouts so a dead peer can't stall the single-threaded hub. None on any error.
 fn cluster_call_int(addr: &str, args: &[&[u8]]) -> Option<i64> {
@@ -4589,6 +4699,7 @@ fn cluster_call_int(addr: &str, args: &[&[u8]]) -> Option<i64> {
         let mut s = TcpStream::connect_timeout(&sa, Duration::from_millis(500))?;
         s.set_read_timeout(Some(Duration::from_millis(500)))?;
         s.set_write_timeout(Some(Duration::from_millis(500)))?;
+        cluster_auth(&mut s)?;
         send_cmd(&mut s, args)?;
         let line = read_line(&mut s)?;
         match line.first() {
@@ -4691,6 +4802,7 @@ fn cluster_call_array(addr: &str, args: &[&[u8]]) -> Option<Vec<Vec<u8>>> {
         let mut s = TcpStream::connect_timeout(&sa, Duration::from_millis(500))?;
         s.set_read_timeout(Some(Duration::from_millis(800)))?;
         s.set_write_timeout(Some(Duration::from_millis(500)))?;
+        cluster_auth(&mut s)?;
         send_cmd(&mut s, args)?;
         let line = read_line(&mut s)?;
         if line.first() != Some(&b'*') {
