@@ -168,6 +168,13 @@ LOCUS_RDB=/data/locus.rdb        # snapshot path
 
 ## 4. Resource limits
 
+Locus raises its own open-files soft limit to the hard limit at boot (one fd per
+connection). On Linux, set the hard limit via systemd `LimitNOFILE=65536` or Docker
+`--ulimit nofile=65536`. **Threads:** Locus runs ~2 threads per connection — keep
+`LOCUS_MAXCLIENTS` below (OS thread limit / 2); past the limit Locus rejects new
+connections gracefully and keeps serving (it never crashes on thread exhaustion).
+
+
 - **Memory:** set `LOCUS_MAXMEMORY` (e.g. `LOCUS_MAXMEMORY=2gb`). Over the cap a
   master evicts keys; a write is rejected with `OOM` only if the cap still can't be
   met. Size the container/cgroup limit comfortably above this.

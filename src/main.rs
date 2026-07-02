@@ -84,6 +84,46 @@ static SHUTDOWN: AtomicBool = AtomicBool::new(false);
 // adds NO third-party crate — it's the C runtime the binary already links.
 unsafe extern "C" {
     fn signal(signum: i32, handler: extern "C" fn(i32)) -> usize;
+    fn getrlimit(resource: i32, rl: *mut RLimit) -> i32;
+    fn setrlimit(resource: i32, rl: *const RLimit) -> i32;
+}
+
+#[repr(C)]
+struct RLimit {
+    cur: u64,
+    max: u64,
+}
+
+#[cfg(target_os = "macos")]
+const RLIMIT_NOFILE: i32 = 8;
+#[cfg(not(target_os = "macos"))]
+const RLIMIT_NOFILE: i32 = 7;
+
+/// Raise the open-files soft limit to the hard limit — one fd per connection,
+/// and distro defaults (1024) are exhausted by a modest client fleet. Same
+/// libc-FFI stance as signal handling: no crate, just the C runtime.
+fn raise_fd_limit() {
+    unsafe {
+        let mut rl = RLimit { cur: 0, max: 0 };
+        if getrlimit(RLIMIT_NOFILE, &mut rl) != 0 || rl.cur >= rl.max {
+            return;
+        }
+        // An "unlimited" hard limit can't be assigned directly on some OSes —
+        // step down until the kernel accepts.
+        for want in [rl.max, 1 << 20, 65536, 10240] {
+            if want > rl.max || want <= rl.cur {
+                continue;
+            }
+            let req = RLimit {
+                cur: want,
+                max: rl.max,
+            };
+            if setrlimit(RLIMIT_NOFILE, &req) == 0 {
+                log::info(&format!("raised open-files limit to {want}"));
+                return;
+            }
+        }
+    }
 }
 
 extern "C" fn on_signal(_sig: i32) {
@@ -103,6 +143,7 @@ fn install_signal_handlers() {
 
 fn main() -> io::Result<()> {
     log::init();
+    raise_fd_limit();
     // Sentinel mode: run as a failover monitor instead of a data node (never
     // returns). Enabled by pointing LOCUS_SENTINEL at a master's host:port.
     if std::env::var("LOCUS_SENTINEL").is_ok_and(|v| !v.is_empty()) {
@@ -167,12 +208,20 @@ fn main() -> io::Result<()> {
                 let id = next_id.fetch_add(1, Ordering::Relaxed);
                 let tx = tx.clone();
                 let guard = ConnGuard(conns.clone());
-                thread::spawn(move || {
+                // Builder::spawn returns the OS error instead of panicking — if
+                // the process hits its thread limit, reject THIS connection and
+                // keep serving; a full server must degrade, never crash.
+                let res = thread::Builder::new().spawn(move || {
                     let _guard = guard;
                     if let Err(e) = handle_conn(conn, id, tx) {
                         log::warn(&format!("connection error: {e}"));
                     }
                 });
+                if let Err(e) = res {
+                    log::error(&format!(
+                        "connection thread spawn failed (thread limit?): {e} — rejecting client"
+                    ));
+                }
             }
             Err(e) => log::warn(&format!("accept error: {e}")),
         }
@@ -229,12 +278,17 @@ fn spawn_tls_listener(
             let tx = tx.clone();
             let guard = ConnGuard(conns.clone());
             let config = config.clone();
-            thread::spawn(move || {
+            let res = thread::Builder::new().spawn(move || {
                 let _guard = guard;
                 if let Err(e) = tls::handle_tls_conn(conn, id, tx, config) {
                     log::warn(&format!("tls connection error: {e}"));
                 }
             });
+            if let Err(e) = res {
+                log::error(&format!(
+                    "tls connection thread spawn failed (thread limit?): {e} — rejecting client"
+                ));
+            }
         }
     });
 }
@@ -3853,13 +3907,15 @@ fn handle_conn(conn: TcpStream, id: u64, tx: mpsc::Sender<Msg>) -> io::Result<()
 
     let mut write_half = conn.try_clone()?;
     let (out_tx, out_rx) = mpsc::channel::<Vec<u8>>();
-    let writer = thread::spawn(move || {
+    // Builder::spawn so hitting the process thread limit fails THIS connection
+    // with an error instead of panicking the server.
+    let writer = thread::Builder::new().spawn(move || {
         while let Ok(bytes) = out_rx.recv() {
             if write_half.write_all(&bytes).is_err() {
                 break;
             }
         }
-    });
+    })?;
 
     if tx
         .send(Msg::Connect {
