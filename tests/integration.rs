@@ -1462,6 +1462,79 @@ fn wait_ignores_forged_replconf_acks() {
 }
 
 #[test]
+fn replica_kill9_restarts_as_replica_with_exactly_the_masters_data() {
+    // The Frankenstein scenario: a node with its OWN prior AOF data becomes a
+    // replica, is kill -9'd, and restarts. It must come back (a) holding
+    // exactly the master's dataset — not a replay of old-data + stream — and
+    // (b) AS a read-only replica, not a writable master.
+    let tmp = std::env::temp_dir();
+    let pid = std::process::id();
+    let aof = format!("{}/locus-t2-replica-{pid}.aof", tmp.display());
+    let role = format!("{}/locus-t2-replica-{pid}.role", tmp.display());
+    for f in [&aof, &role] {
+        let _ = std::fs::remove_file(f);
+    }
+
+    let master = Server::start();
+    let mut m = master.connect();
+    m.cmd(&["SET", "shared", "from-master"]);
+
+    // The replica-to-be first lives as a standalone with its own data.
+    let env: &[(&str, &str)] = &[
+        ("LOCUS_AOF", aof.as_str()),
+        ("LOCUS_ROLE_FILE", role.as_str()),
+    ];
+    let mut replica = Server::start_inner(env);
+    {
+        let mut r = replica.connect();
+        r.cmd(&["SET", "junk", "pre-sync-data"]);
+        assert_eq!(
+            r.cmd(&["REPLICAOF", "127.0.0.1", &master.port.to_string()]),
+            "OK"
+        );
+        let deadline = Instant::now() + Duration::from_secs(3);
+        while r.cmd(&["GET", "shared"]) != "from-master" {
+            assert!(Instant::now() < deadline, "never synced");
+            sleep(Duration::from_millis(30));
+        }
+        // A post-sync streamed write, so the rebuilt AOF gets a tail too.
+        m.cmd(&["SET", "streamed", "later"]);
+        let deadline = Instant::now() + Duration::from_secs(3);
+        while r.cmd(&["GET", "streamed"]) != "later" {
+            assert!(Instant::now() < deadline, "stream never applied");
+            sleep(Duration::from_millis(30));
+        }
+    }
+    // kill -9 (Child::kill is SIGKILL) and restart on the same AOF+role files.
+    replica.child.kill().unwrap();
+    let _ = replica.child.wait();
+    let restarted = Server::start_inner(env);
+    let mut r = restarted.connect();
+    // (a) Exactly the master's dataset: junk must NOT have been resurrected.
+    assert_eq!(r.cmd(&["GET", "shared"]), "from-master");
+    assert_eq!(r.cmd(&["GET", "streamed"]), "later");
+    assert_eq!(
+        r.cmd(&["GET", "junk"]),
+        "(nil)",
+        "pre-sync data resurrected"
+    );
+    // (b) Still a replica: role persisted, writes rejected.
+    let deadline = Instant::now() + Duration::from_secs(3);
+    loop {
+        let info = r.cmd(&["INFO"]);
+        if info.contains("role:slave") {
+            break;
+        }
+        assert!(Instant::now() < deadline, "did not resume replica role");
+        sleep(Duration::from_millis(50));
+    }
+    assert!(r.cmd(&["SET", "w", "1"]).starts_with("-READONLY"));
+    for f in [&aof, &role] {
+        let _ = std::fs::remove_file(f);
+    }
+}
+
+#[test]
 fn replica_loses_keys_when_the_master_expires_them() {
     let master = Server::start();
     let replica = Server::start();

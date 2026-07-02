@@ -102,8 +102,9 @@ enum Msg {
     /// The replica's link to its master dropped (clear master_link_status).
     MasterLinkDown,
     /// An async BGREWRITEAOF finished writing its base image off-thread; carries
-    /// the temp path on success (to finalize) or an error string.
-    AofRewriteDone(Result<String, String>),
+    /// the generation it was started under (a full resync invalidates in-flight
+    /// rewrites) and the temp path on success (to finalize) or an error string.
+    AofRewriteDone(u64, Result<String, String>),
     /// A peer's gossiped slot topology, as (start, end, owner, epoch) runs — the
     /// gossip thread fetched it off-hub; the hub adopts higher-epoch entries.
     ClusterGossip(Vec<(u16, u16, String, u64)>),
@@ -267,6 +268,32 @@ fn main() -> io::Result<()> {
         }
     }
     Ok(())
+}
+
+/// Where the node's role (master / replicaof host port) is persisted across
+/// restarts. Defaults beside the RDB file; override with LOCUS_ROLE_FILE.
+fn role_file_path() -> String {
+    std::env::var("LOCUS_ROLE_FILE").unwrap_or_else(|_| format!("{}.role", rdb::configured_path()))
+}
+
+/// The master to replicate from at boot: LOCUS_REPLICAOF ("host port" or
+/// "host:port") wins; otherwise the persisted role file from the previous run.
+fn boot_master() -> Option<(String, String)> {
+    let parse = |s: &str| -> Option<(String, String)> {
+        let s = s.trim();
+        let (h, p) = s
+            .split_once(' ')
+            .or_else(|| s.split_once(':'))
+            .map(|(h, p)| (h.trim(), p.trim()))?;
+        (!h.is_empty() && p.parse::<u16>().is_ok()).then(|| (h.to_string(), p.to_string()))
+    };
+    if let Ok(v) = std::env::var("LOCUS_REPLICAOF")
+        && !v.trim().is_empty()
+    {
+        return parse(&v);
+    }
+    let content = std::fs::read_to_string(role_file_path()).ok()?;
+    parse(content.trim().strip_prefix("replicaof")?)
 }
 
 /// A data file that failed to load is EVIDENCE — move it aside (timestamped)
@@ -522,6 +549,9 @@ struct Hub {
     // Next allowed recovery-rewrite attempt (ms since epoch) — backoff so a
     // still-full disk isn't hammered every maintenance tick.
     aof_retry_at: u64,
+    // Bumped whenever an in-flight rewrite becomes invalid (a full resync
+    // replaced the dataset); a stale AofRewriteDone is discarded by generation.
+    aof_rewrite_gen: u64,
     clients: HashMap<u64, OutChan>,
     outbuf: OutLimits,
     pubsub: PubSub,
@@ -720,6 +750,7 @@ impl Hub {
                 .map(|v| v.trim().eq_ignore_ascii_case("stop"))
                 .unwrap_or(true),
             aof_retry_at: 0,
+            aof_rewrite_gen: 0,
             clients: HashMap::new(),
             outbuf: OutLimits::from_env(),
             pubsub: PubSub::new(),
@@ -798,6 +829,12 @@ impl Hub {
             waiting: Vec::new(),
         };
         hub.apply_extras(extras);
+        // Resume the persisted role: a crashed replica must come back AS a
+        // replica (read-only, re-syncing from its master) — not as a writable
+        // master serving stale data that a sentinel might then promote.
+        if let Some((h, p)) = boot_master() {
+            hub.start_replication(h, p);
+        }
         hub
     }
 
@@ -953,11 +990,12 @@ impl Hub {
         let buf = aof::serialize_rewrite(&self.db);
         self.aof_rewrite_buf = Some(Vec::new());
         let tx = self.tx.clone();
+        let rewrite_gen = self.aof_rewrite_gen;
         let spawned = thread::Builder::new().spawn(move || {
             let res = aof::write_tmp(&tmp, &buf)
                 .map(|()| tmp)
                 .map_err(|e| e.to_string());
-            let _ = tx.send(Msg::AofRewriteDone(res));
+            let _ = tx.send(Msg::AofRewriteDone(rewrite_gen, res));
         });
         if spawned.is_err() {
             self.aof_rewrite_buf = None;
@@ -988,6 +1026,70 @@ impl Hub {
         if let Err(e) = self.start_aof_rewrite() {
             log::error(&format!("AOF recovery rewrite failed to start: {e}"));
         }
+    }
+
+    /// Replace the on-disk AOF with a fresh serialization of the CURRENT
+    /// dataset (temp + fsync + atomic rename), synchronously on the hub. Used
+    /// at the full-resync boundary: correctness over latency — every byte of
+    /// the master's stream appended afterwards lands on a log that starts from
+    /// the exact snapshot it continues.
+    fn rebuild_aof_from_db(&mut self) {
+        let Some(path) = self.aof_path.clone() else {
+            return;
+        };
+        if self.aof.is_none() {
+            return; // AOF disabled (or already dark) — nothing to rebuild
+        }
+        let buf = aof::serialize_rewrite(&self.db);
+        let tmp = format!("{path}.tmp.{}", std::process::id());
+        let res = aof::write_tmp(&tmp, &buf).and_then(|()| aof::finalize_rewrite(&tmp, &path, &[]));
+        match res.and_then(|()| aof::Aof::open(&path)) {
+            Ok(a) => {
+                self.aof = Some(a);
+                log::info("AOF rebuilt from the full-resync snapshot");
+            }
+            Err(e) => {
+                // Appending the stream to the OLD file would be worse than no
+                // AOF at all (crash-replay would merge two datasets): go dark.
+                let _ = std::fs::remove_file(&tmp);
+                self.aof = None;
+                log::error(&format!(
+                    "AOF rebuild after full resync failed: {e} — AOF DISABLED (the old log described the pre-sync dataset)"
+                ));
+            }
+        }
+    }
+
+    /// Persist which role this node is in (master, or replica of whom), so a
+    /// restart resumes the SAME role. Without this a crashed replica rebooted
+    /// as a writable master with whatever data its files held — and a sentinel
+    /// could promote that.
+    fn persist_role(&self) {
+        let content = match &self.master {
+            Some((h, p)) => format!("replicaof {h} {p}\n"),
+            None => "master\n".to_string(),
+        };
+        if let Err(e) = std::fs::write(role_file_path(), content) {
+            log::warn(&format!("could not persist role: {e}"));
+        }
+    }
+
+    /// Point this node at a master and start the sync thread. Shared by the
+    /// REPLICAOF command and boot-time role resumption.
+    fn start_replication(&mut self, host: String, port: String) {
+        if let Some(flag) = self.replica_stop.take() {
+            flag.store(true, Ordering::Relaxed);
+        }
+        self.master = Some((host.clone(), port.clone()));
+        self.master_link_up = false; // until the full sync completes
+        let stop = Arc::new(AtomicBool::new(false));
+        self.replica_stop = Some(stop.clone());
+        let addr = format!("{host}:{port}");
+        let txc = self.tx.clone();
+        let masterauth = self.masterauth.clone();
+        thread::spawn(move || replica_sync(addr, masterauth, txc, stop));
+        self.persist_role();
+        log::info(&format!("replication: now replicating from {host}:{port}"));
     }
 
     /// Flush the AOF and (unless NOSAVE) write a final snapshot, then exit 0.
@@ -3444,26 +3546,19 @@ impl Hub {
                 resp::error("ERR wrong number of arguments for 'replicaof' command"),
             );
         }
-        // Stop any existing replication link first.
-        if let Some(flag) = self.replica_stop.take() {
-            flag.store(true, Ordering::Relaxed);
-        }
         if tokens[1].eq_ignore_ascii_case(b"NO") && tokens[2].eq_ignore_ascii_case(b"ONE") {
+            // Stop the sync thread; promotion to a writable master.
+            if let Some(flag) = self.replica_stop.take() {
+                flag.store(true, Ordering::Relaxed);
+            }
             self.master = None;
+            self.persist_role();
             log::info("replication: promoted to master");
             return self.send(id, resp::simple_string("OK"));
         }
         let host = String::from_utf8_lossy(&tokens[1]).to_string();
         let port = String::from_utf8_lossy(&tokens[2]).to_string();
-        self.master = Some((host.clone(), port.clone()));
-        self.master_link_up = false; // until the full sync completes
-        let stop = Arc::new(AtomicBool::new(false));
-        self.replica_stop = Some(stop.clone());
-        let addr = format!("{host}:{port}");
-        let txc = self.tx.clone();
-        let masterauth = self.masterauth.clone();
-        thread::spawn(move || replica_sync(addr, masterauth, txc, stop));
-        log::info(&format!("replication: now replicating from {host}:{port}"));
+        self.start_replication(host, port);
         self.send(id, resp::simple_string("OK"));
     }
 
@@ -3758,42 +3853,60 @@ fn run_hub(rx: mpsc::Receiver<Msg>, tx: mpsc::SyncSender<Msg>) {
                 hub.replid = replid;
                 hub.master_repl_offset = offset;
                 hub.master_link_up = true;
+                // An in-flight BGREWRITEAOF serialized the PRE-sync dataset —
+                // finalizing it would swap old-base + new-tail into place.
+                // Invalidate it by generation, then rebuild the AOF from the
+                // fresh snapshot: the on-disk log still holds the OLD dataset,
+                // and appending the master's stream after it would replay a
+                // Frankenstein merge of both after a crash.
+                hub.aof_rewrite_gen += 1;
+                hub.aof_rewrite_buf = None;
+                hub.rebuild_aof_from_db();
                 // A replica that just loaded a full-sync snapshot may now be able
                 // to satisfy readers parked on a blocking XREAD.
                 hub.serve_blocked();
             }
             Ok(Msg::MasterLinkDown) => hub.master_link_up = false,
             Ok(Msg::ClusterGossip(ranges)) => hub.merge_gossip(ranges),
-            Ok(Msg::AofRewriteDone(res)) => {
-                // Fold the writes buffered during the rewrite into the new file,
-                // then swap it in. On any failure we keep the old AOF (which still
-                // holds those writes), so durability is never broken.
-                let tail = hub.aof_rewrite_buf.take().unwrap_or_default();
-                match (res, hub.aof_path.clone()) {
-                    (Ok(tmp), Some(path)) => match aof::finalize_rewrite(&tmp, &path, &tail) {
-                        Ok(()) => match aof::Aof::open(&path) {
-                            Ok(a) => {
-                                hub.aof = Some(a);
-                                log::info("AOF rewrite complete");
-                            }
-                            Err(e) => {
-                                // Persistence just went dark — say so loudly
-                                // (INFO reports aof_enabled:0 from here on).
-                                hub.aof = None;
-                                log::error(&format!(
-                                    "AOF reopen after rewrite failed: {e} — AOF DISABLED, writes are no longer being logged"
-                                ));
-                            }
-                        },
-                        Err(e) => {
-                            let _ = std::fs::remove_file(&tmp);
-                            log::error(&format!("AOF rewrite finalize failed: {e}"));
-                        }
-                    },
-                    (Ok(tmp), None) => {
+            Ok(Msg::AofRewriteDone(rewrite_gen, res)) => {
+                if rewrite_gen != hub.aof_rewrite_gen {
+                    // Started before a full resync replaced the dataset: its
+                    // base image describes a dataset we no longer hold.
+                    if let Ok(tmp) = res {
                         let _ = std::fs::remove_file(&tmp);
                     }
-                    (Err(e), _) => log::error(&format!("AOF rewrite failed: {e}")),
+                    log::info("discarded a stale AOF rewrite (dataset was replaced mid-rewrite)");
+                } else {
+                    // Fold the writes buffered during the rewrite into the new
+                    // file, then swap it in. On any failure we keep the old AOF
+                    // (which still holds those writes) — durability unbroken.
+                    let tail = hub.aof_rewrite_buf.take().unwrap_or_default();
+                    match (res, hub.aof_path.clone()) {
+                        (Ok(tmp), Some(path)) => match aof::finalize_rewrite(&tmp, &path, &tail) {
+                            Ok(()) => match aof::Aof::open(&path) {
+                                Ok(a) => {
+                                    hub.aof = Some(a);
+                                    log::info("AOF rewrite complete");
+                                }
+                                Err(e) => {
+                                    // Persistence just went dark — say so loudly
+                                    // (INFO reports aof_enabled:0 from here on).
+                                    hub.aof = None;
+                                    log::error(&format!(
+                                        "AOF reopen after rewrite failed: {e} — AOF DISABLED, writes are no longer being logged"
+                                    ));
+                                }
+                            },
+                            Err(e) => {
+                                let _ = std::fs::remove_file(&tmp);
+                                log::error(&format!("AOF rewrite finalize failed: {e}"));
+                            }
+                        },
+                        (Ok(tmp), None) => {
+                            let _ = std::fs::remove_file(&tmp);
+                        }
+                        (Err(e), _) => log::error(&format!("AOF rewrite failed: {e}")),
+                    }
                 }
             }
             Err(mpsc::RecvTimeoutError::Timeout) => {}
