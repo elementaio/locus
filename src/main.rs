@@ -770,9 +770,16 @@ impl Hub {
         let aof_path = aof::configured_path();
         let (db, aof, extras) = match &aof_path {
             Some(path) => {
+                // A torn tail loads fine (stops at the last complete command);
+                // mid-file corruption returns Err and we REFUSE TO START rather
+                // than quarantine-and-start-empty (which would silently discard
+                // the recoverable prefix). The operator fixes the disk or sets
+                // LOCUS_AOF_LOAD_TRUNCATED=yes to recover what precedes the hole.
                 let db = aof::load(path).unwrap_or_else(|e| {
-                    quarantine_corrupt_file(path, &format!("AOF load failed: {e}"));
-                    Db::new()
+                    log::error(&format!(
+                        "refusing to start: {e}. The AOF is the source of truth and dropping it would lose data. Investigate {path}, or set LOCUS_AOF_LOAD_TRUNCATED=yes to load everything up to the corruption."
+                    ));
+                    std::process::exit(1);
                 });
                 let aof = aof::Aof::open(path)
                     .map_err(|e| log::warn(&format!("AOF open failed: {e}")))
@@ -1167,6 +1174,7 @@ impl Hub {
         self.reset_master_repl_state();
         self.repl_session += 1; // orphan any still-running sync thread's stream
         self.master = Some((host.clone(), port.clone()));
+        self.db.set_replica_mode(true); // expiry becomes hide-don't-delete
         self.master_link_up = false; // until the full sync completes
         let stop = Arc::new(AtomicBool::new(false));
         self.replica_stop = Some(stop.clone());
@@ -2239,9 +2247,26 @@ impl Hub {
                 } else if t.dirty {
                     self.send(id, resp::null_array()); // a watched key changed -> abort
                 } else {
+                    // Wrap the batch's replicated writes in MULTI/EXEC so a
+                    // replica applies them in ONE hub turn — a replica reader
+                    // can't observe a half-applied transaction (the writes
+                    // otherwise stream as individual commands with client reads
+                    // free to interleave between them). The AOF is NOT wrapped:
+                    // its loader replays bare commands, and a torn tail already
+                    // stops at the last complete one.
+                    let has_write = t
+                        .queued
+                        .iter()
+                        .any(|q| !q.is_empty() && aof::is_write(&q[0].to_ascii_uppercase()));
+                    if has_write {
+                        self.replicate(resp::command(&[b"MULTI".to_vec()]));
+                    }
                     let mut replies = Vec::with_capacity(t.queued.len());
                     for q in t.queued {
                         replies.push(self.exec_one(id, q));
+                    }
+                    if has_write {
+                        self.replicate(resp::command(&[b"EXEC".to_vec()]));
                     }
                     self.send(id, resp::array(&replies));
                 }
@@ -3681,6 +3706,9 @@ impl Hub {
             }
             self.repl_session += 1; // any straggling stream messages are stale
             if self.master.take().is_some() {
+                // A master owns expiry again: switch back to delete-on-expire
+                // and actively reap the keys the old master hadn't DEL'd yet.
+                self.db.set_replica_mode(false);
                 // ROTATE the replication id: our history may diverge from the
                 // old master's unseen tail from this point on, so a downstream
                 // PSYNC quoting the old replid must FULLRESYNC — a CONTINUE

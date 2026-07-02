@@ -198,6 +198,11 @@ pub struct Db {
     /// Victim cache for `evict_one`: a random window of keys, refilled on
     /// demand, so eviction is random-ish instead of iteration-order-determined.
     evict_pool: Vec<Vec<u8>>,
+    /// Replica mode: expiry is HIDE-don't-delete. A logically-expired key reads
+    /// as absent but is NOT removed until the master streams the DEL. Deleting
+    /// it locally (clock skew ahead of the master) then having the master
+    /// extend its TTL leaves the two permanently diverged.
+    replica_mode: bool,
     /// Approximate memory accounting for `maxmemory`. `mem_used` is the running
     /// total; `sizes` is the last-known estimate per key so removals/updates can
     /// be applied as deltas. Estimates are deliberately coarse (see
@@ -220,6 +225,7 @@ impl Db {
             expired: Vec::new(),
             expiry_pool: Vec::new(),
             evict_pool: Vec::new(),
+            replica_mode: false,
             mem_used: 0,
             sizes: HashMap::new(),
             geo_index: BTreeMap::new(),
@@ -265,7 +271,23 @@ impl Db {
         out
     }
 
+    /// Set (or clear) replica mode. In replica mode the keyspace never expires
+    /// keys on its own — only the master's streamed DELs remove them.
+    pub fn set_replica_mode(&mut self, on: bool) {
+        self.replica_mode = on;
+    }
+
+    /// Is `key` logically expired right now (deadline passed)?
+    fn is_expired(&self, key: &[u8]) -> bool {
+        self.expires.get(key).is_some_and(|&d| d <= now_ms())
+    }
+
     fn check_expiry(&mut self, key: &[u8]) {
+        // On a replica, reads HIDE an expired key (handled by callers via
+        // is_expired) but never delete it — the master owns expiry timing.
+        if self.replica_mode {
+            return;
+        }
         if let Some(&deadline) = self.expires.get(key)
             && deadline <= now_ms()
         {
@@ -352,11 +374,17 @@ impl Db {
 
     pub fn get(&mut self, key: &[u8]) -> Option<&Value> {
         self.check_expiry(key);
+        if self.replica_mode && self.is_expired(key) {
+            return None; // hidden-but-present until the master's DEL
+        }
         self.data.get(key)
     }
 
     pub fn get_mut(&mut self, key: &[u8]) -> Option<&mut Value> {
         self.check_expiry(key);
+        if self.replica_mode && self.is_expired(key) {
+            return None;
+        }
         self.data.get_mut(key)
     }
 
@@ -377,11 +405,17 @@ impl Db {
 
     pub fn contains(&mut self, key: &[u8]) -> bool {
         self.check_expiry(key);
+        if self.replica_mode && self.is_expired(key) {
+            return false;
+        }
         self.data.contains_key(key)
     }
 
     pub fn type_name(&mut self, key: &[u8]) -> Option<&'static str> {
         self.check_expiry(key);
+        if self.replica_mode && self.is_expired(key) {
+            return None;
+        }
         self.data.get(key).map(|v| v.type_name())
     }
 
@@ -425,6 +459,9 @@ impl Db {
     /// quarter or more of each sample was expired (Redis's stop rule). Bounded
     /// per call so it can't stall the hub.
     pub fn active_expire(&mut self) {
+        if self.replica_mode {
+            return; // the master owns expiry timing; we wait for its DELs
+        }
         let now = now_ms();
         // Lazy compaction: stale entries (TTL removed/overwritten keys) are
         // dropped as drawn; a full rebuild only when the pool is mostly stale.
@@ -624,6 +661,28 @@ mod tests {
         while db.evict_one().is_some() {}
         assert_eq!(db.mem_used(), 0);
         assert!(db.evict_one().is_none());
+    }
+
+    #[test]
+    fn replica_mode_hides_but_keeps_expired_keys() {
+        let mut db = Db::new();
+        db.set_replica_mode(true);
+        db.insert(b"k".to_vec(), Value::Str(b"v".to_vec()));
+        db.set_expire(b"k", now_ms().saturating_sub(1)); // already past
+        // Reads hide the logically-expired key...
+        assert!(db.get(b"k").is_none());
+        assert!(!db.contains(b"k"));
+        // ...but the active reaper does NOT delete it (master owns expiry).
+        db.active_expire();
+        assert!(db.take_expired().is_empty(), "replica reaped a key itself");
+        // The master's streamed DEL removes it and dirties WATCHers as normal.
+        assert!(db.remove(b"k").is_some());
+        // Back on a master, expiry deletes locally again.
+        db.set_replica_mode(false);
+        db.insert(b"k2".to_vec(), Value::Str(b"v".to_vec()));
+        db.set_expire(b"k2", now_ms().saturating_sub(1));
+        db.active_expire();
+        assert_eq!(db.take_expired(), vec![b"k2".to_vec()]);
     }
 
     #[test]

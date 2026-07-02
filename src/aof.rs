@@ -280,7 +280,15 @@ fn extract_bulks(reply: &[u8]) -> Vec<Vec<u8>> {
     out
 }
 
-/// Replay the AOF to rebuild the dataset. Tolerant of a truncated final command.
+/// Replay the AOF to rebuild the dataset.
+///
+/// A crash can only ever truncate the FINAL command, so a short/incomplete tail
+/// is tolerated (stop at the last complete command). But a `Parsed::Error` — a
+/// structurally invalid frame — with more bytes after it is MID-FILE corruption
+/// (a flipped byte, a bad disk), not a torn tail: silently stopping there would
+/// hide an unbounded amount of still-present history. That is refused (unless
+/// LOCUS_AOF_LOAD_TRUNCATED=yes), so the operator sees it instead of quietly
+/// starting with half the data and appending after the hole.
 pub fn load(path: &str) -> io::Result<Db> {
     let mut data = Vec::new();
     match File::open(path) {
@@ -290,6 +298,10 @@ pub fn load(path: &str) -> io::Result<Db> {
         Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(Db::new()),
         Err(e) => return Err(e),
     }
+    let allow_truncated = std::env::var("LOCUS_AOF_LOAD_TRUNCATED")
+        .map(|v| matches!(v.trim(), "yes" | "1" | "on" | "true"))
+        .unwrap_or(false);
+    let total = data.len();
     let mut db = Db::new();
     let mut pos = 0;
     while pos < data.len() {
@@ -300,7 +312,19 @@ pub fn load(path: &str) -> io::Result<Db> {
                 }
                 pos += consumed;
             }
-            // Truncated or corrupt tail — stop at the last complete command.
+            // A structurally-invalid frame with bytes remaining after it can't
+            // be a torn tail (a crash truncates, it doesn't corrupt the middle):
+            // refuse rather than silently drop the rest of the history.
+            Parsed::Error(msg) if !allow_truncated => {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    format!(
+                        "AOF corruption at byte {pos}/{total}: {msg} (set LOCUS_AOF_LOAD_TRUNCATED=yes to load what precedes it)"
+                    ),
+                ));
+            }
+            // Truncated final command (or, with the override, a corrupt tail) —
+            // stop at the last complete command.
             Parsed::Incomplete | Parsed::Error(_) => break,
         }
     }
@@ -534,6 +558,31 @@ mod tests {
         let mut db = load(path).unwrap();
         assert_eq!(run(&mut db, &[b"GET", b"ok"]), b"$1\r\n1\r\n".to_vec());
         assert_eq!(run(&mut db, &[b"EXISTS", b"half"]), b":0\r\n".to_vec()); // torn cmd dropped
+        let _ = fs::remove_file(path);
+    }
+
+    #[test]
+    fn mid_file_corruption_is_refused_but_torn_tail_is_not() {
+        let path = "/tmp/locus_aof_midcorrupt.aof";
+        let _ = fs::remove_file(path);
+        let mut a = Aof::open(path).unwrap();
+        a.append(&[vec![b"SET".to_vec(), b"a".to_vec(), b"1".to_vec()]])
+            .unwrap();
+        // A structurally-invalid frame in the MIDDLE, then a valid command
+        // after it — this can't be a crash's torn tail (a crash truncates the
+        // end), so replay must refuse rather than silently drop the rest.
+        let mut f = OpenOptions::new().append(true).open(path).unwrap();
+        f.write_all(b"*9\r\n+notabulk\r\n").unwrap(); // bad frame mid-file
+        f.write_all(b"*3\r\n$3\r\nSET\r\n$1\r\nb\r\n$1\r\n2\r\n")
+            .unwrap();
+        drop(f);
+        assert!(load(path).is_err(), "mid-file corruption should be refused");
+
+        // The override recovers everything up to the corruption.
+        unsafe { std::env::set_var("LOCUS_AOF_LOAD_TRUNCATED", "yes") };
+        let mut db = load(path).unwrap();
+        assert_eq!(run(&mut db, &[b"GET", b"a"]), b"$1\r\n1\r\n".to_vec());
+        unsafe { std::env::remove_var("LOCUS_AOF_LOAD_TRUNCATED") };
         let _ = fs::remove_file(path);
     }
 
