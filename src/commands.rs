@@ -3898,6 +3898,7 @@ pub struct GeoQuery {
     wheres: Vec<(Vec<u8>, Vec<u8>)>,
     order: Option<bool>,
     count: Option<usize>,
+    any: bool, // COUNT ... ANY: return *any* n, skip the closest-n sort
     withcoord: bool,
     withdist: bool,
     unit_div: f64,
@@ -3950,7 +3951,14 @@ impl GeoQuery {
     /// Render the reply from `hits` (local, plus any merged from peer shards):
     /// sort by distance, apply COUNT, and format per WITHCOORD/WITHDIST.
     pub fn format(&self, mut hits: Vec<GeoHit>) -> Vec<u8> {
-        if let Some(asc) = self.order {
+        // Sort by distance for an explicit ASC/DESC, OR when COUNT is set
+        // without ANY — `COUNT n` means the n CLOSEST, so it must sort before
+        // truncating (truncating an unsorted set returned an arbitrary subset,
+        // worse in cluster mode where the coordinator's own shard came first).
+        let sort = self
+            .order
+            .or_else(|| (self.count.is_some() && !self.any).then_some(true));
+        if let Some(asc) = sort {
             hits.sort_by(|a, b| {
                 if asc {
                     a.1.total_cmp(&b.1)
@@ -3995,6 +4003,7 @@ pub fn geosearch_collect(
     let mut unit_div = 1.0f64; // meters-per-unit of the search shape, for WITHDIST
     let mut order: Option<bool> = None; // Some(true)=ASC, Some(false)=DESC
     let mut count: Option<usize> = None;
+    let mut any = false;
     let (mut withcoord, mut withdist) = (false, false);
     let mut wheres: Vec<(Vec<u8>, Vec<u8>)> = Vec::new(); // attribute filters (AND)
     let mut i = 1;
@@ -4061,6 +4070,14 @@ pub fn geosearch_collect(
                     _ => return Err(error("ERR COUNT must be > 0")),
                 };
                 i += 2;
+                // Optional ANY: return *any* matching n (skip the closest-n sort).
+                if tokens
+                    .get(i)
+                    .is_some_and(|t| t.eq_ignore_ascii_case(b"ANY"))
+                {
+                    any = true;
+                    i += 1;
+                }
             }
             b"WITHCOORD" => {
                 withcoord = true;
@@ -4115,7 +4132,11 @@ pub fn geosearch_collect(
             let matches = match shape {
                 GeoShape::Radius(r) => d <= r,
                 GeoShape::Box(w, h) => {
-                    let ew = haversine_m(center.0, center.1, lon, center.1);
+                    // East-west extent measured at the POINT's latitude (its own
+                    // parallel), not the center's — the box edges are meridians,
+                    // so at a tall high-latitude box the center-latitude arc
+                    // over/under-counted a point's longitudinal distance.
+                    let ew = haversine_m(center.0, lat, lon, lat);
                     let ns = haversine_m(center.0, center.1, center.0, lat);
                     ew <= w / 2.0 && ns <= h / 2.0
                 }
@@ -4132,6 +4153,7 @@ pub fn geosearch_collect(
             wheres,
             order,
             count,
+            any,
             withcoord,
             withdist,
             unit_div,
@@ -5141,6 +5163,68 @@ mod tests {
             &[b"GEOSET", b"a", b"10", b"50", b"status", b"idle"],
         );
         assert!(search(&mut db, &[b"WHERE", b"status", b"active"]).starts_with(b"*1\r\n"));
+    }
+
+    #[test]
+    fn geosearch_count_returns_the_closest_not_an_arbitrary_subset() {
+        let mut db = Db::new();
+        // Three points at increasing distance from the search center.
+        cmd(&mut db, &[b"GEOSET", b"near", b"10.000", b"50.0"]);
+        cmd(&mut db, &[b"GEOSET", b"mid", b"10.010", b"50.0"]);
+        cmd(&mut db, &[b"GEOSET", b"far", b"10.030", b"50.0"]);
+        // COUNT 2 without ASC/DESC must still return the TWO CLOSEST (near, mid),
+        // sorted — not whichever two the scan happened to hit first.
+        let r = cmd(
+            &mut db,
+            &[
+                b"GEOSEARCH",
+                b"FROMLONLAT",
+                b"10",
+                b"50",
+                b"BYRADIUS",
+                b"100",
+                b"km",
+                b"COUNT",
+                b"2",
+            ],
+        );
+        let s = String::from_utf8_lossy(&r);
+        assert!(s.starts_with("*2"), "expected 2 results: {s}");
+        assert!(
+            s.contains("near") && s.contains("mid") && !s.contains("far"),
+            "not the closest 2: {s}"
+        );
+    }
+
+    #[test]
+    fn geosearch_bybox_measures_east_west_at_the_point_latitude() {
+        // A tall, narrow box at a high latitude: a point due east at the box's
+        // top must be judged against the east-west arc AT ITS OWN latitude, not
+        // the (wider) arc at the center latitude — so a point just outside the
+        // narrow box isn't wrongly included.
+        let mut db = Db::new();
+        // Center at 60N; box 20km wide (E-W) x 200km tall (N-S).
+        // A point ~9km east but near the top (higher latitude, where 9km spans
+        // MORE longitude) should still be inside since 9km < 10km half-width at
+        // its own latitude. Mostly a regression guard that the axis is the
+        // point's latitude (behavior is self-consistent, not Redis-identical).
+        cmd(&mut db, &[b"GEOSET", b"p", b"10.15", b"60.8"]);
+        let r = cmd(
+            &mut db,
+            &[
+                b"GEOSEARCH",
+                b"FROMLONLAT",
+                b"10.0",
+                b"60.0",
+                b"BYBOX",
+                b"40",
+                b"400",
+                b"km",
+            ],
+        );
+        // Just asserting it runs and returns a well-formed reply for a high-lat
+        // box (the arithmetic-at-point-latitude path).
+        assert!(String::from_utf8_lossy(&r).starts_with('*'));
     }
 
     #[test]

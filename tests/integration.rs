@@ -676,6 +676,36 @@ fn changefeed_consumer_groups() {
 }
 
 #[test]
+fn changefeed_region_rejects_invalid_geometry() {
+    let s = Server::start();
+    let mut c = s.connect();
+    // A non-positive or non-finite radius (and out-of-range lon/lat) matches
+    // nothing and used to be accepted, silently never firing.
+    assert!(
+        c.cmd(&["CDCSUBSCRIBE", "REGION", "0", "0", "0", "km"])
+            .starts_with("-ERR")
+    );
+    assert!(
+        c.cmd(&["CDCSUBSCRIBE", "REGION", "0", "0", "-5", "km"])
+            .starts_with("-ERR")
+    );
+    assert!(
+        c.cmd(&["CDCSUBSCRIBE", "REGION", "0", "0", "nan", "km"])
+            .starts_with("-ERR")
+    );
+    assert!(
+        c.cmd(&["CDCSUBSCRIBE", "REGION", "999", "0", "5", "km"])
+            .starts_with("-ERR")
+    );
+    // A valid one is accepted (snapshot-done marker).
+    let ok = c.cmd(&["CDCSUBSCRIBE", "REGION", "0", "0", "5", "km"]);
+    assert!(
+        ok.contains("cdc-snapshot-done"),
+        "valid region rejected: {ok}"
+    );
+}
+
+#[test]
 fn changefeed_region_geofencing() {
     let s = Server::start();
     let mut w = s.connect();
@@ -2472,6 +2502,48 @@ fn cluster_works_with_requirepass_via_cluster_secret() {
     // A wrong/absent mesh secret path: the client password alone still gates.
     let mut bad = conn_to(p1);
     assert!(bad.cmd(&["GET", "loc:a"]).starts_with("-NOAUTH"));
+
+    for n in [&mut n1, &mut n2] {
+        let _ = n.kill();
+        let _ = n.wait();
+    }
+}
+
+#[test]
+fn cluster_geosearch_fromkey_requires_a_local_center() {
+    // GEOSEARCH FROMKEY resolves the center from a key that may live on another
+    // shard (GEOSEARCH is keyless for routing). In cluster mode a center key
+    // this node doesn't own is rejected toward FROMLONLAT rather than silently
+    // searching a stale/absent local copy (T3-12).
+    let (p1, p2) = (free_port(), free_port());
+    let nodes = format!("127.0.0.1:{p1} 0-8191;127.0.0.1:{p2} 8192-16383");
+    let mut n1 = spawn_cluster_node(p1, &nodes);
+    let mut n2 = spawn_cluster_node(p2, &nodes);
+    let mut c1 = conn_to(p1);
+    let mut c2 = conn_to(p2);
+
+    // Find a center key owned by node2, place it there.
+    let mut center = None;
+    for i in 0..300 {
+        let k = format!("ctr{i}");
+        let slot: i64 = c1.cmd(&["CLUSTER", "KEYSLOT", &k]).parse().unwrap();
+        if slot > 8191 {
+            center = Some(k);
+            break;
+        }
+    }
+    let center = center.unwrap();
+    c2.cmd(&["GEOSET", &center, "51.5", "25.3"]);
+
+    // FROMKEY that center on node1 (which doesn't own it) -> CROSSSLOT error.
+    let r = c1.cmd(&["GEOSEARCH", "FROMKEY", &center, "BYRADIUS", "5", "km"]);
+    assert!(
+        r.starts_with("-CROSSSLOT"),
+        "expected CROSSSLOT for a remote center key, got: {r}"
+    );
+    // On node2 (the owner) it resolves fine.
+    let r2 = c2.cmd(&["GEOSEARCH", "FROMKEY", &center, "BYRADIUS", "5", "km"]);
+    assert!(!r2.starts_with('-'), "owner should resolve FROMKEY: {r2}");
 
     for n in [&mut n1, &mut n2] {
         let _ = n.kill();

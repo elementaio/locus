@@ -744,6 +744,7 @@ struct Hub {
     cdc_maxlen: usize,
     // changefeed consumer groups (load-balanced read mode), by group name
     cdc_groups: HashMap<Vec<u8>, CdcGroup>,
+    cdc_pel_max: usize, // per-group pending-entries cap (0 = unbounded)
     // secondary indexes over a hash field, by index name (in-memory)
     indexes: HashMap<Vec<u8>, SecondaryIndex>,
     // authentication: the active shared secret (None = open) and the set of
@@ -956,6 +957,10 @@ impl Hub {
                 .and_then(|s| s.trim().parse::<usize>().ok())
                 .unwrap_or(0),
             cdc_groups: HashMap::new(),
+            cdc_pel_max: std::env::var("LOCUS_CDC_PEL_MAX")
+                .ok()
+                .and_then(|s| s.trim().parse().ok())
+                .unwrap_or(100_000),
             indexes: HashMap::new(),
             requirepass: std::env::var("LOCUS_REQUIREPASS")
                 .ok()
@@ -1526,6 +1531,25 @@ impl Hub {
     /// to every peer, merge the raw hits, then sort/count/format once. Peer calls
     /// are bounded by short timeouts (they run synchronously on the hub for now).
     fn cluster_geosearch(&mut self, tokens: &[Vec<u8>]) -> Vec<u8> {
+        // FROMKEY/FROMMEMBER resolves the center from a key. In cluster mode
+        // that key may live on another shard — GEOSEARCH is keyless for routing,
+        // so it wasn't redirected — and a leftover local copy (failed migration)
+        // would give a stale center. Only trust a center key we OWN; otherwise
+        // error toward FROMLONLAT rather than silently searching the wrong spot.
+        let mut i = 1;
+        while i + 1 < tokens.len() {
+            if tokens[i].eq_ignore_ascii_case(b"FROMKEY")
+                || tokens[i].eq_ignore_ascii_case(b"FROMMEMBER")
+            {
+                if !self.owns_key(&tokens[i + 1]) {
+                    return resp::error(
+                        "CROSSSLOT GEOSEARCH FROMKEY/FROMMEMBER center key is not on this shard — resolve its coordinate and use FROMLONLAT in cluster mode",
+                    );
+                }
+                break;
+            }
+            i += 1;
+        }
         let (q, local) = match commands::geosearch_collect(&mut self.db, tokens) {
             Ok(v) => v,
             Err(e) => return e,
@@ -2990,6 +3014,22 @@ impl Hub {
             Some(p) if tokens.len() == 6 => p,
             _ => return self.send(id, resp::error("ERR syntax error")),
         };
+        // Reject NaN / ±inf / non-positive radius: such a region matches nothing
+        // and would silently never fire (parse accepts them as f64).
+        if !lon.is_finite()
+            || !lat.is_finite()
+            || !radius_m.is_finite()
+            || radius_m <= 0.0
+            || !(-180.0..=180.0).contains(&lon)
+            || !(-90.0..=90.0).contains(&lat)
+        {
+            return self.send(
+                id,
+                resp::error(
+                    "ERR invalid REGION: lon/lat out of range or radius not a positive finite number",
+                ),
+            );
+        }
         let mut members = HashSet::new();
         let mut n = 0;
         for k in self.db.geo_keys() {
@@ -3454,6 +3494,21 @@ impl Hub {
             Some(g) => g.last_delivered,
             None => return self.send(id, resp::error("NOGROUP No such changefeed group")),
         };
+        // If the log was trimmed PAST this group's cursor, records between the
+        // cursor and the oldest retained record are gone — the group would
+        // silently jump the gap (at-least-once broken). Error instead, exactly
+        // as CDCREAD does, so the consumer knows to re-snapshot. (front.offset
+        // == last+1 is contiguous; only a bigger gap is a real loss.)
+        if let Some(front) = self.cdc_log.front()
+            && front.offset > last.saturating_add(1)
+        {
+            return self.send(
+                id,
+                resp::error(
+                    "ERR changefeed history truncated past this group's cursor — re-snapshot",
+                ),
+            );
+        }
         // Scan the log for new records (no group borrow held during the scan).
         let mut out: Vec<Vec<u8>> = Vec::new();
         let mut offsets: Vec<u64> = Vec::new();
@@ -3477,10 +3532,27 @@ impl Hub {
                 }
             }
         }
+        // The pending-entries list is bounded: a consumer that never ACKs can't
+        // grow it without limit. At the cap the OLDEST pending entries are
+        // dropped (delivered-but-unacked → treated as lost/at-most-once for
+        // those), with a warning — better than unbounded hub memory.
+        let cap = self.cdc_pel_max;
         if let Some(g) = self.cdc_groups.get_mut(&tokens[1]) {
             g.last_delivered = maxoff;
             for off in offsets {
                 g.pending.insert(off, consumer.clone());
+            }
+            if cap > 0 && g.pending.len() > cap {
+                let mut keys: Vec<u64> = g.pending.keys().copied().collect();
+                keys.sort_unstable();
+                let drop_n = g.pending.len() - cap;
+                for k in keys.into_iter().take(drop_n) {
+                    g.pending.remove(&k);
+                }
+                log::warn(&format!(
+                    "changefeed group {}: pending list hit {cap} — dropped {drop_n} oldest unacked entries (a consumer isn't acking)",
+                    String::from_utf8_lossy(&tokens[1])
+                ));
             }
         }
         self.send(id, resp::array(&out));
