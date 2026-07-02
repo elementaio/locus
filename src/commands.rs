@@ -35,8 +35,9 @@ fn next_rand() -> u64 {
     s
 }
 
-/// A uniform-ish index in `0..n` (n must be > 0).
-fn rand_index(n: usize) -> usize {
+/// A uniform-ish index in `0..n` (n must be > 0). Shared with the keyspace's
+/// expiry/eviction sampling (db.rs).
+pub(crate) fn rand_index(n: usize) -> usize {
     (next_rand() % n as u64) as usize
 }
 

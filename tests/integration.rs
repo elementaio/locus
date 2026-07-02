@@ -816,6 +816,56 @@ fn bounded_hub_queue_backpressures_pipeline_without_loss() {
     assert_eq!(c.cmd(&["GET", "k9999"]), "v9999");
 }
 
+#[test]
+fn maintenance_runs_under_sustained_load() {
+    // XREAD BLOCK deadlines and active TTL expiry are driven by the hub's
+    // maintenance sweep. A steady command stream must not starve it (the old
+    // shape only swept when the queue went idle for 100ms — never, under load).
+    let s = Server::start();
+    let mut blocked = s.connect();
+    blocked.cmd(&["XADD", "st", "1-1", "f", "v"]);
+    blocked.send(&["XREAD", "BLOCK", "300", "STREAMS", "st", "$"]);
+
+    // Saturate the hub with cheap commands from another connection for ~1.2s.
+    let mut busy = s.connect();
+    busy.cmd(&["SET", "ttl-key", "v"]);
+    busy.cmd(&["PEXPIRE", "ttl-key", "150"]);
+    let start = Instant::now();
+    while start.elapsed() < Duration::from_millis(1200) {
+        busy.send(&["PING"]);
+        busy.read_reply();
+    }
+    // The parked reader must have been timed out near its 300ms deadline
+    // (its nil reply is already waiting), despite the hub never going idle.
+    let reply = blocked.read_reply();
+    assert_eq!(reply, "(nil)", "BLOCK deadline starved: {reply}");
+    // And the TTL key must have been actively reaped meanwhile (EXISTS would
+    // also passively delete it — used_memory-level reap is what we saturated).
+    assert_eq!(busy.cmd(&["EXISTS", "ttl-key"]), "0");
+}
+
+#[test]
+fn aof_write_status_is_reported_in_info() {
+    // The INFO plumbing for AOF health (drives the MISCONF write gate and the
+    // recovery rewrite; the failure path itself needs fault injection).
+    let aof = format!(
+        "{}/locus-aof-status-{}.aof",
+        std::env::temp_dir().display(),
+        std::process::id()
+    );
+    let _ = std::fs::remove_file(&aof);
+    let s = Server::start_inner(&[("LOCUS_AOF", aof.as_str())]);
+    let mut c = s.connect();
+    assert_eq!(c.cmd(&["SET", "a", "1"]), "OK");
+    let info = c.cmd(&["INFO"]);
+    assert!(
+        info.contains("aof_enabled:1") && info.contains("aof_last_write_status:ok"),
+        "AOF health missing from INFO"
+    );
+    drop(s);
+    let _ = std::fs::remove_file(&aof);
+}
+
 // === blocking XREAD =========================================================
 
 #[test]

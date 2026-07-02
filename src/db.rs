@@ -188,6 +188,16 @@ pub struct Db {
     /// drains this to dirty any WATCHers of an expired key (a watched key that
     /// expires must abort EXEC, just like an explicit modification).
     expired: Vec<Vec<u8>>,
+    /// Sampling pool for the active reaper: every key that ever gained a TTL,
+    /// with lazy deletion (stale entries are dropped when drawn, and the pool
+    /// is rebuilt when it grows well past `expires`). std's HashMap can't be
+    /// indexed randomly, so this Vec is what makes O(1) *random* sampling
+    /// possible — iterating `expires` from the front every cycle would sample
+    /// the same keys forever and let everything behind them leak.
+    expiry_pool: Vec<Vec<u8>>,
+    /// Victim cache for `evict_one`: a random window of keys, refilled on
+    /// demand, so eviction is random-ish instead of iteration-order-determined.
+    evict_pool: Vec<Vec<u8>>,
     /// Approximate memory accounting for `maxmemory`. `mem_used` is the running
     /// total; `sizes` is the last-known estimate per key so removals/updates can
     /// be applied as deltas. Estimates are deliberately coarse (see
@@ -208,6 +218,8 @@ impl Db {
             data: HashMap::new(),
             expires: HashMap::new(),
             expired: Vec::new(),
+            expiry_pool: Vec::new(),
+            evict_pool: Vec::new(),
             mem_used: 0,
             sizes: HashMap::new(),
             geo_index: BTreeMap::new(),
@@ -311,15 +323,30 @@ impl Db {
         self.geo_cell.keys().cloned().collect()
     }
 
-    /// Evict one arbitrary key (HashMap order — not true LRU/random; that's a
-    /// later refinement). Returns the evicted key, or None if the keyspace is
-    /// empty. Used by the hub's `maxmemory` eviction loop.
+    /// Evict one random-ish key (allkeys-random). Victims come from a small
+    /// cache refilled from a RANDOM window of the keyspace: `.keys().next()`
+    /// would hammer whatever sits at the front of HashMap iteration order and
+    /// never touch the back. The O(n) skip to a random offset is amortized over
+    /// a window of evictions. Returns None if the keyspace is empty.
     pub fn evict_one(&mut self) -> Option<Vec<u8>> {
-        let key = self.data.keys().next().cloned()?;
-        self.data.remove(&key);
-        self.expires.remove(&key);
-        self.forget_size(&key);
-        Some(key)
+        loop {
+            match self.evict_pool.pop() {
+                Some(key) if self.data.contains_key(&key) => {
+                    self.data.remove(&key);
+                    self.expires.remove(&key);
+                    self.forget_size(&key);
+                    return Some(key);
+                }
+                Some(_) => continue, // already gone (expired/deleted) — next
+                None => {
+                    if self.data.is_empty() {
+                        return None;
+                    }
+                    let skip = crate::commands::rand_index(self.data.len());
+                    self.evict_pool = self.data.keys().skip(skip).take(64).cloned().collect();
+                }
+            }
+        }
     }
 
     pub fn get(&mut self, key: &[u8]) -> Option<&Value> {
@@ -377,8 +404,8 @@ impl Db {
     }
 
     pub fn set_expire(&mut self, key: &[u8], at_ms: u64) {
-        if self.data.contains_key(key) {
-            self.expires.insert(key.to_vec(), at_ms);
+        if self.data.contains_key(key) && self.expires.insert(key.to_vec(), at_ms).is_none() {
+            self.expiry_pool.push(key.to_vec()); // newly-volatile key -> sampleable
         }
     }
 
@@ -391,22 +418,44 @@ impl Db {
         self.expires.get(key).copied()
     }
 
+    /// Active TTL reaper: sample RANDOM volatile keys (via the pool — HashMap
+    /// iteration order would resample the same front group forever and leak
+    /// everything behind it), delete the expired ones, and keep going while a
+    /// quarter or more of each sample was expired (Redis's stop rule). Bounded
+    /// per call so it can't stall the hub.
     pub fn active_expire(&mut self) {
         let now = now_ms();
-        loop {
-            if self.expires.is_empty() {
+        // Lazy compaction: stale entries (TTL removed/overwritten keys) are
+        // dropped as drawn; a full rebuild only when the pool is mostly stale.
+        if self.expiry_pool.len() > self.expires.len().saturating_mul(4) + 64 {
+            self.expiry_pool = self.expires.keys().cloned().collect();
+        }
+        for _round in 0..16 {
+            if self.expires.is_empty() || self.expiry_pool.is_empty() {
                 break;
             }
-            let sample: Vec<Vec<u8>> = self.expires.keys().take(20).cloned().collect();
-            let total = sample.len();
+            let total = 20usize.min(self.expiry_pool.len());
             let mut expired = 0usize;
-            for k in &sample {
-                if self.expires.get(k).is_some_and(|&t| t <= now) {
-                    self.data.remove(k);
-                    self.expires.remove(k);
-                    self.forget_size(k);
-                    self.expired.push(k.clone());
-                    expired += 1;
+            for _ in 0..total {
+                if self.expiry_pool.is_empty() {
+                    break;
+                }
+                let i = crate::commands::rand_index(self.expiry_pool.len());
+                let deadline = self.expires.get(&self.expiry_pool[i]).copied();
+                match deadline {
+                    None => {
+                        // Stale pool entry (no longer volatile): drop it.
+                        self.expiry_pool.swap_remove(i);
+                    }
+                    Some(t) if t <= now => {
+                        let k = self.expiry_pool.swap_remove(i);
+                        self.data.remove(&k);
+                        self.expires.remove(&k);
+                        self.forget_size(&k);
+                        self.expired.push(k);
+                        expired += 1;
+                    }
+                    Some(_) => {} // alive: leave it in the pool
                 }
             }
             if expired * 4 < total {
@@ -442,6 +491,8 @@ impl Db {
         self.expired.extend(keys);
         self.data.clear();
         self.expires.clear();
+        self.expiry_pool.clear();
+        self.evict_pool.clear();
         self.sizes.clear();
         self.mem_used = 0;
         self.geo_index.clear();
@@ -460,8 +511,10 @@ impl Db {
 
     pub fn insert_with_expire(&mut self, key: Vec<u8>, value: Value, expire: Option<u64>) {
         self.geo_unindex(&key); // drop any prior geo entry (overwrite/retype)
-        if let Some(deadline) = expire {
-            self.expires.insert(key.clone(), deadline);
+        if let Some(deadline) = expire
+            && self.expires.insert(key.clone(), deadline).is_none()
+        {
+            self.expiry_pool.push(key.clone()); // newly-volatile key -> sampleable
         }
         if let Value::Geo(lon, lat, _) = &value {
             self.geo_reindex(key.clone(), *lon, *lat);

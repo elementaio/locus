@@ -31,14 +31,28 @@ pub fn configured_path() -> String {
 /// Crash-safe write of a pre-serialized snapshot: temp file -> fsync -> atomic
 /// rename -> directory fsync. Splitting this out lets BGSAVE serialize on the
 /// hub (consistent) and hand the bytes to a background thread for the slow I/O.
+///
+/// The temp name is unique per writer (pid + counter): a SAVE or shutdown save
+/// racing an in-flight BGSAVE must never truncate the file the background
+/// thread is still writing — each writer owns its temp, and the atomic rename
+/// keeps the destination a complete snapshot no matter who finishes last.
 pub fn write_snapshot(bytes: &[u8], path: &str) -> io::Result<()> {
-    let tmp = format!("{path}.tmp");
-    {
+    static SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let tmp = format!(
+        "{path}.tmp.{}.{}",
+        std::process::id(),
+        SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+    );
+    let write = || -> io::Result<()> {
         let file = File::create(&tmp)?;
         let mut w = BufWriter::new(file);
         w.write_all(bytes)?;
         w.flush()?;
-        w.get_ref().sync_all()?; // fsync the data before we rename
+        w.get_ref().sync_all() // fsync the data before we rename
+    };
+    if let Err(e) = write() {
+        let _ = fs::remove_file(&tmp); // don't leave a partial temp behind
+        return Err(e);
     }
     fs::rename(&tmp, path)?; // atomic replace
     fsync_parent_dir(path); // make the rename itself durable

@@ -269,6 +269,19 @@ fn main() -> io::Result<()> {
     Ok(())
 }
 
+/// A data file that failed to load is EVIDENCE — move it aside (timestamped)
+/// instead of starting empty over it, where the next SAVE/append would destroy
+/// a possibly-recoverable original.
+fn quarantine_corrupt_file(path: &str, why: &str) {
+    let aside = format!("{path}.corrupt.{}", now_ms());
+    match std::fs::rename(path, &aside) {
+        Ok(()) => log::error(&format!("{why} — moved {path} to {aside}; starting empty")),
+        Err(e) => log::error(&format!(
+            "{why} — could not move {path} aside ({e}); starting empty"
+        )),
+    }
+}
+
 /// Decrements the live-connection counter when a connection's thread ends, so the
 /// maxclients cap reflects real disconnects (including early returns / panics).
 struct ConnGuard(Arc<AtomicUsize>);
@@ -503,6 +516,12 @@ struct Hub {
     // Some(buf) while an async BGREWRITEAOF runs: captures writes that land
     // during the rewrite so they can be folded into the new file (no loss).
     aof_rewrite_buf: Option<Vec<u8>>,
+    // Reject writes while the AOF is unhealthy (LOCUS_AOF_ON_WRITE_ERROR=stop,
+    // the default): a full disk must not silently ACK writes it can't log.
+    aof_stop_on_error: bool,
+    // Next allowed recovery-rewrite attempt (ms since epoch) — backoff so a
+    // still-full disk isn't hammered every maintenance tick.
+    aof_retry_at: u64,
     clients: HashMap<u64, OutChan>,
     outbuf: OutLimits,
     pubsub: PubSub,
@@ -658,7 +677,7 @@ impl Hub {
         let (db, aof, extras) = match &aof_path {
             Some(path) => {
                 let db = aof::load(path).unwrap_or_else(|e| {
-                    log::warn(&format!("AOF load failed: {e} — starting empty"));
+                    quarantine_corrupt_file(path, &format!("AOF load failed: {e}"));
                     Db::new()
                 });
                 let aof = aof::Aof::open(path)
@@ -674,7 +693,7 @@ impl Hub {
             None => {
                 let p = rdb::configured_path();
                 let (db, extras) = rdb::load_with_extras(&p).unwrap_or_else(|e| {
-                    log::warn(&format!("RDB load failed: {e} — starting empty"));
+                    quarantine_corrupt_file(&p, &format!("RDB load failed: {e}"));
                     (Db::new(), rdb::Extras::default())
                 });
                 (db, None, extras)
@@ -686,6 +705,10 @@ impl Hub {
             aof,
             aof_path,
             aof_rewrite_buf: None,
+            aof_stop_on_error: std::env::var("LOCUS_AOF_ON_WRITE_ERROR")
+                .map(|v| v.trim().eq_ignore_ascii_case("stop"))
+                .unwrap_or(true),
+            aof_retry_at: 0,
             clients: HashMap::new(),
             outbuf: OutLimits::from_env(),
             pubsub: PubSub::new(),
@@ -895,6 +918,58 @@ impl Hub {
             self.outbuf.pubsub
         } else {
             self.outbuf.normal
+        }
+    }
+
+    /// Kick off an async AOF rewrite: serialize the base image on the hub (a
+    /// consistent point-in-time state), write+fsync it off-thread, and capture
+    /// writes that land meanwhile in `aof_rewrite_buf` to fold in on completion.
+    /// Shared by BGREWRITEAOF and the unhealthy-AOF recovery loop.
+    fn start_aof_rewrite(&mut self) -> Result<(), &'static str> {
+        if self.aof_rewrite_buf.is_some() {
+            return Err("ERR Background append only file rewriting already in progress");
+        }
+        let (Some(path), true) = (self.aof_path.clone(), self.aof.is_some()) else {
+            return Err("ERR AOF is not enabled");
+        };
+        let tmp = format!("{path}.tmp.{}", std::process::id());
+        let buf = aof::serialize_rewrite(&self.db);
+        self.aof_rewrite_buf = Some(Vec::new());
+        let tx = self.tx.clone();
+        let spawned = thread::Builder::new().spawn(move || {
+            let res = aof::write_tmp(&tmp, &buf)
+                .map(|()| tmp)
+                .map_err(|e| e.to_string());
+            let _ = tx.send(Msg::AofRewriteDone(res));
+        });
+        if spawned.is_err() {
+            self.aof_rewrite_buf = None;
+            return Err("ERR rewrite thread spawn failed");
+        }
+        Ok(())
+    }
+
+    /// True when the AOF is enabled but has a hole (a failed append/fsync) —
+    /// its on-disk history is incomplete until a rewrite replaces it.
+    fn aof_unhealthy(&self) -> bool {
+        self.aof.as_ref().is_some_and(|a| !a.healthy())
+    }
+
+    /// Recovery for an unhealthy AOF: rewrite the whole file from the current
+    /// in-memory state (which is complete — only the log has the hole). Runs
+    /// from maintenance with a 5s backoff until the disk cooperates.
+    fn maybe_recover_aof(&mut self) {
+        if !self.aof_unhealthy() || self.aof_rewrite_buf.is_some() {
+            return;
+        }
+        let now = now_ms();
+        if now < self.aof_retry_at {
+            return;
+        }
+        self.aof_retry_at = now + 5000;
+        log::warn("AOF unhealthy (failed append/fsync) — attempting a recovery rewrite");
+        if let Err(e) = self.start_aof_rewrite() {
+            log::error(&format!("AOF recovery rewrite failed to start: {e}"));
         }
     }
 
@@ -1767,7 +1842,10 @@ impl Hub {
             "rdb_bgsave_in_progress:{}\r\n",
             self.bgsave_in_progress.load(Ordering::Relaxed) as u8
         ));
-        s.push_str("aof_last_write_status:ok\r\n");
+        s.push_str(&format!(
+            "aof_last_write_status:{}\r\n",
+            if self.aof_unhealthy() { "err" } else { "ok" }
+        ));
         s.push_str("rdb_last_bgsave_status:ok\r\n");
         s.push_str("# Stats\r\n");
         s.push_str(&format!(
@@ -2177,34 +2255,24 @@ impl Hub {
 
             // --- persistence (owner-side) ---
             b"BGREWRITEAOF" => {
-                let reply = if self.aof_rewrite_buf.is_some() {
-                    resp::error("ERR Background append only file rewriting already in progress")
-                } else if let (Some(path), true) = (self.aof_path.clone(), self.aof.is_some()) {
-                    // Serialize the base image on the hub (fast, in-memory), then
-                    // write+fsync it off-thread. Writes that land meanwhile are
-                    // captured in aof_rewrite_buf and folded in on completion.
-                    let tmp = format!("{path}.tmp");
-                    let buf = aof::serialize_rewrite(&self.db);
-                    self.aof_rewrite_buf = Some(Vec::new());
-                    let tx = self.tx.clone();
-                    thread::spawn(move || {
-                        let res = aof::write_tmp(&tmp, &buf)
-                            .map(|()| tmp)
-                            .map_err(|e| e.to_string());
-                        let _ = tx.send(Msg::AofRewriteDone(res));
-                    });
-                    resp::simple_string("Background append only file rewriting started")
-                } else {
-                    resp::error("ERR AOF is not enabled")
+                let reply = match self.start_aof_rewrite() {
+                    Ok(()) => resp::simple_string("Background append only file rewriting started"),
+                    Err(e) => resp::error(e),
                 };
                 self.send(id, reply);
             }
             b"SAVE" => {
-                let extras = self.build_extras();
-                let reply = match rdb::save_with_extras(&self.db, &extras, &rdb::configured_path())
-                {
-                    Ok(()) => resp::simple_string("OK"),
-                    Err(e) => resp::error(&format!("ERR {e}")),
+                // Refuse alongside a running BGSAVE: even with unique temp
+                // files, racing renames could replace a newer snapshot with an
+                // older one. (Shutdown's final save accepts that benign race.)
+                let reply = if self.bgsave_in_progress.load(Ordering::Relaxed) {
+                    resp::error("ERR Background save already in progress")
+                } else {
+                    let extras = self.build_extras();
+                    match rdb::save_with_extras(&self.db, &extras, &rdb::configured_path()) {
+                        Ok(()) => resp::simple_string("OK"),
+                        Err(e) => resp::error(&format!("ERR {e}")),
+                    }
                 };
                 self.send(id, reply);
             }
@@ -3143,6 +3211,15 @@ impl Hub {
         if self.master.is_some() && id != MASTER_ID && is_write {
             return resp::error("READONLY You can't write against a read only replica.");
         }
+        // AOF gate: while the log is unhealthy (failed append/fsync — e.g. disk
+        // full) new writes would be applied-but-unlogged. Reject them (Redis's
+        // MISCONF behavior) until the recovery rewrite restores the log. The
+        // master stream is exempt — dropping replicated commands means diverging.
+        if is_write && id != MASTER_ID && self.aof_stop_on_error && self.aof_unhealthy() {
+            return resp::error(
+                "MISCONF Errors writing to the append-only file; write commands are rejected until the AOF recovers (see aof_last_write_status)",
+            );
+        }
         // maxmemory: on a master/standalone, free memory before a write; if the
         // cap still can't be met, reject the write instead of growing unbounded.
         // (Replicas don't evict on their own — the master streams the DELs.)
@@ -3152,6 +3229,17 @@ impl Hub {
         let proto = self.protos.get(&id).copied().unwrap_or(2);
         let reply = execute_proto(&tokens, &mut self.db, proto);
         let errored = reply.first() == Some(&b'-');
+        // FLUSHDB/FLUSHALL clears every key: dirty the watchers and feed the
+        // changefeed as `del`s HERE, so the generic expired-key drain below
+        // doesn't misreport the wipe as per-key `expire`s — and don't stream
+        // per-key DELs to the AOF/replicas (the FLUSH itself is propagated).
+        if !errored && matches!(cmd.as_slice(), b"FLUSHDB" | b"FLUSHALL") {
+            for key in self.db.take_expired() {
+                self.dirty_watchers(&key);
+                self.record_change(b"del", &key, None);
+                self.reindex_key(&key);
+            }
+        }
         if !errored && is_write {
             // Keep the memory estimate in sync with whatever the command changed
             // (including in-place collection growth like LPUSH/SADD).
@@ -3490,10 +3578,15 @@ fn slowlog_snapshot(tokens: &[Vec<u8>]) -> Vec<Vec<u8>> {
         .collect()
 }
 
+/// How often the hub runs its maintenance sweep (expiry, blocked-reader and
+/// WAIT deadlines, everysec fsync, shutdown), busy or idle.
+const MAINT_EVERY: Duration = Duration::from_millis(100);
+
 fn run_hub(rx: mpsc::Receiver<Msg>, tx: mpsc::SyncSender<Msg>) {
     let mut hub = Hub::new(tx);
+    let mut last_maint = Instant::now();
     loop {
-        match rx.recv_timeout(Duration::from_millis(100)) {
+        match rx.recv_timeout(MAINT_EVERY) {
             Ok(Msg::Connect {
                 id,
                 out,
@@ -3565,10 +3658,20 @@ fn run_hub(rx: mpsc::Receiver<Msg>, tx: mpsc::SyncSender<Msg>) {
                 let tail = hub.aof_rewrite_buf.take().unwrap_or_default();
                 match (res, hub.aof_path.clone()) {
                     (Ok(tmp), Some(path)) => match aof::finalize_rewrite(&tmp, &path, &tail) {
-                        Ok(()) => {
-                            hub.aof = aof::Aof::open(&path).ok();
-                            log::info("AOF rewrite complete");
-                        }
+                        Ok(()) => match aof::Aof::open(&path) {
+                            Ok(a) => {
+                                hub.aof = Some(a);
+                                log::info("AOF rewrite complete");
+                            }
+                            Err(e) => {
+                                // Persistence just went dark — say so loudly
+                                // (INFO reports aof_enabled:0 from here on).
+                                hub.aof = None;
+                                log::error(&format!(
+                                    "AOF reopen after rewrite failed: {e} — AOF DISABLED, writes are no longer being logged"
+                                ));
+                            }
+                        },
                         Err(e) => {
                             let _ = std::fs::remove_file(&tmp);
                             log::error(&format!("AOF rewrite finalize failed: {e}"));
@@ -3580,29 +3683,39 @@ fn run_hub(rx: mpsc::Receiver<Msg>, tx: mpsc::SyncSender<Msg>) {
                     (Err(e), _) => log::error(&format!("AOF rewrite failed: {e}")),
                 }
             }
-            Err(mpsc::RecvTimeoutError::Timeout) => {
-                if SHUTDOWN.load(Ordering::Relaxed) {
-                    // Drain anything already queued, then persist and exit.
-                    while let Ok(msg) = rx.try_recv() {
-                        if let Msg::Command { id, tokens } = msg {
-                            hub.handle_command(id, tokens);
-                        }
-                    }
-                    hub.persist_and_exit(true);
-                }
-                if let Some(a) = hub.aof.as_mut() {
-                    a.maybe_fsync();
-                }
-                // Only the master actively expires keys; a replica waits for the
-                // master's DELs, so the two never diverge on expiry timing.
-                if hub.master.is_none() {
-                    hub.db.active_expire();
-                }
-                hub.dirty_expired_watchers();
-                hub.expire_blocked();
-                hub.check_waits();
-            }
+            Err(mpsc::RecvTimeoutError::Timeout) => {}
             Err(mpsc::RecvTimeoutError::Disconnected) => break,
+        }
+        // Maintenance runs on a WALL-CLOCK cadence, after busy iterations and
+        // idle timeouts alike. Gating it on recv_timeout's Timeout arm (the old
+        // shape) meant a steady message stream starved active expiry, XREAD
+        // BLOCK / WAIT deadlines, the everysec fsync — and even SIGTERM.
+        if last_maint.elapsed() >= MAINT_EVERY {
+            last_maint = Instant::now();
+            if SHUTDOWN.load(Ordering::Relaxed) {
+                // Drain anything already queued, then persist and exit.
+                while let Ok(msg) = rx.try_recv() {
+                    if let Msg::Command { id, tokens } = msg {
+                        hub.handle_command(id, tokens);
+                    }
+                }
+                hub.persist_and_exit(true);
+            }
+            if let Some(a) = hub.aof.as_mut() {
+                a.maybe_fsync();
+            }
+            // An unhealthy AOF (failed write or fsync — e.g. disk full) has a
+            // hole: recover by rewriting the whole file from memory, retried
+            // with a backoff until the disk lets a rewrite succeed.
+            hub.maybe_recover_aof();
+            // Only the master actively expires keys; a replica waits for the
+            // master's DELs, so the two never diverge on expiry timing.
+            if hub.master.is_none() {
+                hub.db.active_expire();
+            }
+            hub.dirty_expired_watchers();
+            hub.expire_blocked();
+            hub.check_waits();
         }
     }
 }

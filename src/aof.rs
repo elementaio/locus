@@ -68,6 +68,11 @@ pub struct Aof {
     file: File,
     last_fsync: u64,
     policy: FsyncPolicy,
+    /// Latches false on the first failed append or fsync and stays false: the
+    /// file now has a hole (an applied-but-unlogged write), so it can't be
+    /// trusted again until a full rewrite replaces it. Read by INFO
+    /// (`aof_last_write_status`) and the hub's write gate + recovery loop.
+    healthy: bool,
 }
 
 impl Aof {
@@ -77,7 +82,13 @@ impl Aof {
             file,
             last_fsync: now_ms(),
             policy: policy_from_env(),
+            healthy: true,
         })
+    }
+
+    /// False after any failed append/fsync — the log has a hole until rewritten.
+    pub fn healthy(&self) -> bool {
+        self.healthy
     }
 
     pub fn append(&mut self, commands: &[Vec<Vec<u8>>]) -> io::Result<()> {
@@ -85,7 +96,11 @@ impl Aof {
         for c in commands {
             encode_command(&mut buf, c);
         }
-        self.file.write_all(&buf)?;
+        if let Err(e) = self.file.write_all(&buf) {
+            self.healthy = false;
+            crate::log::error(&format!("AOF append failed: {e}"));
+            return Err(e);
+        }
         if self.policy == FsyncPolicy::Always {
             self.do_fsync();
         }
@@ -110,6 +125,7 @@ impl Aof {
     /// fsync error means "everysec" durability is quietly broken.
     fn do_fsync(&mut self) {
         if let Err(e) = self.file.sync_data() {
+            self.healthy = false;
             crate::log::error(&format!("AOF fsync failed: {e}"));
         }
         self.last_fsync = now_ms();
@@ -134,17 +150,19 @@ pub fn entries_for(tokens: &[Vec<u8>], reply: &[u8], db: &mut Db) -> Vec<Vec<Vec
             // Log the RESULTING state (handles NX/XX no-ops) + absolute TTL. Read
             // the deadline RAW (no passive expiry): if it's already in the past,
             // log a DEL so replay removes any prior value instead of resurrecting
-            // it; otherwise log SET (+ PEXPIREAT).
+            // it. Value and TTL go in ONE `SET ... PXAT` record — as two records,
+            // a crash between them would replay the value without its deadline
+            // and resurrect an immortal key.
             match db.raw_expire(key) {
                 Some(t) if t <= now_ms() => vec![vec![b"DEL".to_vec(), key.clone()]],
                 deadline => match db.get(key) {
                     Some(Value::Str(v)) => {
-                        let v = v.clone();
-                        let mut out = vec![vec![b"SET".to_vec(), key.clone(), v]];
+                        let mut c = vec![b"SET".to_vec(), key.clone(), v.clone()];
                         if let Some(t) = deadline {
-                            out.push(pexpireat(key, t));
+                            c.push(b"PXAT".to_vec());
+                            c.push(t.to_string().into_bytes());
                         }
-                        out
+                        vec![c]
                     }
                     _ => vec![],
                 },
@@ -442,6 +460,35 @@ mod tests {
         assert_eq!(
             entries_for(&toks, b"+OK\r\n", &mut db),
             vec![vec![b"DEL".to_vec(), b"k".to_vec()]]
+        );
+    }
+
+    #[test]
+    fn set_with_ttl_logs_one_atomic_record() {
+        let mut db = Db::new();
+        let future = now_ms() + 60_000;
+        let toks: Vec<Vec<u8>> = [
+            &b"SET"[..],
+            b"k",
+            b"v",
+            b"PXAT",
+            future.to_string().as_bytes(),
+        ]
+        .iter()
+        .map(|s| s.to_vec())
+        .collect();
+        execute(&toks, &mut db);
+        // ONE record carrying both value and deadline — never SET + PEXPIREAT,
+        // where a torn tail between them would resurrect an immortal key.
+        assert_eq!(
+            entries_for(&toks, b"+OK\r\n", &mut db),
+            vec![vec![
+                b"SET".to_vec(),
+                b"k".to_vec(),
+                b"v".to_vec(),
+                b"PXAT".to_vec(),
+                future.to_string().into_bytes(),
+            ]]
         );
     }
 
