@@ -459,6 +459,7 @@ impl Db {
     }
 
     pub fn insert_with_expire(&mut self, key: Vec<u8>, value: Value, expire: Option<u64>) {
+        self.geo_unindex(&key); // drop any prior geo entry (overwrite/retype)
         if let Some(deadline) = expire {
             self.expires.insert(key.clone(), deadline);
         }
@@ -548,6 +549,22 @@ mod tests {
         while db.evict_one().is_some() {}
         assert_eq!(db.mem_used(), 0);
         assert!(db.evict_one().is_none());
+    }
+
+    #[test]
+    fn insert_with_expire_reindexes_geo_overwrite() {
+        let mut db = Db::new();
+        // Overwriting a geo key via the restore/migration path must MOVE its
+        // spatial-index entry, not leave the old cell's entry behind forever.
+        db.insert(b"g".to_vec(), Value::Geo(10.0, 10.0, vec![]));
+        db.insert_with_expire(b"g".to_vec(), Value::Geo(-60.0, -30.0, vec![]), None);
+        let old = db.geo_candidates(9.9, 9.9, 10.1, 10.1);
+        assert!(!old.contains(&b"g".to_vec()), "stale entry at the old cell");
+        let new = db.geo_candidates(-60.1, -30.1, -59.9, -29.9);
+        assert!(new.contains(&b"g".to_vec()));
+        // Retyping to a non-geo value must drop the key from the index entirely.
+        db.insert_with_expire(b"g".to_vec(), Value::Str(b"x".to_vec()), None);
+        assert!(db.geo_keys().is_empty());
     }
 
     #[test]

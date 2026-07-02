@@ -3774,49 +3774,51 @@ fn cluster_call_array(addr: &str, args: &[&[u8]]) -> Option<Vec<Vec<u8>>> {
     go().ok()
 }
 
-/// Fan `args` out to every target concurrently and collect the array replies in
-/// the same order (None for an unreachable/slow peer). One thread per peer, each
-/// bounded by `cluster_call_array`'s own timeouts — so the caller waits at most
-/// ~one peer timeout total, not the sum across peers. Keeps replies synchronous
-/// (and thus correctly ordered on the client connection); only the peer I/O is
-/// parallel.
-fn scatter_array(targets: &[String], args: &[&[u8]]) -> Vec<Option<Vec<Vec<u8>>>> {
+/// Fan `args` out to every target concurrently and collect the replies in the
+/// same order (None for an unreachable/slow peer). One thread per peer, each
+/// bounded by the call's own timeouts — so the caller waits at most ~one peer
+/// timeout total, not the sum across peers. Keeps replies synchronous (and thus
+/// correctly ordered on the client connection); only the peer I/O is parallel.
+/// A thread that can't spawn (process thread limit) marks that peer unreachable
+/// instead of panicking — this runs on the hub, where a panic kills the server.
+fn scatter<T: Send + 'static>(
+    targets: &[String],
+    args: &[&[u8]],
+    call: fn(&str, &[&[u8]]) -> Option<T>,
+) -> Vec<Option<T>> {
     let owned: Vec<Vec<u8>> = args.iter().map(|a| a.to_vec()).collect();
     let handles: Vec<_> = targets
         .iter()
         .map(|addr| {
             let addr = addr.clone();
             let owned = owned.clone();
-            thread::spawn(move || {
+            thread::Builder::new().spawn(move || {
                 let refs: Vec<&[u8]> = owned.iter().map(|v| v.as_slice()).collect();
-                cluster_call_array(&addr, &refs)
+                call(&addr, &refs)
             })
         })
         .collect();
     handles
         .into_iter()
-        .map(|h| h.join().unwrap_or(None))
+        .map(|h| match h {
+            Ok(handle) => handle.join().unwrap_or(None),
+            Err(e) => {
+                log::error(&format!(
+                    "scatter thread spawn failed (thread limit?): {e} — treating peer as unreachable"
+                ));
+                None
+            }
+        })
         .collect()
+}
+
+fn scatter_array(targets: &[String], args: &[&[u8]]) -> Vec<Option<Vec<Vec<u8>>>> {
+    scatter(targets, args, cluster_call_array)
 }
 
 /// Like [`scatter_array`] for integer replies (e.g. cluster-wide DBSIZE).
 fn scatter_int(targets: &[String], args: &[&[u8]]) -> Vec<Option<i64>> {
-    let owned: Vec<Vec<u8>> = args.iter().map(|a| a.to_vec()).collect();
-    let handles: Vec<_> = targets
-        .iter()
-        .map(|addr| {
-            let addr = addr.clone();
-            let owned = owned.clone();
-            thread::spawn(move || {
-                let refs: Vec<&[u8]> = owned.iter().map(|v| v.as_slice()).collect();
-                cluster_call_int(&addr, &refs)
-            })
-        })
-        .collect();
-    handles
-        .into_iter()
-        .map(|h| h.join().unwrap_or(None))
-        .collect()
+    scatter(targets, args, cluster_call_int)
 }
 
 fn read_line(s: &mut TcpStream) -> io::Result<Vec<u8>> {
