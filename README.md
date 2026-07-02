@@ -127,11 +127,17 @@ cargo test                # unit + end-to-end integration tests
 ### Install (Docker / prebuilt binary)
 
 ```console
-# Docker — RESP on 6379
-docker run -p 6379:6379 ghcr.io/intenttext/locus:latest
+# Docker — RESP on 6379. Set a password: protected mode (on by default) refuses
+# non-loopback clients without one, and Docker connections are non-loopback.
+docker run -p 6379:6379 -e LOCUS_REQUIREPASS=change-me ghcr.io/intenttext/locus:latest
 # persist across restarts:
-docker run -p 6379:6379 -v locus-data:/data -e LOCUS_RDB=/data/locus.rdb ghcr.io/intenttext/locus:latest
+docker run -p 6379:6379 -e LOCUS_REQUIREPASS=change-me \
+  -v locus-data:/data -e LOCUS_RDB=/data/locus.rdb ghcr.io/intenttext/locus:latest
+# then: redis-cli -a change-me PING
 ```
+
+(For a throwaway on a trusted network you can `-e LOCUS_PROTECTED_MODE=no` instead —
+but prefer the password; it's one flag.)
 
 Or grab a prebuilt static binary from the [latest release](https://github.com/intenttext/locus/releases/latest)
 (Linux x86_64/aarch64, macOS x86_64/aarch64). With a Rust toolchain, install from crates.io (the crate
