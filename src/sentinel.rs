@@ -31,14 +31,24 @@
 
 use std::io::{self, Read, Write};
 use std::net::{TcpListener, TcpStream, ToSocketAddrs};
-use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::{Duration, Instant};
 
 use crate::log;
 
 const IO_TIMEOUT: Duration = Duration::from_millis(800);
+
+/// The failover decision every sentinel converges on: who the master is and the
+/// epoch that decision was made at. Shared between the poll loop and the peer
+/// server (which answers `GETMASTER` and accepts `SWITCH`), and persisted so a
+/// restart resumes the last known decision instead of reverting to env.
+#[derive(Clone)]
+struct View {
+    master: String,
+    epoch: u64,
+}
 
 /// Entry point for sentinel mode (never returns). Caller checks `LOCUS_SENTINEL`.
 pub fn run() -> io::Result<()> {
@@ -76,10 +86,6 @@ pub fn run() -> io::Result<()> {
             .unwrap_or_default()
     });
     let master_down = Arc::new(AtomicBool::new(false));
-    if let Some(port) = sentinel_port.clone() {
-        let flag = master_down.clone();
-        thread::spawn(move || serve_peers(&port, flag));
-    }
 
     // Cluster nodes to notify on failover: after promoting a replica we broadcast
     // CLUSTER REASSIGN <old> <new> to each so the cluster routes the dead master's
@@ -104,22 +110,47 @@ pub fn run() -> io::Result<()> {
         }
     }
 
-    let mut master = master0;
-    let mut down_since: Option<Instant> = None;
-    log::info(&format!(
-        "sentinel: monitoring master {master} + {} replica(s); down-after {down_after}ms, replica-quorum {quorum}, {} peer sentinel(s)",
-        nodes.len() - 1,
-        peers.len()
-    ));
+    // Boot view: the persisted decision, then whatever the live nodes report
+    // (a node saying role:master with a higher config epoch wins) — so a
+    // restarted sentinel doesn't revert to a stale env master after a failover
+    // it wasn't around for. Falls back to the env master at epoch 0.
+    let state_path = std::env::var("LOCUS_SENTINEL_STATE").ok();
+    let boot = persisted_view(state_path.as_deref()).unwrap_or(View {
+        master: master0,
+        epoch: 0,
+    });
+    let view = Arc::new(Mutex::new(derive_view(&nodes, auth.as_deref(), boot)));
+    {
+        let v = view.lock().unwrap();
+        log::info(&format!(
+            "sentinel: monitoring master {} (epoch {}) + {} replica(s); down-after {down_after}ms, replica-quorum {quorum}, {} peer sentinel(s)",
+            v.master,
+            v.epoch,
+            nodes.len() - 1,
+            peers.len()
+        ));
+    }
+    if let Some(port) = sentinel_port.clone() {
+        let flag = master_down.clone();
+        let shared = view.clone();
+        thread::spawn(move || serve_peers(&port, flag, shared));
+    }
 
+    let mut down_since: Option<Instant> = None;
     loop {
         std::thread::sleep(Duration::from_millis(interval));
         let auth = auth.as_deref();
+        // Adopt any higher-epoch decision a peer sentinel pushed us via SWITCH.
+        adopt_peer_switch(&view, &peers);
+        let (master, epoch) = {
+            let v = view.lock().unwrap();
+            (v.master.clone(), v.epoch)
+        };
 
         if alive(&master, auth) {
             down_since = None;
             master_down.store(false, Ordering::Relaxed);
-            reconcile(&nodes, &master, auth);
+            reconcile(&nodes, &master, epoch, auth);
         } else {
             let since = *down_since.get_or_insert_with(Instant::now);
             log::warn(&format!("sentinel: master {master} unreachable"));
@@ -133,46 +164,132 @@ pub fn run() -> io::Result<()> {
                     log::warn(
                         "sentinel: holding failover — no sentinel majority, or another sentinel leads",
                     );
-                } else if let Some(new_master) = failover(&nodes, &master, auth) {
-                    log::info(&format!(
-                        "sentinel: +switch-master {master} -> {new_master}"
-                    ));
-                    // Cluster mode: repoint the dead master's slots to its successor.
-                    if !cluster_nodes.is_empty() {
-                        reassign_cluster(&cluster_nodes, &master, &new_master, auth);
+                } else {
+                    // The new epoch is above everything we know (self + every
+                    // reachable node + peer sentinel), so the promotion this
+                    // failover issues supersedes any concurrent one, and data
+                    // nodes reject stale REPLICAOFs against it.
+                    let new_epoch = next_epoch(epoch, &nodes, &peers, auth) + 1;
+                    if let Some(new_master) = failover(&nodes, &master, new_epoch, auth) {
+                        log::info(&format!(
+                            "sentinel: +switch-master {master} -> {new_master} (epoch {new_epoch})"
+                        ));
+                        if !cluster_nodes.is_empty() {
+                            reassign_cluster(&cluster_nodes, &master, &new_master, auth);
+                        }
+                        let updated = View {
+                            master: new_master,
+                            epoch: new_epoch,
+                        };
+                        *view.lock().unwrap() = updated.clone();
+                        persist_view(state_path.as_deref(), &updated);
+                        broadcast_switch(&peers, &updated);
+                        down_since = None;
+                        master_down.store(false, Ordering::Relaxed);
                     }
-                    master = new_master;
-                    down_since = None;
-                    master_down.store(false, Ordering::Relaxed);
                 }
             }
         }
     }
 }
 
-/// Ensure every node other than `master` is a replica of `master`; repoint any
-/// that isn't (a fresh replica, or an old master that just came back).
-fn reconcile(nodes: &[String], master: &str, auth: Option<&str>) {
-    let (mh, mp) = split_hostport(master);
-    for n in nodes.iter().filter(|n| n.as_str() != master) {
-        let Some(inf) = info(n, auth) else { continue }; // unreachable -> skip
-        let role = field(&inf, "role");
-        let host = field(&inf, "master_host");
-        let port = field(&inf, "master_port");
-        let aligned = role.as_deref() == Some("slave")
-            && host.as_deref() == Some(mh)
-            && port.as_deref() == Some(mp);
-        if !aligned {
-            log::info(&format!("sentinel: repointing {n} -> {master}"));
-            let _ = command(n, auth, &["REPLICAOF", mh, mp]);
+/// Reconcile the boot view with what the live nodes report: if a reachable node
+/// declares itself master at a config epoch >= our known epoch, adopt it. This
+/// is how a (re)started sentinel learns about a failover that happened while it
+/// was down instead of trusting a stale env/persisted master.
+fn derive_view(nodes: &[String], auth: Option<&str>, mut best: View) -> View {
+    for n in nodes {
+        if let Some(inf) = info(n, auth)
+            && field(&inf, "role").as_deref() == Some("master")
+        {
+            let ep = field(&inf, "config_epoch")
+                .and_then(|v| v.parse::<u64>().ok())
+                .unwrap_or(0);
+            if ep >= best.epoch {
+                best = View {
+                    master: n.clone(),
+                    epoch: ep,
+                };
+            }
+        }
+    }
+    best
+}
+
+/// The epoch a new failover must exceed: the max across our view, every node's
+/// config epoch, and every peer sentinel's current epoch.
+fn next_epoch(mine: u64, nodes: &[String], peers: &[String], auth: Option<&str>) -> u64 {
+    let mut hi = mine;
+    for n in nodes {
+        if let Some(inf) = info(n, auth) {
+            hi = hi.max(
+                field(&inf, "config_epoch")
+                    .and_then(|v| v.parse::<u64>().ok())
+                    .unwrap_or(0),
+            );
+        }
+    }
+    for p in peers {
+        if let Some((_, ep)) = peer_getmaster(p) {
+            hi = hi.max(ep);
+        }
+    }
+    hi
+}
+
+/// Pull any higher-epoch switch-master decision our peers hold into our view
+/// (so a sentinel that wasn't the failover leader still converges).
+fn adopt_peer_switch(view: &Arc<Mutex<View>>, peers: &[String]) {
+    for p in peers {
+        if let Some((m, ep)) = peer_getmaster(p) {
+            let mut v = view.lock().unwrap();
+            if ep > v.epoch {
+                log::info(&format!(
+                    "sentinel: adopting peer switch-master -> {m} (epoch {ep})"
+                ));
+                *v = View {
+                    master: m,
+                    epoch: ep,
+                };
+            }
         }
     }
 }
 
-/// Promote the most up-to-date reachable replica and repoint the rest at it.
-fn failover(nodes: &[String], old_master: &str, auth: Option<&str>) -> Option<String> {
+/// Ensure every node other than `master` is a replica of `master`; repoint any
+/// that isn't (a fresh replica, or an old master that just came back). Every
+/// REPLICAOF carries our config epoch, so a data node rejects a stale
+/// sentinel's repointing (the fence that stops a returned old master from
+/// demoting the real one — see the STALEEPOCH guard in the data node).
+fn reconcile(nodes: &[String], master: &str, epoch: u64, auth: Option<&str>) {
+    let (mh, mp) = split_hostport(master);
+    let ep = epoch.to_string();
+    for n in nodes.iter().filter(|n| !same_node(n, master)) {
+        let Some(inf) = info(n, auth) else { continue }; // unreachable -> skip
+        let role = field(&inf, "role");
+        let host = field(&inf, "master_host");
+        let port = field(&inf, "master_port");
+        // Compare resolved addresses, not raw strings: "localhost" and
+        // "127.0.0.1" name the same node and must not trigger an endless
+        // repoint + full-resync loop every interval.
+        let aligned = role.as_deref() == Some("slave")
+            && host
+                .zip(port)
+                .is_some_and(|(h, p)| same_node(&format!("{h}:{p}"), &format!("{mh}:{mp}")));
+        if !aligned {
+            log::info(&format!(
+                "sentinel: repointing {n} -> {master} (epoch {epoch})"
+            ));
+            let _ = command(n, auth, &["REPLICAOF", mh, mp, "EPOCH", &ep]);
+        }
+    }
+}
+
+/// Promote the most up-to-date reachable replica and repoint the rest at it,
+/// carrying the new config epoch through every directive.
+fn failover(nodes: &[String], old_master: &str, epoch: u64, auth: Option<&str>) -> Option<String> {
     let mut best: Option<(String, u64)> = None;
-    for n in nodes.iter().filter(|n| n.as_str() != old_master) {
+    for n in nodes.iter().filter(|n| !same_node(n, old_master)) {
         if let Some(inf) = info(n, auth) {
             let off = field(&inf, "master_repl_offset")
                 .and_then(|v| v.parse::<u64>().ok())
@@ -183,14 +300,17 @@ fn failover(nodes: &[String], old_master: &str, auth: Option<&str>) -> Option<St
         }
     }
     let (winner, off) = best?;
-    log::info(&format!("sentinel: promoting {winner} (offset {off})"));
-    command(&winner, auth, &["REPLICAOF", "NO", "ONE"]).ok()?;
+    let ep = epoch.to_string();
+    log::info(&format!(
+        "sentinel: promoting {winner} (offset {off}, epoch {epoch})"
+    ));
+    command(&winner, auth, &["REPLICAOF", "NO", "ONE", "EPOCH", &ep]).ok()?;
     let (wh, wp) = split_hostport(&winner);
     for n in nodes
         .iter()
-        .filter(|n| n.as_str() != winner && n.as_str() != old_master)
+        .filter(|n| !same_node(n, &winner) && !same_node(n, old_master))
     {
-        let _ = command(n, auth, &["REPLICAOF", wh, wp]); // best-effort
+        let _ = command(n, auth, &["REPLICAOF", wh, wp, "EPOCH", &ep]); // best-effort
     }
     Some(winner)
 }
@@ -261,9 +381,45 @@ fn peer_isdown(peer: &str) -> Option<bool> {
     go().ok()
 }
 
-/// Serve peer "ISDOWN" / "PING" queries on a line protocol, reporting our own
-/// view of the master via the shared `master_down` flag.
-fn serve_peers(port: &str, master_down: Arc<AtomicBool>) {
+/// Ask a peer sentinel for its current switch-master view: `(master, epoch)`.
+/// None = unreachable or no answer.
+fn peer_getmaster(peer: &str) -> Option<(String, u64)> {
+    let go = || -> io::Result<Option<(String, u64)>> {
+        let mut s = connect(peer, None)?;
+        s.write_all(b"GETMASTER\n")?;
+        let line = read_line(&mut s)?;
+        let text = String::from_utf8_lossy(&line);
+        Ok(text.rsplit_once(' ').and_then(|(m, e)| {
+            let ep = e.trim().parse::<u64>().ok()?;
+            (!m.is_empty()).then(|| (m.to_string(), ep))
+        }))
+    };
+    go().ok().flatten()
+}
+
+/// Push our switch-master decision to every peer so they converge even if they
+/// weren't the failover leader (best-effort; adopt_peer_switch is the pull side
+/// that closes any gap on the next tick).
+fn broadcast_switch(peers: &[String], view: &View) {
+    for p in peers {
+        let go = || -> io::Result<()> {
+            let mut s = connect(p, None)?;
+            s.write_all(format!("SWITCH {} {}\n", view.master, view.epoch).as_bytes())?;
+            let _ = read_line(&mut s);
+            Ok(())
+        };
+        if go().is_err() {
+            log::warn(&format!(
+                "sentinel: SWITCH to peer {p} failed (unreachable)"
+            ));
+        }
+    }
+}
+
+/// Serve peer queries on a line protocol: ISDOWN / PING (down-corroboration),
+/// GETMASTER (our current switch-master view), SWITCH (adopt a higher-epoch
+/// decision from the failover leader).
+fn serve_peers(port: &str, master_down: Arc<AtomicBool>, view: Arc<Mutex<View>>) {
     let listener = match TcpListener::bind(format!("0.0.0.0:{port}")) {
         Ok(l) => l,
         Err(e) => return log::error(&format!("sentinel: peer listener bind failed: {e}")),
@@ -271,19 +427,77 @@ fn serve_peers(port: &str, master_down: Arc<AtomicBool>) {
     log::info(&format!("sentinel: peer agreement listening on :{port}"));
     for stream in listener.incoming().flatten() {
         let flag = master_down.clone();
+        let view = view.clone();
         thread::spawn(move || {
             let mut s = stream;
             let _ = s.set_read_timeout(Some(IO_TIMEOUT));
-            if let Ok(line) = read_line(&mut s) {
-                let reply: &[u8] = match line.as_slice() {
-                    b"ISDOWN" if flag.load(Ordering::Relaxed) => b"1\n",
-                    b"ISDOWN" => b"0\n",
-                    b"PING" => b"PONG\n",
-                    _ => b"-ERR\n",
-                };
-                let _ = s.write_all(reply);
-            }
+            let Ok(line) = read_line(&mut s) else { return };
+            let reply: Vec<u8> = if line == b"ISDOWN" {
+                if flag.load(Ordering::Relaxed) {
+                    b"1\n".to_vec()
+                } else {
+                    b"0\n".to_vec()
+                }
+            } else if line == b"PING" {
+                b"PONG\n".to_vec()
+            } else if line == b"GETMASTER" {
+                let v = view.lock().unwrap();
+                format!("{} {}\n", v.master, v.epoch).into_bytes()
+            } else if let Some(rest) = line.strip_prefix(b"SWITCH ") {
+                // SWITCH <master> <epoch>: adopt if strictly newer.
+                let text = String::from_utf8_lossy(rest);
+                if let Some((m, ep)) = text
+                    .rsplit_once(' ')
+                    .and_then(|(m, e)| Some((m.to_string(), e.trim().parse::<u64>().ok()?)))
+                {
+                    let mut v = view.lock().unwrap();
+                    if ep > v.epoch {
+                        *v = View {
+                            master: m,
+                            epoch: ep,
+                        };
+                    }
+                    b"OK\n".to_vec()
+                } else {
+                    b"-ERR\n".to_vec()
+                }
+            } else {
+                b"-ERR\n".to_vec()
+            };
+            let _ = s.write_all(&reply);
         });
+    }
+}
+
+/// Load a persisted `(master, epoch)` view, if any (survives sentinel restart).
+fn persisted_view(path: Option<&str>) -> Option<View> {
+    let content = std::fs::read_to_string(path?).ok()?;
+    let (m, e) = content.trim().rsplit_once(' ')?;
+    Some(View {
+        master: m.to_string(),
+        epoch: e.trim().parse().ok()?,
+    })
+}
+
+/// Persist the current switch-master decision so a restart resumes it.
+fn persist_view(path: Option<&str>, view: &View) {
+    if let Some(p) = path
+        && let Err(e) = std::fs::write(p, format!("{} {}\n", view.master, view.epoch))
+    {
+        log::warn(&format!("sentinel: could not persist view: {e}"));
+    }
+}
+
+/// Whether two `host:port` strings name the same node, resolving each so
+/// "localhost:6379" and "127.0.0.1:6379" compare equal.
+fn same_node(a: &str, b: &str) -> bool {
+    if a == b {
+        return true;
+    }
+    let resolve = |s: &str| s.to_socket_addrs().ok().and_then(|mut it| it.next());
+    match (resolve(a), resolve(b)) {
+        (Some(x), Some(y)) => x == y,
+        _ => false,
     }
 }
 

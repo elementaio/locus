@@ -307,24 +307,38 @@ fn role_file_path() -> String {
     std::env::var("LOCUS_ROLE_FILE").unwrap_or_else(|_| format!("{}.role", rdb::configured_path()))
 }
 
+/// Parse a "host port" or "host:port" pair.
+fn parse_hostport(s: &str) -> Option<(String, String)> {
+    let s = s.trim();
+    let (h, p) = s
+        .split_once(' ')
+        .or_else(|| s.split_once(':'))
+        .map(|(h, p)| (h.trim(), p.trim()))?;
+    (!h.is_empty() && p.parse::<u16>().is_ok()).then(|| (h.to_string(), p.to_string()))
+}
+
+/// The persisted config epoch from the role file (0 if none / unreadable).
+fn boot_epoch() -> u64 {
+    std::fs::read_to_string(role_file_path())
+        .ok()
+        .and_then(|c| {
+            c.lines()
+                .find_map(|l| l.strip_prefix("epoch ")?.trim().parse::<u64>().ok())
+        })
+        .unwrap_or(0)
+}
+
 /// The master to replicate from at boot: LOCUS_REPLICAOF ("host port" or
 /// "host:port") wins; otherwise the persisted role file from the previous run.
 fn boot_master() -> Option<(String, String)> {
-    let parse = |s: &str| -> Option<(String, String)> {
-        let s = s.trim();
-        let (h, p) = s
-            .split_once(' ')
-            .or_else(|| s.split_once(':'))
-            .map(|(h, p)| (h.trim(), p.trim()))?;
-        (!h.is_empty() && p.parse::<u16>().is_ok()).then(|| (h.to_string(), p.to_string()))
-    };
     if let Ok(v) = std::env::var("LOCUS_REPLICAOF")
         && !v.trim().is_empty()
     {
-        return parse(&v);
+        return parse_hostport(&v);
     }
     let content = std::fs::read_to_string(role_file_path()).ok()?;
-    parse(content.trim().strip_prefix("replicaof")?)
+    let line = content.lines().find(|l| l.starts_with("replicaof"))?;
+    parse_hostport(line.strip_prefix("replicaof")?)
 }
 
 /// A data file that failed to load is EVIDENCE — move it aside (timestamped)
@@ -593,6 +607,11 @@ struct Hub {
     // Monotonic id of the CURRENT sync session; stream/snapshot/link messages
     // from any other session are stale and dropped (see Msg::MasterCommand).
     repl_session: u64,
+    // Replication config epoch: the version of the last failover decision this
+    // node accepted. A REPLICAOF carrying an OLDER epoch is a stale sentinel
+    // trying to repoint us at a superseded master — rejected. Persisted in the
+    // role file so it survives restarts.
+    config_epoch: u64,
     tx: mpsc::SyncSender<Msg>, // so we can spawn a replica sync thread
     // transactions
     txs: HashMap<u64, TxState>,
@@ -792,6 +811,7 @@ impl Hub {
             master: None,
             replica_stop: None,
             repl_session: 0,
+            config_epoch: 0,
             tx,
             txs: HashMap::new(),
             watched_keys: HashMap::new(),
@@ -861,6 +881,7 @@ impl Hub {
             waiting: Vec::new(),
         };
         hub.apply_extras(extras);
+        hub.config_epoch = boot_epoch();
         // Resume the persisted role: a crashed replica must come back AS a
         // replica (read-only, re-syncing from its master) — not as a writable
         // master serving stale data that a sentinel might then promote.
@@ -1092,15 +1113,16 @@ impl Hub {
         }
     }
 
-    /// Persist which role this node is in (master, or replica of whom), so a
-    /// restart resumes the SAME role. Without this a crashed replica rebooted
-    /// as a writable master with whatever data its files held — and a sentinel
-    /// could promote that.
+    /// Persist which role this node is in (master, or replica of whom) plus the
+    /// config epoch, so a restart resumes the SAME role at the SAME epoch.
+    /// Without this a crashed replica rebooted as a writable master with
+    /// whatever data its files held — and a sentinel could promote that.
     fn persist_role(&self) {
-        let content = match &self.master {
-            Some((h, p)) => format!("replicaof {h} {p}\n"),
-            None => "master\n".to_string(),
+        let role = match &self.master {
+            Some((h, p)) => format!("replicaof {h} {p}"),
+            None => "master".to_string(),
         };
+        let content = format!("epoch {}\n{role}\n", self.config_epoch);
         if let Err(e) = std::fs::write(role_file_path(), content) {
             log::warn(&format!("could not persist role: {e}"));
         }
@@ -2046,6 +2068,7 @@ impl Hub {
         s.push_str(&format!("role:{role}\r\n"));
         s.push_str(&format!("connected_slaves:{}\r\n", self.replicas.len()));
         s.push_str(&format!("master_replid:{}\r\n", self.replid));
+        s.push_str(&format!("config_epoch:{}\r\n", self.config_epoch));
         s.push_str(&format!(
             "master_repl_offset:{}\r\n",
             self.master_repl_offset
@@ -3624,11 +3647,32 @@ impl Hub {
     }
 
     fn handle_replicaof(&mut self, id: u64, tokens: &[Vec<u8>]) {
-        if tokens.len() != 3 {
+        // REPLICAOF host port [EPOCH n]  |  REPLICAOF NO ONE [EPOCH n]
+        if tokens.len() != 3 && !(tokens.len() == 5 && tokens[3].eq_ignore_ascii_case(b"EPOCH")) {
             return self.send(
                 id,
                 resp::error("ERR wrong number of arguments for 'replicaof' command"),
             );
+        }
+        // Epoch fence: a sentinel that missed a failover carries a stale epoch.
+        // Reject its repointing so a resurrected old master (or a lagging
+        // sentinel) can't demote the legitimate new master and destroy
+        // post-failover writes. A command with no epoch (manual op) is trusted.
+        if let Some(ep) = tokens
+            .get(4)
+            .and_then(|t| std::str::from_utf8(t).ok())
+            .and_then(|s| s.trim().parse::<u64>().ok())
+        {
+            if ep < self.config_epoch {
+                return self.send(
+                    id,
+                    resp::error(&format!(
+                        "STALEEPOCH REPLICAOF epoch {ep} is older than my config epoch {} — ignoring a superseded failover directive",
+                        self.config_epoch
+                    )),
+                );
+            }
+            self.config_epoch = ep;
         }
         if tokens[1].eq_ignore_ascii_case(b"NO") && tokens[2].eq_ignore_ascii_case(b"ONE") {
             // Stop the sync thread; promotion to a writable master.

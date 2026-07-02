@@ -1906,6 +1906,51 @@ fn sentinel_promotes_replica_and_repoints_on_master_death() {
 }
 
 #[test]
+fn replicaof_epoch_fence_rejects_stale_directives() {
+    // The load-bearing failover-safety fence: once a node has accepted a
+    // promotion at epoch N, a REPLICAOF carrying an OLDER epoch (a sentinel
+    // that missed the failover) is rejected — this is what stops a resurrected
+    // old master from demoting the legitimate new one and eating post-failover
+    // writes. A stray peer (never a real target) plays the "old master".
+    let node = Server::start();
+    let stray = Server::start();
+    let mut c = node.connect();
+
+    // Promote at epoch 5 (as a sentinel's failover would).
+    assert_eq!(c.cmd(&["REPLICAOF", "NO", "ONE", "EPOCH", "5"]), "OK");
+    assert!(c.cmd(&["INFO"]).contains("config_epoch:5"));
+
+    // A stale sentinel (epoch 3) tries to repoint us at the old master: rejected.
+    let stale = c.cmd(&[
+        "REPLICAOF",
+        "127.0.0.1",
+        &stray.port.to_string(),
+        "EPOCH",
+        "3",
+    ]);
+    assert!(
+        stale.starts_with("-STALEEPOCH"),
+        "stale epoch not fenced: {stale}"
+    );
+    assert!(c.cmd(&["INFO"]).contains("role:master")); // still master
+
+    // An equal-or-newer epoch is honored (the real, current failover).
+    assert_eq!(
+        c.cmd(&[
+            "REPLICAOF",
+            "127.0.0.1",
+            &stray.port.to_string(),
+            "EPOCH",
+            "6"
+        ]),
+        "OK"
+    );
+    assert!(c.cmd(&["INFO"]).contains("config_epoch:6"));
+    // A manual REPLICAOF (no epoch) is always trusted (operator override).
+    assert_eq!(c.cmd(&["REPLICAOF", "NO", "ONE"]), "OK");
+}
+
+#[test]
 fn sentinel_holds_failover_without_quorum() {
     let master = Server::start();
     let r1 = Server::start();
