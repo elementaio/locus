@@ -74,22 +74,42 @@ fn gen_id(arg: &[u8], last: StreamId) -> Result<StreamId, String> {
 }
 
 pub fn xadd(db: &mut Db, tokens: &[Vec<u8>]) -> Vec<u8> {
-    // XADD key id field value [field value ...]
-    if tokens.len() < 5 || tokens.len().is_multiple_of(2) {
+    // XADD key [MAXLEN [= | ~] count] id field value [field value ...]
+    if tokens.len() < 5 {
         return error("ERR wrong number of arguments for 'xadd' command");
     }
     let key = &tokens[1];
+    // Optional trim clause before the id. `~` (approximate) and `=` (exact) are
+    // both honored by trimming to `count` from the front — we keep no radix
+    // tree, so there is no cheaper approximate form to fall back to.
+    let mut i = 2;
+    let mut maxlen: Option<usize> = None;
+    if tokens[i].eq_ignore_ascii_case(b"MAXLEN") {
+        i += 1;
+        if tokens.get(i).is_some_and(|t| t == b"~" || t == b"=") {
+            i += 1;
+        }
+        match parse_usize(tokens.get(i)) {
+            Some(n) => maxlen = Some(n),
+            None => return error("ERR value is not an integer or out of range"),
+        }
+        i += 1;
+    }
+    // Remaining must be: id field value [field value ...] — id + ≥1 even pair.
+    if tokens.len() < i + 3 || !(tokens.len() - i - 1).is_multiple_of(2) {
+        return error("ERR wrong number of arguments for 'xadd' command");
+    }
     // Determine the id without creating an empty stream on error.
     let last = match db.get(key) {
         Some(Value::Stream(s)) => s.last_id,
         Some(_) => return wrongtype(),
         None => (0, 0),
     };
-    let id = match gen_id(&tokens[2], last) {
+    let id = match gen_id(&tokens[i], last) {
         Ok(id) => id,
         Err(e) => return error(&format!("ERR {e}")),
     };
-    let fields: Vec<(Vec<u8>, Vec<u8>)> = tokens[3..]
+    let fields: Vec<(Vec<u8>, Vec<u8>)> = tokens[i + 1..]
         .chunks(2)
         .map(|c| (c[0].clone(), c[1].clone()))
         .collect();
@@ -97,6 +117,12 @@ pub fn xadd(db: &mut Db, tokens: &[Vec<u8>]) -> Vec<u8> {
         Value::Stream(s) => {
             s.entries.push((id, fields));
             s.last_id = id;
+            if let Some(n) = maxlen
+                && s.entries.len() > n
+            {
+                let drop = s.entries.len() - n;
+                s.entries.drain(0..drop); // trim oldest to the cap
+            }
             bulk_string(&fmt_id(id))
         }
         _ => wrongtype(),
@@ -114,11 +140,17 @@ pub fn xlen(db: &mut Db, tokens: &[Vec<u8>]) -> Vec<u8> {
     }
 }
 
-fn bound(arg: &[u8], is_end: bool) -> Option<StreamId> {
+/// Parse an XRANGE bound, honoring the exclusive `(` prefix (Redis syntax used
+/// by cursor paging). Returns (id, exclusive).
+fn bound_ex(arg: &[u8], is_end: bool) -> Option<(StreamId, bool)> {
+    if let Some(rest) = arg.strip_prefix(b"(") {
+        // `(-`/`(+` are meaningless; a bare `(id` excludes that id.
+        return parse_id(rest, if is_end { u64::MAX } else { 0 }).map(|id| (id, true));
+    }
     match arg {
-        b"-" => Some((0, 0)),
-        b"+" => Some((u64::MAX, u64::MAX)),
-        _ => parse_id(arg, if is_end { u64::MAX } else { 0 }),
+        b"-" => Some(((0, 0), false)),
+        b"+" => Some(((u64::MAX, u64::MAX), false)),
+        _ => parse_id(arg, if is_end { u64::MAX } else { 0 }).map(|id| (id, false)),
     }
 }
 
@@ -155,17 +187,26 @@ pub fn xrange(db: &mut Db, tokens: &[Vec<u8>], rev: bool) -> Vec<u8> {
     } else {
         (&tokens[2], &tokens[3])
     };
-    let (start, end) = match (bound(start_arg, false), bound(end_arg, true)) {
-        (Some(a), Some(b)) => (a, b),
-        _ => return error("ERR Invalid stream ID specified as stream command argument"),
-    };
+    let ((start, start_excl), (end, end_excl)) =
+        match (bound_ex(start_arg, false), bound_ex(end_arg, true)) {
+            (Some(a), Some(b)) => (a, b),
+            _ => return error("ERR Invalid stream ID specified as stream command argument"),
+        };
     match db.get(&tokens[1]) {
         None => array(&[]),
         Some(Value::Stream(s)) => {
             let mut matched: Vec<Vec<u8>> = s
                 .entries
                 .iter()
-                .filter(|(id, _)| *id >= start && *id <= end)
+                .filter(|(id, _)| {
+                    let lo = if start_excl {
+                        *id > start
+                    } else {
+                        *id >= start
+                    };
+                    let hi = if end_excl { *id < end } else { *id <= end };
+                    lo && hi
+                })
                 .map(|(id, f)| entry_reply(*id, f))
                 .collect();
             if rev {

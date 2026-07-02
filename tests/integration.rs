@@ -1058,6 +1058,30 @@ fn blocking_xread_wakes_on_xadd() {
     );
 }
 
+#[test]
+fn xadd_maxlen_trims_to_the_cap() {
+    let s = Server::start();
+    let mut c = s.connect();
+    // MAXLEN with the approximate marker (as go-redis emits) keeps only the
+    // newest N entries; also the exact form and the no-trim form.
+    for i in 0..10 {
+        c.cmd(&["XADD", "log", "MAXLEN", "~", "3", "*", "n", &i.to_string()]);
+    }
+    assert_eq!(c.cmd(&["XLEN", "log"]), "3");
+    let r = c.cmd(&["XRANGE", "log", "-", "+"]);
+    assert!(
+        r.contains("n, 9") && r.contains("n, 7") && !r.contains("n, 6"),
+        "kept newest 3: {r}"
+    );
+    // Exact marker.
+    c.cmd(&["XADD", "log", "MAXLEN", "=", "1", "*", "n", "last"]);
+    assert_eq!(c.cmd(&["XLEN", "log"]), "1");
+    // Plain XADD (no MAXLEN) still works and grows.
+    c.cmd(&["XADD", "plain", "1-1", "f", "v"]);
+    c.cmd(&["XADD", "plain", "2-2", "f", "v"]);
+    assert_eq!(c.cmd(&["XLEN", "plain"]), "2");
+}
+
 // === maxmemory / eviction ===================================================
 
 #[test]
