@@ -35,10 +35,12 @@ $ redis-cli -p 6379 GEOSEARCH fleet FROMLONLAT 55.27 25.2 BYRADIUS 5 km ASC   # 
 > durable persistence (crash-tested), the full reactive/geo differentiator set, broad driver/ops
 > compatibility (`SCAN`, `INFO`, `redis_exporter`, RESP3), correct replication (`WAIT`, no expiry
 > divergence, **partial-resync** on reconnect), **automatic failover** (built-in sentinel), **TLS**
-> (sidecar, or in-process via the optional `tls` feature), and **horizontal spatial clustering**
+> (sidecar, or in-process via the optional `tls` feature), **horizontal spatial clustering**
 > (cell-in-key sharding, bounded cross-shard `GEOSEARCH`, live resharding, per-shard failover, a global
-> HLC-ordered changefeed). The **default build stays 100% dependency-free** — the `tls` feature is the only
-> thing that pulls a crate, and only when you ask. ~14k lines of `std`-only Rust.
+> HLC-ordered changefeed), a **disk tier** for archives, **work queues** (blocking pops), and a
+> three-reviewer adversarial hardening pass with every finding fixed and regression-tested. The
+> **default build stays 100% dependency-free** — the `tls` feature is the only thing that pulls a
+> crate, and only when you ask. ~18k lines of `std`-only Rust.
 
 ---
 
@@ -47,7 +49,7 @@ $ redis-cli -p 6379 GEOSEARCH fleet FROMLONLAT 55.27 25.2 BYRADIUS 5 km ASC   # 
 **Redis-compatible core**
 
 - **Data types:** strings, lists, hashes, sets, sorted sets, streams, bitmaps — broad per-type command
-  coverage with `WRONGTYPE` checks. ~180 commands; see [docs/COMMANDS.md](docs/COMMANDS.md).
+  coverage with `WRONGTYPE` checks. ~200 commands; see [docs/COMMANDS.md](docs/COMMANDS.md).
 - **Iteration & introspection:** real incremental `SCAN`/`HSCAN`/`SSCAN`/`ZSCAN`, `COMMAND`/`COMMAND
   DOCS`, `OBJECT ENCODING`, `CLIENT`, `GETEX` — off-the-shelf clients connect without fallbacks.
 - **Key expiration:** `SET … EX/PX/EXAT/PXAT/NX/XX/KEEPTTL`, `EXPIRE`/`TTL`/`PERSIST`, passive + active.
@@ -73,6 +75,10 @@ $ redis-cli -p 6379 GEOSEARCH fleet FROMLONLAT 55.27 25.2 BYRADIUS 5 km ASC   # 
 - **Snapshots + AOF:** RDB-style binary snapshots (truly-async `BGSAVE`) and an append-only file with
   crash-safe, torn-tail-tolerant replay, configurable `appendfsync`, and `BGREWRITEAOF` compaction.
   Directory-fsync'd renames; **fuzz- and `kill -9` crash-recovery-tested.**
+- **Disk tier — "RAM for live data, NVMe for archives":** `TIER key` moves a value to an on-disk
+  value-log, leaving a ~100-byte stub; any read **thaws it back transparently** (API unchanged). TTL,
+  RDB/AOF, and replication all keep working. Turns "keep 30 days of history" from a RAM bill into a
+  disk one (`LOCUS_TIER`).
 
 **Replication & high availability**
 
@@ -99,6 +105,27 @@ $ redis-cli -p 6379 GEOSEARCH fleet FROMLONLAT 55.27 25.2 BYRADIUS 5 km ASC   # 
 - **Secondary index:** `IDXCREATE`/`IDXGET`/`IDXRANGE` — query by hash field, auto-maintained (no drift).
 
 **Zero dependencies.** Pure `std`; one small static binary; reproducible builds.
+
+---
+
+## What do you build with it?
+
+The shapes Locus is good at, each one or two commands deep:
+
+| Job | How |
+|---|---|
+| **Work queue / background jobs** | producers `RPUSH`, workers `BLPOP` (blocking, FIFO-fair across workers); `BLMOVE` for the reliable-queue pattern; `LMPOP` for batch drains |
+| **Cache / sessions** | `SET … EX`, `GETEX`, `maxmemory` + eviction — the classic role, minus a second moving part |
+| **Rate limits & quotas** | `INCRCAP` (atomic increment-with-cap: one verb, no script), `CAS` for optimistic writes, `SETNX + EX` for idempotency keys and locks |
+| **Live dashboards / sync** | `CDCSUBSCRIBE prefix` — snapshot **then** every change, gap-free with offsets and consumer groups; UIs stop polling |
+| **Fleet / delivery / anything moving** | `GEOSET` with attributes, `GEOSEARCH … WHERE status active`, live geofences via `CDCSUBSCRIBE REGION` |
+| **Analytics counters** | `PFADD`/`PFCOUNT` daily uniques in 16 KB, `TOPKADD` trending, `CMSINCRBY` frequencies, `TDADD`/`TDQUANTILE` live p99s — all mergeable across shards/days |
+| **Dedup** | `BFADD` — "have I seen this id?" in constant memory |
+| **Query-by-field** | `IDXCREATE`/`IDXGET` — find hashes by a field's value without maintaining your own reverse sets |
+| **Archives on a budget** | finish a record → `TIER` it to the value-log; reads thaw transparently; RAM holds only the live working set |
+
+One binary covers the cache, the queue, the pub/sub bus, the geo index, and the analytics
+counters — the usual "Redis + a queue + a tile server + a metrics store" sprawl, without the sprawl.
 
 For **Node**, the [`locusdb`](clients/node) npm client adds typed verbs and the reactive
 changefeed/geofence as events (`feed.on('change', …)`, `fence.on('enter', …)`) — the push API a stock
