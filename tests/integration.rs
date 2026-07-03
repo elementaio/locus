@@ -998,8 +998,14 @@ fn slow_pubsub_consumer_is_disconnected_not_oom() {
 
     let mut publisher = s.connect();
     let payload = "x".repeat(4096);
-    for _ in 0..200 {
-        // Publishing must keep succeeding regardless of the stalled subscriber.
+    // The stalled consumer's unread bytes land in KERNEL socket buffers before
+    // the server-side queue grows at all, and Linux auto-tunes loopback buffers
+    // into the megabytes (CI runners absorbed an 800 KB flood entirely — the
+    // 64 KB cap never tripped and this test flaked). Publish enough to exceed
+    // any plausible kernel buffering, so the cap must engage: 16 MB.
+    for _ in 0..4000 {
+        // Publishing must keep succeeding regardless of the stalled subscriber
+        // (once it's dropped, deliveries legitimately report 0 subscribers).
         let n = publisher.cmd(&["PUBLISH", "flood", &payload]);
         assert!(n == "0" || n == "1", "PUBLISH failed: {n}");
     }
