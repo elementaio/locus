@@ -22,14 +22,14 @@ jobs:
           name: Locus ${{ github.ref_name }}
           generate_release_notes: true
           body: |
-            Full notes: [CHANGELOG.md](https://github.com/intenttext/locus/blob/${{ github.ref_name }}/CHANGELOG.md).
+            Full notes: [CHANGELOG.md](https://github.com/elementaio/locus/blob/${{ github.ref_name }}/CHANGELOG.md).
 
-            > Pre-1.0 preview. Hardened (AUTH/ACL, protected mode, TLS, replication, sentinel failover, clustering) but still maturing — review [DEPLOYMENT.md](https://github.com/intenttext/locus/blob/${{ github.ref_name }}/docs/DEPLOYMENT.md) before exposing it. Prebuilt binaries are the zero-dependency default build; for in-process TLS build with `--features tls`.
+            > Pre-1.0 preview. Hardened (AUTH/ACL, protected mode, TLS, replication, sentinel failover, clustering) but still maturing — review [DEPLOYMENT.md](https://github.com/elementaio/locus/blob/${{ github.ref_name }}/docs/DEPLOYMENT.md) before exposing it. Prebuilt binaries are the zero-dependency default build; for in-process TLS build with `--features tls`.
 
             ### Install
             **Docker**
             ```
-            docker run -p 6379:6379 ghcr.io/intenttext/locus:${{ github.ref_name }}
+            docker run -p 6379:6379 ghcr.io/elementaio/locus:${{ github.ref_name }}
             ```
             **Prebuilt binary** — download the archive for your platform below, verify the `.sha256`, extract, and run `./locus`.
 

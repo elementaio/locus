@@ -65,7 +65,7 @@ See [CHANGEFEED.md](CHANGEFEED.md), [GEO.md](GEO.md), [SKETCHES.md](SKETCHES.md)
 ## Distribution (shipped in v0.2.0)
 
 - **GitHub Releases** with prebuilt static binaries (Linux x86_64/aarch64, macOS x86_64/arm64).
-- **Docker image** — `ghcr.io/intenttext/locus` (multi-tag, public).
+- **Docker image** — `ghcr.io/elementaio/locus` (multi-tag, public).
 - **crates.io** — `cargo install locusdb` (crate `locusdb`; the command stays `locus`).
 - Any **Redis client** works over RESP; the custom verbs go through each client's raw-command API
   (see [CLIENTS.md](CLIENTS.md)).

@@ -1,8 +1,8 @@
 blank_issues_enabled: true
 contact_links:
   - name: Security vulnerability
-    url: https://github.com/intenttext/locus/security/advisories/new
+    url: https://github.com/elementaio/locus/security/advisories/new
     about: Please report security issues privately — see SECURITY.md, not the public tracker.
   - name: Question or idea
-    url: https://github.com/intenttext/locus/discussions
+    url: https://github.com/elementaio/locus/discussions
     about: Open-ended questions and discussion (if Discussions are enabled).

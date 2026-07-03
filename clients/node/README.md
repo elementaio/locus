@@ -1,6 +1,6 @@
 # locusdb
 
-The Node.js client for [Locus](https://github.com/intenttext/locus). Any Redis
+The Node.js client for [Locus](https://github.com/elementaio/locus). Any Redis
 driver works against Locus for standard commands — this package adds the two
 things a plain driver can't give you ergonomically:
 

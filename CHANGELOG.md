@@ -214,7 +214,7 @@ plus transaction-correctness fixes and `maxmemory` eviction. Still pre-1.0 and n
 
 ### Added (distribution)
 - **`LOCUS_BIND`** — configurable listen interface (default `127.0.0.1`, so Locus isn't exposed by
-  accident given it has no AUTH/TLS). An official **Docker image** (`ghcr.io/intenttext/locus`, sets
+  accident given it has no AUTH/TLS). An official **Docker image** (`ghcr.io/elementaio/locus`, sets
   `LOCUS_BIND=0.0.0.0`) and **prebuilt static binaries** (Linux/macOS, x86_64/arm64) are now published
   per release.
 
@@ -356,7 +356,7 @@ milestone. Zero third-party dependencies (pure `std`).
   a skiplist for O(log n) sorted-set ops; full RESP3 typing of every reply; thread-per-core execution.
 - No authentication or TLS yet — bind to a trusted network only.
 
-[Unreleased]: https://github.com/intenttext/locus/compare/v0.3.0...HEAD
-[0.3.0]: https://github.com/intenttext/locus/compare/v0.2.0...v0.3.0
-[0.2.0]: https://github.com/intenttext/locus/compare/v0.1.0...v0.2.0
-[0.1.0]: https://github.com/intenttext/locus/releases/tag/v0.1.0
+[Unreleased]: https://github.com/elementaio/locus/compare/v0.3.0...HEAD
+[0.3.0]: https://github.com/elementaio/locus/compare/v0.2.0...v0.3.0
+[0.2.0]: https://github.com/elementaio/locus/compare/v0.1.0...v0.2.0
+[0.1.0]: https://github.com/elementaio/locus/releases/tag/v0.1.0

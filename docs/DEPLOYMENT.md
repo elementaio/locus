@@ -123,7 +123,7 @@ redis-cli -p 6379 REPLICAOF 127.0.0.1 7000
 ```yaml
 services:
   locus:
-    image: ghcr.io/intenttext/locus:latest
+    image: ghcr.io/elementaio/locus:latest
     environment:
       LOCUS_BIND: 127.0.0.1          # loopback only; the sidecar fronts it
       LOCUS_REQUIREPASS: ${LOCUS_PW}

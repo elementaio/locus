@@ -2,7 +2,7 @@
 
 **The reactive, geo-first datastore that speaks Redis.**
 
-[![CI](https://github.com/intenttext/locus/actions/workflows/ci.yml/badge.svg)](https://github.com/intenttext/locus/actions/workflows/ci.yml)
+[![CI](https://github.com/elementaio/locus/actions/workflows/ci.yml/badge.svg)](https://github.com/elementaio/locus/actions/workflows/ci.yml)
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
 [![Rust](https://img.shields.io/badge/rust-2024-orange.svg)](https://www.rust-lang.org/)
 
@@ -157,17 +157,17 @@ cargo test                # unit + end-to-end integration tests
 ```console
 # Docker — RESP on 6379. Set a password: protected mode (on by default) refuses
 # non-loopback clients without one, and Docker connections are non-loopback.
-docker run -p 6379:6379 -e LOCUS_REQUIREPASS=change-me ghcr.io/intenttext/locus:latest
+docker run -p 6379:6379 -e LOCUS_REQUIREPASS=change-me ghcr.io/elementaio/locus:latest
 # persist across restarts:
 docker run -p 6379:6379 -e LOCUS_REQUIREPASS=change-me \
-  -v locus-data:/data -e LOCUS_RDB=/data/locus.rdb ghcr.io/intenttext/locus:latest
+  -v locus-data:/data -e LOCUS_RDB=/data/locus.rdb ghcr.io/elementaio/locus:latest
 # then: redis-cli -a change-me PING
 ```
 
 (For a throwaway on a trusted network you can `-e LOCUS_PROTECTED_MODE=no` instead —
 but prefer the password; it's one flag.)
 
-Or grab a prebuilt static binary from the [latest release](https://github.com/intenttext/locus/releases/latest)
+Or grab a prebuilt static binary from the [latest release](https://github.com/elementaio/locus/releases/latest)
 (Linux x86_64/aarch64, macOS x86_64/aarch64). With a Rust toolchain, install from crates.io (the crate
 is `locusdb`; the installed command is `locus`):
 

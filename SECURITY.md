@@ -24,7 +24,7 @@ Only the latest release line receives security fixes while the project is pre-1.
 Report privately through either channel:
 
 - **GitHub** — open a private advisory via the repository's
-  [Security → Report a vulnerability](https://github.com/intenttext/locus/security/advisories/new)
+  [Security → Report a vulnerability](https://github.com/elementaio/locus/security/advisories/new)
   tab (preferred).
 - **Email** — emadjumaah@gmail.com, with `[locus security]` in the subject.
 
