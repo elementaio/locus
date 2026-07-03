@@ -475,6 +475,7 @@ fn reconstruct(key: &[u8], value: &Value) -> Vec<Vec<Vec<u8>>> {
         ]],
         Value::TopK(t) => vec![vec![b"TOPKLOAD".to_vec(), k, t.to_bytes()]],
         Value::TDigest(t) => vec![vec![b"TDLOAD".to_vec(), k, t.to_bytes()]],
+        Value::Hll(h) => vec![vec![b"PFLOAD".to_vec(), k, h.regs.clone()]],
     }
 }
 

@@ -28,6 +28,8 @@ works. This is a curated subset of Redis — the common, useful commands per typ
 | `DBSIZE` | number of keys (cluster-wide total across shards when cluster mode is on) |
 | `RANDOMKEY` | a random key (nil if empty) |
 | `RENAME key newkey` / `RENAMENX key newkey` | move value+TTL; RENAMENX fails if dest exists |
+| `COPY src dst [DB 0] [REPLACE]` | deep-copy value **and TTL**; `0` if dst exists without REPLACE |
+| `OBJECT ENCODING\|REFCOUNT\|IDLETIME\|FREQ key` | plausible introspection answers (one representation per type) |
 | `FLUSHDB` / `FLUSHALL` | empty the keyspace (single logical DB) |
 | `TYPE key` | `string`/`list`/`hash`/`set`/`zset`/`stream`/`none` |
 | `EXPIRE` / `PEXPIRE` / `EXPIREAT` / `PEXPIREAT key n` | set TTL |
@@ -53,6 +55,13 @@ works. This is a curated subset of Redis — the common, useful commands per typ
 `LPUSH` `RPUSH` `LPUSHX` `RPUSHX` `LPOP [count]` `RPOP [count]` `LLEN` `LRANGE` (negative indices)
 `LINDEX` `LSET` `LINSERT key BEFORE|AFTER pivot value` `LREM key count value` `LTRIM key start stop`
 `LPOS key value [RANK r] [COUNT n]` `RPOPLPUSH src dst` `LMOVE src dst LEFT|RIGHT LEFT|RIGHT`
+`LMPOP numkeys key [key ...] LEFT|RIGHT [COUNT n]` — pop from the first non-empty list
+
+**Blocking (work queues):** `BLPOP key [key ...] timeout` `BRPOP key [key ...] timeout`
+`BLMOVE src dst LEFT|RIGHT LEFT|RIGHT timeout` — block until data arrives or the timeout
+(seconds, fractional ok, `0` = forever) passes. Waiters are served oldest-first; a served
+pop propagates to AOF/replicas as the same command applied non-blocking; inside
+MULTI/EXEC they never block (immediate value or nil, Redis semantics).
 
 ## Sketches (probabilistic)
 
@@ -63,6 +72,10 @@ Compact, mergeable summaries. First up: a Bloom filter for dedup / set membershi
 | `BFADD key item` | add an item → `1` if probably new, `0` if probably already seen |
 | `BFEXISTS key item` | `1` if probably present, `0` if **definitely** absent (no false negatives) |
 | `BFLOAD key k nbits bits` | restore raw bits (used by AOF rewrite / replication) |
+| `PFADD key [item ...]` | HyperLogLog: add items → `1` if the estimate may have changed |
+| `PFCOUNT key [key ...]` | approximate distinct count (multi-key = the UNION's count, no mutation) |
+| `PFMERGE dst src [src ...]` | fold sources into `dst` (register-wise max — lossless union) |
+| `PFLOAD key regs` | restore raw registers (AOF rewrite / replication) |
 | `CMSINCRBY key item count [item count ...]` | Count-Min: add to frequencies → new estimate per item |
 | `CMSQUERY key item [item ...]` | estimated frequency per item (over-estimate, never under) |
 | `CMSLOAD key width depth bytes` | restore raw counters (AOF rewrite / replication) |
@@ -75,7 +88,8 @@ Compact, mergeable summaries. First up: a Bloom filter for dedup / set membershi
 | `TDQUANTILE key q [q ...]` | estimated value at each quantile `q` (0..1); exact at min/max |
 | `TDLOAD key bytes` | restore (AOF rewrite / replication) |
 
-Auto-sized on first add (Bloom ≈10k @ 1% FPR; CMS 2000×5; TopK k=10; t-digest compression 100);
+Auto-sized on first add (Bloom ≈10k @ 1% FPR; HLL dense 2^14 registers ≈16 KB @ ~0.81% error;
+CMS 2000×5; TopK k=10; t-digest compression 100);
 persist via RDB/AOF. The full a-la-carte sketch family is in place.
 
 ## Secondary index (query by field)
@@ -157,6 +171,8 @@ combined attribute filters are the next phases.)
 `ZADD [NX\|XX] [GT\|LT] [CH] [INCR]` `ZSCORE` `ZMSCORE` `ZCARD` `ZREM` `ZINCRBY` `ZRANK` `ZREVRANK`
 `ZRANGE [WITHSCORES] [REV]` `ZREVRANGE` `ZRANGEBYSCORE` / `ZREVRANGEBYSCORE` (exclusive `(` bounds,
 `inf`/`-inf`, `LIMIT`) `ZCOUNT` `ZPOPMIN [count]` `ZPOPMAX [count]`
+`ZMPOP numkeys key [key ...] MIN|MAX [COUNT n]` — pop from the first non-empty zset
+`BZPOPMIN key [key ...] timeout` / `BZPOPMAX` — blocking pops (same rules as BLPOP)
 `ZREMRANGEBYRANK key start stop` `ZREMRANGEBYSCORE key min max`
 `ZUNIONSTORE dst numkeys key... [WEIGHTS w...] [AGGREGATE SUM|MIN|MAX]` `ZINTERSTORE` (same form;
 sources may be sets, scoring 1.0)

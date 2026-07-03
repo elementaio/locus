@@ -11,7 +11,7 @@ Point any Redis client at Locus — then get what a vanilla Redis can't cleanly 
 - a reliable, ordered **[changefeed](docs/CHANGEFEED.md)** — snapshot + live deltas, offsets, consumer
   groups (keyspace notifications done right);
 - **[geo-first](docs/GEO.md)** objects with `GEOSEARCH` and **live geofencing**;
-- mergeable **[sketches](docs/SKETCHES.md)** — Bloom, Count-Min, Top-K, t-digest;
+- mergeable **[sketches](docs/SKETCHES.md)** — Bloom, HyperLogLog, Count-Min, Top-K, t-digest;
 - atomic **CAS** write verbs and a drift-free **secondary index** (query by field).
 
 **Why it can do this:** every command runs on a single hub thread, so Locus sees each mutation's
@@ -54,6 +54,7 @@ $ redis-cli -p 6379 GEOSEARCH fleet FROMLONLAT 55.27 25.2 BYRADIUS 5 km ASC   # 
 - **`maxmemory` + eviction:** soft cap with key eviction and `OOM` rejection.
 - **Transactions:** `MULTI`/`EXEC`/`DISCARD`, `WATCH`/`UNWATCH` (EXECABORT + WATCH-on-expiry).
 - **Streams:** `XADD`/`XRANGE`/`XREAD`, including **blocking `XREAD`**.
+- **Work queues:** **blocking pops** — `BLPOP`/`BRPOP`/`BLMOVE`/`BZPOPMIN`/`BZPOPMAX` (+ `LMPOP`/`ZMPOP`).
 - **Protocol:** RESP2 **and RESP3** typed replies (maps/sets/doubles) + **push frames** for pub/sub on
   `HELLO 3`; pipelining.
 
@@ -92,8 +93,8 @@ $ redis-cli -p 6379 GEOSEARCH fleet FROMLONLAT 55.27 25.2 BYRADIUS 5 km ASC   # 
 - **[Geo-first](docs/GEO.md):** `GEOSET`/`GEOPOS`/`GEODIST`/`GEOSEARCH` (backed by a **geohash spatial
   index** → sub-linear radius/box queries) with **combined attribute filters** (`GEOSEARCH … WHERE
   status active`), plus **live geofencing** via `CDCSUBSCRIBE REGION`.
-- **[Sketches](docs/SKETCHES.md):** Bloom (dedup), Count-Min (trending), Top-K (heavy hitters),
-  t-digest (live percentiles).
+- **[Sketches](docs/SKETCHES.md):** Bloom (dedup), HyperLogLog (distinct counts), Count-Min
+  (trending), Top-K (heavy hitters), t-digest (live percentiles).
 - **CAS verbs:** `CAS`/`CADEL`/`SETMAX`/`INCRCAP` — atomic check-and-write.
 - **Secondary index:** `IDXCREATE`/`IDXGET`/`IDXRANGE` — query by hash field, auto-maintained (no drift).
 

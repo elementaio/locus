@@ -21,6 +21,7 @@ fn two_hashes(item: &[u8]) -> (u64, u64) {
 }
 
 /// A classic Bloom filter: a bit array plus `k` hash probes.
+#[derive(Clone)]
 pub struct Bloom {
     pub bits: Vec<u8>, // bit array (little-endian within each byte)
     pub k: u8,         // number of hash functions
@@ -83,6 +84,7 @@ impl Bloom {
 
 /// A Count-Min sketch: `depth` rows × `width` counters, one hash per row. Counts
 /// over-estimate (never under-estimate) — the basis for "trending now".
+#[derive(Clone)]
 pub struct Cms {
     pub width: u32,
     pub depth: u32,
@@ -157,6 +159,7 @@ impl Cms {
 
 /// Top-K heavy hitters: a Count-Min for frequencies plus a `k`-slot table of the
 /// current leaders. Approximate (rides on the CMS estimates) but compact.
+#[derive(Clone)]
 pub struct TopK {
     pub k: usize,
     pub cms: Cms,
@@ -296,6 +299,7 @@ fn lerp(x0: f64, y0: f64, x1: f64, y1: f64, x: f64) -> f64 {
 
 /// A t-digest: streaming quantile/percentile estimation, accurate at the tails
 /// (live p99). Centroids plus an unmerged buffer; exact min/max are tracked.
+#[derive(Clone)]
 pub struct TDigest {
     pub centroids: Vec<(f64, f64)>, // (mean, weight), sorted by mean
     buffer: Vec<f64>,
@@ -441,6 +445,89 @@ impl TDigest {
     }
 }
 
+/// A HyperLogLog (approximate distinct-count). Dense layout: 2^14 = 16384
+/// one-byte registers (16 KB per key, ~0.81% standard error) — one byte per
+/// register instead of Redis's packed 6 bits trades a little RAM for much
+/// simpler (and std-only) code. Registers only ever grow, so merge = max,
+/// which is what makes PFMERGE and multi-key PFCOUNT possible.
+#[derive(Clone)]
+pub struct Hll {
+    pub regs: Vec<u8>, // REG_COUNT registers
+}
+
+const HLL_P: u32 = 14;
+pub const HLL_REGS: usize = 1 << HLL_P; // 16384
+
+impl Hll {
+    pub fn new() -> Hll {
+        Hll {
+            regs: vec![0u8; HLL_REGS],
+        }
+    }
+
+    pub fn from_raw(regs: Vec<u8>) -> Option<Hll> {
+        if regs.len() != HLL_REGS {
+            return None;
+        }
+        Some(Hll { regs })
+    }
+
+    /// Add an item; true if any register grew (the estimate may have changed).
+    pub fn add(&mut self, item: &[u8]) -> bool {
+        let (h, _) = two_hashes(item);
+        let idx = (h >> (64 - HLL_P)) as usize; // top P bits pick the register
+        // Rank = position of the first 1-bit in the remaining 50 bits (1-based).
+        // The `| 1` sentinel bounds it at 64-P+1 when the tail is all zeros.
+        let tail = (h << HLL_P) | 1;
+        let rank = (tail.leading_zeros() + 1) as u8;
+        if rank > self.regs[idx] {
+            self.regs[idx] = rank;
+            return true;
+        }
+        false
+    }
+
+    /// The cardinality estimate (raw HLL + linear counting for the small range;
+    /// with a 64-bit hash no large-range correction is needed).
+    pub fn count(&self) -> u64 {
+        estimate(&self.regs)
+    }
+
+    /// Merge another HLL in (register-wise max); true if anything grew.
+    pub fn merge(&mut self, other: &Hll) -> bool {
+        let mut grew = false;
+        for (a, b) in self.regs.iter_mut().zip(other.regs.iter()) {
+            if *b > *a {
+                *a = *b;
+                grew = true;
+            }
+        }
+        grew
+    }
+}
+
+/// The standard HLL estimator over a register array (shared by single-key
+/// counts and the multi-key union, which max-merges into a scratch array).
+pub fn estimate(regs: &[u8]) -> u64 {
+    let m = regs.len() as f64;
+    let alpha = 0.7213 / (1.0 + 1.079 / m);
+    let mut sum = 0.0;
+    let mut zeros = 0u64;
+    for &r in regs {
+        sum += (2.0f64).powi(-i32::from(r)); // exact for every rank a u8 can hold
+        if r == 0 {
+            zeros += 1;
+        }
+    }
+    let raw = alpha * m * m / sum;
+    if raw <= 2.5 * m && zeros > 0 {
+        // Small-range correction: linear counting is far more accurate here.
+        (m * (m / zeros as f64).ln()).round() as u64
+    } else {
+        raw.round() as u64
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -527,5 +614,62 @@ mod tests {
         let r = TopK::from_bytes(&t.to_bytes()).unwrap();
         assert_eq!(r.list(), list);
         assert_eq!(r.k, 2);
+    }
+
+    #[test]
+    fn hll_small_range_is_near_exact() {
+        // Linear counting keeps small cardinalities essentially exact.
+        let mut h = Hll::new();
+        for i in 0..100 {
+            h.add(format!("item-{i}").as_bytes());
+        }
+        let e = h.count();
+        assert!((95..=105).contains(&e), "estimate {e} for 100 distinct");
+        // Re-adding the same items must not move the estimate.
+        for i in 0..100 {
+            assert!(!h.add(format!("item-{i}").as_bytes()));
+        }
+        assert_eq!(h.count(), e);
+    }
+
+    #[test]
+    fn hll_large_range_within_error_bounds() {
+        // 100k distinct at m=16384 → σ ≈ 0.81%; assert within 3σ (~2.5%).
+        let mut h = Hll::new();
+        for i in 0..100_000 {
+            h.add(format!("user:{i}").as_bytes());
+        }
+        let e = h.count() as f64;
+        assert!(
+            (e - 100_000.0).abs() / 100_000.0 < 0.025,
+            "estimate {e} off by more than 2.5%"
+        );
+    }
+
+    #[test]
+    fn hll_merge_is_union() {
+        let (mut a, mut b) = (Hll::new(), Hll::new());
+        for i in 0..5_000 {
+            a.add(format!("a-{i}").as_bytes());
+        }
+        for i in 0..5_000 {
+            b.add(format!("b-{i}").as_bytes());
+        }
+        // Overlap: half of b's items also in a.
+        for i in 0..2_500 {
+            a.add(format!("b-{i}").as_bytes());
+        }
+        assert!(a.merge(&b));
+        let e = a.count() as f64;
+        assert!(
+            (e - 10_000.0).abs() / 10_000.0 < 0.03,
+            "union estimate {e}, want ≈10000"
+        );
+        // Merging an already-covered HLL changes nothing.
+        assert!(!a.merge(&b));
+        // Raw round-trip (persistence path).
+        let r = Hll::from_raw(a.regs.clone()).unwrap();
+        assert_eq!(r.count(), a.count());
+        assert!(Hll::from_raw(vec![0u8; 3]).is_none());
     }
 }

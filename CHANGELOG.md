@@ -6,6 +6,30 @@ All notable changes to Locus are documented here. The format is based on
 
 ## [Unreleased]
 
+## [0.6.0] — 2026-07-03
+
+Broadened general-purpose Redis surface — queues + uniques:
+
+### Added
+- **HyperLogLog**: `PFADD` / `PFCOUNT` (multi-key = union) / `PFMERGE`
+  (+ internal `PFLOAD` for AOF rewrite). Dense 2^14 one-byte registers
+  (16 KB per key, ~0.81% standard error), linear counting on the small range,
+  register-wise max merge. Joins the sketch family (Bloom/CMS/TopK/t-digest);
+  persists via RDB (tag 13) and AOF; new `hll` TYPE.
+- **Blocking list/zset ops** — Locus as a work queue: `BLPOP` `BRPOP`
+  `BLMOVE` `BZPOPMIN` `BZPOPMAX`. Fractional-second timeouts (`0` = forever);
+  waiters served oldest-first; a served pop propagates to AOF/replicas as the
+  same command applied non-blocking (deterministic), so replicas/replay never
+  park; inside MULTI/EXEC they never block (immediate value or nil — Redis
+  semantics); `INFO blocked_clients` includes parked pops.
+- **Parity trio**: `LMPOP` / `ZMPOP` (pop from the first non-empty key,
+  `COUNT` supported) and `COPY src dst [DB 0] [REPLACE]` (deep copy including
+  TTL).
+
+### Fixed
+- An empty (nil) blocking pop is no longer written to the AOF or the
+  replication stream (it changed nothing).
+
 ## [0.5.1] — 2026-07-03
 
 Stream command parity — two standard Redis features go-redis emits that Locus rejected:

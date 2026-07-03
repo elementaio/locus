@@ -355,6 +355,230 @@ fn bloom_filter_dedup() {
 }
 
 #[test]
+fn hyperloglog_counts_and_merges() {
+    let s = Server::start();
+    let mut c = s.connect();
+    // 1000 distinct ids, batched; the estimate must land within ~3%.
+    for start in (0..1000).step_by(100) {
+        let mut args = vec!["PFADD".to_string(), "uniq".to_string()];
+        for i in start..start + 100 {
+            args.push(format!("user-{i}"));
+        }
+        let a: Vec<&str> = args.iter().map(|s| s.as_str()).collect();
+        c.cmd(&a);
+    }
+    let n: f64 = c.cmd(&["PFCOUNT", "uniq"]).parse().unwrap();
+    assert!((n - 1000.0).abs() / 1000.0 < 0.03, "estimate {n}");
+    assert_eq!(c.cmd(&["TYPE", "uniq"]), "hll");
+    // Overlapping second set; union ≈ 1500 via multi-key count and PFMERGE.
+    for start in (500..1500).step_by(100) {
+        let mut args = vec!["PFADD".to_string(), "uniq2".to_string()];
+        for i in start..start + 100 {
+            args.push(format!("user-{i}"));
+        }
+        let a: Vec<&str> = args.iter().map(|s| s.as_str()).collect();
+        c.cmd(&a);
+    }
+    let u: f64 = c.cmd(&["PFCOUNT", "uniq", "uniq2"]).parse().unwrap();
+    assert!((u - 1500.0).abs() / 1500.0 < 0.03, "union {u}");
+    assert_eq!(c.cmd(&["PFMERGE", "both", "uniq", "uniq2"]), "OK");
+    let m: f64 = c.cmd(&["PFCOUNT", "both"]).parse().unwrap();
+    assert!((m - 1500.0).abs() / 1500.0 < 0.03, "merged {m}");
+}
+
+#[test]
+fn hyperloglog_survives_aof_rewrite_and_kill9() {
+    let tmp = std::env::temp_dir();
+    let pid = std::process::id();
+    let rdb = format!("{}/locus-hll-{pid}.rdb", tmp.display());
+    let aof = format!("{}/locus-hll-{pid}.aof", tmp.display());
+    for f in [&rdb, &aof] {
+        let _ = std::fs::remove_file(f);
+    }
+    let env: &[(&str, &str)] = &[("LOCUS_AOF", aof.as_str())];
+    let mut s = Server::spawn_at(rdb.clone(), env);
+    let mut c = s.connect();
+    for start in (0..500).step_by(100) {
+        let mut args = vec!["PFADD".to_string(), "uniq".to_string()];
+        for i in start..start + 100 {
+            args.push(format!("id-{i}"));
+        }
+        let a: Vec<&str> = args.iter().map(|s| s.as_str()).collect();
+        c.cmd(&a);
+    }
+    let before = c.cmd(&["PFCOUNT", "uniq"]);
+    // Rewrite folds the HLL into a PFLOAD record; the tail stays PFADDs.
+    c.cmd(&["BGREWRITEAOF"]);
+    sleep(Duration::from_millis(300));
+    c.cmd(&["PFADD", "uniq", "post-rewrite"]);
+
+    s.child.kill().unwrap(); // ungraceful — replay must rebuild the registers
+    let _ = s.child.wait();
+    let s2 = Server::spawn_at(rdb.clone(), env);
+    let mut c2 = s2.connect();
+    let after: f64 = c2.cmd(&["PFCOUNT", "uniq"]).parse().unwrap();
+    let before: f64 = before.parse().unwrap();
+    assert!(
+        (after - before).abs() <= 2.0,
+        "count drifted across replay: {before} -> {after}"
+    );
+    drop(s2);
+    for f in [&rdb, &aof] {
+        let _ = std::fs::remove_file(f);
+    }
+}
+
+#[test]
+fn parity_commands_lmpop_zmpop_copy() {
+    let s = Server::start();
+    let mut c = s.connect();
+    c.cmd(&["RPUSH", "jobs", "a", "b", "c"]);
+    // LMPOP skips missing keys and reports which key served.
+    assert_eq!(
+        c.cmd(&["LMPOP", "2", "nope", "jobs", "LEFT", "COUNT", "2"]),
+        "[jobs, [a, b]]"
+    );
+    assert_eq!(c.cmd(&["LMPOP", "1", "empty", "LEFT"]), "(nil)");
+    c.cmd(&["ZADD", "board", "3", "c", "1", "a"]);
+    assert_eq!(c.cmd(&["ZMPOP", "1", "board", "MIN"]), "[board, [[a, 1]]]");
+    // COPY clones value + TTL; REPLACE required over an existing key.
+    c.cmd(&["SET", "cfg", "v1"]);
+    c.cmd(&["EXPIRE", "cfg", "100"]);
+    assert_eq!(c.cmd(&["COPY", "cfg", "cfg2"]), "1");
+    assert_eq!(c.cmd(&["GET", "cfg2"]), "v1");
+    let ttl: i64 = c.cmd(&["TTL", "cfg2"]).parse().unwrap();
+    assert!(ttl > 90, "ttl {ttl}");
+    assert_eq!(c.cmd(&["COPY", "cfg", "cfg2"]), "0");
+    assert_eq!(c.cmd(&["COPY", "cfg", "cfg2", "REPLACE"]), "1");
+    // OBJECT ENCODING answers for introspecting client libraries.
+    assert_eq!(c.cmd(&["OBJECT", "ENCODING", "cfg"]), "raw");
+}
+
+#[test]
+fn blpop_blocks_until_a_push_arrives() {
+    let s = Server::start();
+    let mut pusher = s.connect();
+    let mut waiter = s.connect();
+    let started = std::time::Instant::now();
+    let h = std::thread::spawn(move || {
+        let r = waiter.cmd(&["BLPOP", "queue", "5"]);
+        (r, started.elapsed())
+    });
+    sleep(Duration::from_millis(200)); // let it park
+    assert_eq!(pusher.cmd(&["LPUSH", "queue", "job-1"]), "1");
+    let (reply, waited) = h.join().unwrap();
+    assert_eq!(reply, "[queue, job-1]");
+    assert!(
+        waited >= Duration::from_millis(180),
+        "served too early: {waited:?}"
+    );
+    assert!(
+        waited < Duration::from_secs(4),
+        "served by timeout, not push"
+    );
+    // The pop really happened: the queue is gone.
+    assert_eq!(pusher.cmd(&["EXISTS", "queue"]), "0");
+}
+
+#[test]
+fn blpop_times_out_with_nil() {
+    let s = Server::start();
+    let mut c = s.connect();
+    let started = std::time::Instant::now();
+    assert_eq!(c.cmd(&["BLPOP", "nothing", "0.3"]), "(nil)");
+    let waited = started.elapsed();
+    assert!(waited >= Duration::from_millis(250), "{waited:?}");
+    // Immediate serve when data exists; immediate WRONGTYPE on a clashing key.
+    c.cmd(&["RPUSH", "q", "x"]);
+    assert_eq!(c.cmd(&["BLPOP", "q", "1"]), "[q, x]");
+    c.cmd(&["SET", "str", "v"]);
+    assert!(c.cmd(&["BLPOP", "str", "1"]).starts_with("-WRONGTYPE"));
+}
+
+#[test]
+fn blpop_serves_waiters_in_fifo_order() {
+    let s = Server::start();
+    let mut pusher = s.connect();
+    let mut first = s.connect();
+    let mut second = s.connect();
+    let h1 = std::thread::spawn(move || first.cmd(&["BLPOP", "q", "5"]));
+    sleep(Duration::from_millis(150)); // ensure ordering: first parks first
+    let h2 = std::thread::spawn(move || second.cmd(&["BLPOP", "q", "5"]));
+    sleep(Duration::from_millis(150));
+    pusher.cmd(&["RPUSH", "q", "one"]);
+    sleep(Duration::from_millis(100));
+    pusher.cmd(&["RPUSH", "q", "two"]);
+    assert_eq!(h1.join().unwrap(), "[q, one]", "longest waiter first");
+    assert_eq!(h2.join().unwrap(), "[q, two]");
+}
+
+#[test]
+fn blmove_chains_through_a_blocked_consumer() {
+    let s = Server::start();
+    let mut pusher = s.connect();
+    let mut mover = s.connect();
+    let mut consumer = s.connect();
+    // consumer waits on the DESTINATION; mover waits on the SOURCE.
+    let hc = std::thread::spawn(move || consumer.cmd(&["BRPOP", "dst", "5"]));
+    let hm = std::thread::spawn(move || mover.cmd(&["BLMOVE", "src", "dst", "LEFT", "RIGHT", "5"]));
+    sleep(Duration::from_millis(250));
+    // One push satisfies BOTH: the move readies dst, which readies the consumer.
+    pusher.cmd(&["RPUSH", "src", "payload"]);
+    assert_eq!(hm.join().unwrap(), "payload");
+    assert_eq!(hc.join().unwrap(), "[dst, payload]");
+}
+
+#[test]
+fn bzpopmin_pops_lowest_score_across_connections() {
+    let s = Server::start();
+    let mut pusher = s.connect();
+    let mut waiter = s.connect();
+    let h = std::thread::spawn(move || waiter.cmd(&["BZPOPMIN", "board", "5"]));
+    sleep(Duration::from_millis(200));
+    pusher.cmd(&["ZADD", "board", "9", "hi", "2", "lo"]);
+    assert_eq!(h.join().unwrap(), "[board, lo, 2]");
+    // The rest of the zset is intact.
+    assert_eq!(pusher.cmd(&["ZCARD", "board"]), "1");
+}
+
+#[test]
+fn blpop_inside_multi_never_blocks() {
+    let s = Server::start();
+    let mut c = s.connect();
+    assert_eq!(c.cmd(&["MULTI"]), "OK");
+    assert_eq!(c.cmd(&["BLPOP", "missing", "5"]), "QUEUED");
+    let started = std::time::Instant::now();
+    assert_eq!(c.cmd(&["EXEC"]), "[(nil)]"); // immediate nil, Redis semantics
+    assert!(started.elapsed() < Duration::from_millis(500));
+}
+
+#[test]
+fn served_blocking_pop_replicates_to_the_replica() {
+    // A BLPOP served while parked must drain the list everywhere: the serve
+    // re-runs the command through the normal write path, so the replica
+    // applies the same (non-blocking, deterministic) BLPOP from the stream.
+    let m = Server::start_inner(&[]);
+    let r = Server::start_inner(&[]);
+    let (mut cm, mut cr) = (m.connect(), r.connect());
+    cr.cmd(&["REPLICAOF", "127.0.0.1", &m.port.to_string()]);
+    sleep(Duration::from_millis(400)); // let the full sync settle
+
+    let mut waiter = m.connect();
+    let h = std::thread::spawn(move || waiter.cmd(&["BLPOP", "jobs", "5"]));
+    sleep(Duration::from_millis(250)); // park it
+    cm.cmd(&["RPUSH", "jobs", "a", "b"]);
+    assert_eq!(h.join().unwrap(), "[jobs, a]");
+    sleep(Duration::from_millis(300)); // let replication drain
+
+    // Master kept only "b" — and so did the replica.
+    assert_eq!(cm.cmd(&["LRANGE", "jobs", "0", "-1"]), "[b]");
+    assert_eq!(cr.cmd(&["LRANGE", "jobs", "0", "-1"]), "[b]");
+
+    // Writes on a replica are refused, blocking ones included.
+    assert!(cr.cmd(&["BLPOP", "jobs", "1"]).starts_with("-READONLY"));
+}
+
+#[test]
 fn tdigest_percentiles() {
     let s = Server::start();
     let mut c = s.connect();

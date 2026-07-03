@@ -99,6 +99,7 @@ pub fn tag_type_name(tag: u8) -> &'static str {
         8 => "cms",
         9 => "topk",
         10 => "tdigest",
+        13 => "hll",
         _ => "none",
     }
 }
@@ -117,6 +118,7 @@ fn write_value<W: Write>(w: &mut W, key: &[u8], v: &Value) -> io::Result<()> {
         Value::Cms(_) => 8,
         Value::TopK(_) => 9,
         Value::TDigest(_) => 10,
+        Value::Hll(_) => 13,
         Value::Tiered { .. } => 12, // stub: address into the local value-log
     };
     w.write_all(&[tag])?;
@@ -188,6 +190,7 @@ fn write_value<W: Write>(w: &mut W, key: &[u8], v: &Value) -> io::Result<()> {
         }
         Value::TopK(t) => write_bytes(w, &t.to_bytes())?, // self-describing blob
         Value::TDigest(t) => write_bytes(w, &t.to_bytes())?,
+        Value::Hll(h) => write_bytes(w, &h.regs)?, // dense registers, verbatim
         Value::Tiered {
             seg,
             off,
@@ -604,6 +607,12 @@ fn read_value<R: Read>(r: &mut R, tag: u8) -> io::Result<Value> {
                 len,
                 vtag,
             }
+        }
+        13 => {
+            let regs = read_bytes(r)?;
+            let h = crate::sketch::Hll::from_raw(regs)
+                .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "bad HLL"))?;
+            Value::Hll(h)
         }
         _ => {
             return Err(io::Error::new(

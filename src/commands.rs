@@ -75,7 +75,7 @@ pub fn command_keys(tokens: &[Vec<u8>]) -> Vec<&[u8]> {
     let cmd = tokens[0].to_ascii_uppercase();
     match cmd.as_slice() {
         b"DEL" | b"UNLINK" | b"EXISTS" | b"TOUCH" | b"MGET" | b"SINTER" | b"SUNION" | b"SDIFF"
-        | b"PFCOUNT" | b"SINTERSTORE" | b"SUNIONSTORE" | b"SDIFFSTORE" | b"WATCH" => {
+        | b"PFCOUNT" | b"PFMERGE" | b"SINTERSTORE" | b"SUNIONSTORE" | b"SDIFFSTORE" | b"WATCH" => {
             return tokens[1..].iter().map(|k| k.as_slice()).collect();
         }
         b"MSET" | b"MSETNX" => {
@@ -85,7 +85,13 @@ pub fn command_keys(tokens: &[Vec<u8>]) -> Vec<&[u8]> {
                 .map(|k| k.as_slice())
                 .collect();
         }
-        b"RENAME" | b"RENAMENX" | b"RPOPLPUSH" | b"LMOVE" | b"SMOVE" => {
+        b"BLPOP" | b"BRPOP" | b"BZPOPMIN" | b"BZPOPMAX" => {
+            return tokens[1..tokens.len() - 1]
+                .iter()
+                .map(|k| k.as_slice())
+                .collect();
+        }
+        b"RENAME" | b"RENAMENX" | b"RPOPLPUSH" | b"LMOVE" | b"SMOVE" | b"COPY" | b"BLMOVE" => {
             return tokens[1..3.min(tokens.len())]
                 .iter()
                 .map(|k| k.as_slice())
@@ -105,7 +111,7 @@ pub fn command_keys(tokens: &[Vec<u8>]) -> Vec<&[u8]> {
             return keys;
         }
         // SINTERCARD numkeys key [key ...] [LIMIT n]
-        b"SINTERCARD" => return numkeys_keys(tokens, 1),
+        b"SINTERCARD" | b"LMPOP" | b"ZMPOP" => return numkeys_keys(tokens, 1),
         // XREAD [COUNT n] [BLOCK ms] STREAMS key [key ...] id [id ...]
         b"XREAD" => {
             if let Some(pos) = tokens
@@ -289,6 +295,14 @@ pub fn execute_proto(tokens: &[Vec<u8>], db: &mut Db, proto: u8) -> Vec<u8> {
         b"BFADD" => bfadd_cmd(db, tokens),
         b"BFEXISTS" => bfexists_cmd(db, tokens),
         b"BFLOAD" => bfload_cmd(db, tokens),
+        b"PFADD" => pfadd_cmd(db, tokens),
+        b"PFCOUNT" => pfcount_cmd(db, tokens),
+        b"PFMERGE" => pfmerge_cmd(db, tokens),
+        b"PFLOAD" => pfload_cmd(db, tokens),
+        b"LMPOP" => lmpop_cmd(db, tokens),
+        b"BLPOP" | b"BRPOP" | b"BLMOVE" | b"BZPOPMIN" | b"BZPOPMAX" => bpop_now(db, tokens),
+        b"ZMPOP" => zmpop_cmd(db, tokens),
+        b"COPY" => copy_cmd(db, tokens),
         b"CMSINCRBY" => cmsincrby_cmd(db, tokens),
         b"CMSQUERY" => cmsquery_cmd(db, tokens),
         b"CMSLOAD" => cmsload_cmd(db, tokens),
@@ -433,23 +447,28 @@ pub fn command_meta(cmd: &[u8]) -> Option<CmdMeta> {
         | b"EXISTS" | b"TOUCH" | b"KEYS" | b"MGET" | b"SINTER" | b"SUNION" | b"SDIFF"
         | b"WATCH" | b"SUBSCRIBE" | b"PSUBSCRIBE" | b"PUBSUB" | b"BITCOUNT" | b"SRANDMEMBER"
         | b"SELECT" | b"CDCREAD" | b"CDCPENDING" | b"GEOPOS" | b"TOPKLIST" | b"IDXDROP"
-        | b"AUTH" | b"SCAN" | b"OBJECT" | b"CLIENT" | b"SLOWLOG" | b"ACL" => (2, false),
+        | b"AUTH" | b"SCAN" | b"OBJECT" | b"CLIENT" | b"SLOWLOG" | b"ACL" | b"PFCOUNT" => {
+            (2, false)
+        }
         // arity 2 writes
         b"PERSIST" | b"INCR" | b"DECR" | b"GETDEL" | b"LPOP" | b"RPOP" | b"SPOP" | b"ZPOPMIN"
-        | b"ZPOPMAX" | b"DEL" | b"UNLINK" | b"GETEX" | b"TIER" => (2, true),
+        | b"ZPOPMAX" | b"DEL" | b"UNLINK" | b"GETEX" | b"TIER" | b"PFADD" | b"PFMERGE" => (2, true),
         // arity 3 reads
         b"LINDEX" | b"HGET" | b"HEXISTS" | b"HMGET" | b"SISMEMBER" | b"SMISMEMBER" | b"ZSCORE"
         | b"ZMSCORE" | b"ZRANK" | b"ZREVRANK" | b"PUBLISH" | b"REPLICAOF" | b"SLAVEOF"
         | b"LPOS" | b"SINTERCARD" | b"GETBIT" | b"BITPOS" | b"CDCGROUP" | b"CDCREADGROUP"
         | b"CDCACK" | b"GEODIST" | b"BFEXISTS" | b"CMSQUERY" | b"TOPKCOUNT" | b"TDQUANTILE"
         | b"IDXCREATE" | b"IDXGET" | b"HSCAN" | b"SSCAN" | b"ZSCAN" | b"WAIT" => (3, false),
+        // Blocking pops (the hub parks the client; applied non-blocking here)
+        b"BLPOP" | b"BRPOP" | b"BZPOPMIN" | b"BZPOPMAX" => (3, true),
+        b"BLMOVE" => (6, true),
         // arity 3 writes
         b"INCRBY" | b"DECRBY" | b"APPEND" | b"HDEL" | b"SADD" | b"SREM" | b"ZREM" | b"EXPIRE"
         | b"PEXPIRE" | b"EXPIREAT" | b"PEXPIREAT" | b"LPUSH" | b"RPUSH" | b"LPUSHX" | b"RPUSHX"
         | b"SET" | b"SETNX" | b"GETSET" | b"MSET" | b"MSETNX" | b"INCRBYFLOAT" | b"RENAME"
         | b"RENAMENX" | b"RPOPLPUSH" | b"SINTERSTORE" | b"SUNIONSTORE" | b"SDIFFSTORE"
         | b"CADEL" | b"SETMAX" | b"BFADD" | b"TOPKRESERVE" | b"TOPKADD" | b"TOPKLOAD"
-        | b"TDADD" | b"TDLOAD" => (3, true),
+        | b"TDADD" | b"TDLOAD" | b"PFLOAD" | b"COPY" => (3, true),
         // arity 4 reads
         b"LRANGE" | b"ZRANGE" | b"ZREVRANGE" | b"ZRANGEBYSCORE" | b"ZREVRANGEBYSCORE"
         | b"ZCOUNT" | b"XRANGE" | b"XREVRANGE" | b"XREAD" | b"GETRANGE" | b"IDXRANGE" => (4, false),
@@ -457,7 +476,7 @@ pub fn command_meta(cmd: &[u8]) -> Option<CmdMeta> {
         b"LSET" | b"HSET" | b"HSETNX" | b"HINCRBY" | b"ZADD" | b"ZINCRBY" | b"SETEX"
         | b"PSETEX" | b"SETRANGE" | b"LREM" | b"LTRIM" | b"SMOVE" | b"ZREMRANGEBYRANK"
         | b"ZREMRANGEBYSCORE" | b"ZUNIONSTORE" | b"ZINTERSTORE" | b"SETBIT" | b"BITOP"
-        | b"GEOSET" | b"CAS" | b"INCRCAP" | b"CMSINCRBY" => (4, true),
+        | b"GEOSET" | b"CAS" | b"INCRCAP" | b"CMSINCRBY" | b"LMPOP" | b"ZMPOP" => (4, true),
         // arity 5 writes
         b"XADD" | b"LINSERT" | b"LMOVE" | b"BFLOAD" | b"CMSLOAD" => (5, true),
         // arity 6 writes (internal: AOF-rewrite stub restore)
@@ -514,6 +533,11 @@ static COMMAND_NAMES: &[&[u8]] = &[
     b"BGSAVE",
     b"BITCOUNT",
     b"BITOP",
+    b"BLMOVE",
+    b"BLPOP",
+    b"BRPOP",
+    b"BZPOPMAX",
+    b"BZPOPMIN",
     b"BITPOS",
     b"CADEL",
     b"CAS",
@@ -531,6 +555,7 @@ static COMMAND_NAMES: &[&[u8]] = &[
     b"CMSQUERY",
     b"COMMAND",
     b"CONFIG",
+    b"COPY",
     b"DBSIZE",
     b"DECR",
     b"DECRBY",
@@ -580,6 +605,7 @@ static COMMAND_NAMES: &[&[u8]] = &[
     b"LINSERT",
     b"LLEN",
     b"LMOVE",
+    b"LMPOP",
     b"LPOP",
     b"LPOS",
     b"LPUSH",
@@ -596,6 +622,10 @@ static COMMAND_NAMES: &[&[u8]] = &[
     b"PERSIST",
     b"PEXPIRE",
     b"PEXPIREAT",
+    b"PFADD",
+    b"PFCOUNT",
+    b"PFLOAD",
+    b"PFMERGE",
     b"PING",
     b"PSETEX",
     b"PSUBSCRIBE",
@@ -675,6 +705,7 @@ static COMMAND_NAMES: &[&[u8]] = &[
     b"ZCOUNT",
     b"ZINCRBY",
     b"ZINTERSTORE",
+    b"ZMPOP",
     b"ZMSCORE",
     b"ZPOPMAX",
     b"ZPOPMIN",
@@ -2425,6 +2456,431 @@ fn bfload_cmd(db: &mut Db, tokens: &[Vec<u8>]) -> Vec<u8> {
         Value::Bloom(crate::sketch::Bloom::from_raw(k, nbits, bits)),
     );
     simple_string("OK")
+}
+
+// === sketches: HyperLogLog ==================================================
+
+fn pfadd_cmd(db: &mut Db, tokens: &[Vec<u8>]) -> Vec<u8> {
+    if tokens.len() < 2 {
+        return wrong_args("pfadd");
+    }
+    let existed = db.contains(&tokens[1]);
+    let hll = match db.get_or_insert_with(&tokens[1], || Value::Hll(crate::sketch::Hll::new())) {
+        Value::Hll(h) => h,
+        _ => return wrongtype(),
+    };
+    // Creating the key counts as a change, even with no elements (Redis shape).
+    let mut changed = !existed;
+    for el in &tokens[2..] {
+        changed |= hll.add(el);
+    }
+    integer(changed as i64)
+}
+
+fn pfcount_cmd(db: &mut Db, tokens: &[Vec<u8>]) -> Vec<u8> {
+    if tokens.len() < 2 {
+        return wrong_args("pfcount");
+    }
+    if tokens.len() == 2 {
+        return match db.get(&tokens[1]) {
+            None => integer(0),
+            Some(Value::Hll(h)) => integer(h.count() as i64),
+            Some(_) => wrongtype(),
+        };
+    }
+    // Multi-key: the union's estimate, via a register-wise max into scratch —
+    // the whole reason HLL merges losslessly. Nothing is mutated.
+    let mut union = vec![0u8; crate::sketch::HLL_REGS];
+    for key in &tokens[1..] {
+        match db.get(key) {
+            None => {}
+            Some(Value::Hll(h)) => {
+                for (u, r) in union.iter_mut().zip(h.regs.iter()) {
+                    *u = (*u).max(*r);
+                }
+            }
+            Some(_) => return wrongtype(),
+        }
+    }
+    integer(crate::sketch::estimate(&union) as i64)
+}
+
+fn pfmerge_cmd(db: &mut Db, tokens: &[Vec<u8>]) -> Vec<u8> {
+    if tokens.len() < 2 {
+        return wrong_args("pfmerge");
+    }
+    // Gather sources first (dest may be among them), then fold into dest.
+    let mut merged = crate::sketch::Hll::new();
+    for key in &tokens[2..] {
+        match db.get(key) {
+            None => {}
+            Some(Value::Hll(h)) => {
+                merged.merge(h);
+            }
+            Some(_) => return wrongtype(),
+        }
+    }
+    let dest = match db.get_or_insert_with(&tokens[1], || Value::Hll(crate::sketch::Hll::new())) {
+        Value::Hll(h) => h,
+        _ => return wrongtype(),
+    };
+    dest.merge(&merged);
+    simple_string("OK")
+}
+
+/// PFLOAD key <registers> — internal: restores an HLL from its raw register
+/// array (AOF rewrite emits it, like BFLOAD/TOPKLOAD for the other sketches).
+fn pfload_cmd(db: &mut Db, tokens: &[Vec<u8>]) -> Vec<u8> {
+    if tokens.len() != 3 {
+        return wrong_args("pfload");
+    }
+    match crate::sketch::Hll::from_raw(tokens[2].clone()) {
+        Some(h) => {
+            db.insert(tokens[1].clone(), Value::Hll(h));
+            simple_string("OK")
+        }
+        None => error("ERR invalid HLL payload"),
+    }
+}
+
+// === blocking pops (BLPOP family) ===========================================
+//
+// The data semantics live HERE, deterministically and without blocking: pop
+// immediately or reply nil. That is exactly what a replica / AOF replay /
+// MULTI-EXEC needs, so the command propagates verbatim. The HUB layers the
+// blocking on top: a nil reply parks the client, any later write re-runs the
+// command, a deadline sends the nil.
+
+/// A parsed blocking-pop request (the hub keeps it beside the parked client).
+pub struct BPopReq {
+    pub keys: Vec<Vec<u8>>,
+    pub kind: BPopKind,
+    /// `None` = block forever (timeout 0).
+    pub timeout_ms: Option<u64>,
+}
+
+pub enum BPopKind {
+    List {
+        front: bool,
+    },
+    Z {
+        min: bool,
+    },
+    Move {
+        dst: Vec<u8>,
+        from_left: bool,
+        to_left: bool,
+    },
+}
+
+pub fn parse_bpop(tokens: &[Vec<u8>]) -> Result<BPopReq, Vec<u8>> {
+    let cmd = tokens[0].to_ascii_uppercase();
+    let parse_timeout = |t: &[u8]| -> Result<Option<u64>, Vec<u8>> {
+        match std::str::from_utf8(t)
+            .ok()
+            .and_then(|s| s.parse::<f64>().ok())
+        {
+            Some(0.0) => Ok(None),
+            Some(v) if v > 0.0 && v.is_finite() => Ok(Some((v * 1000.0).ceil() as u64)),
+            Some(_) => Err(error("ERR timeout is negative")),
+            None => Err(error("ERR timeout is not a float or out of range")),
+        }
+    };
+    match cmd.as_slice() {
+        b"BLPOP" | b"BRPOP" | b"BZPOPMIN" | b"BZPOPMAX" => {
+            if tokens.len() < 3 {
+                return Err(error("ERR wrong number of arguments"));
+            }
+            let kind = match cmd.as_slice() {
+                b"BLPOP" => BPopKind::List { front: true },
+                b"BRPOP" => BPopKind::List { front: false },
+                b"BZPOPMIN" => BPopKind::Z { min: true },
+                _ => BPopKind::Z { min: false },
+            };
+            Ok(BPopReq {
+                keys: tokens[1..tokens.len() - 1].to_vec(),
+                kind,
+                timeout_ms: parse_timeout(&tokens[tokens.len() - 1])?,
+            })
+        }
+        b"BLMOVE" => {
+            if tokens.len() != 6 {
+                return Err(error("ERR wrong number of arguments for 'blmove' command"));
+            }
+            let dir = |t: &Vec<u8>| match t.to_ascii_uppercase().as_slice() {
+                b"LEFT" => Some(true),
+                b"RIGHT" => Some(false),
+                _ => None,
+            };
+            let (Some(from_left), Some(to_left)) = (dir(&tokens[3]), dir(&tokens[4])) else {
+                return Err(error("ERR syntax error"));
+            };
+            Ok(BPopReq {
+                keys: vec![tokens[1].clone()],
+                kind: BPopKind::Move {
+                    dst: tokens[2].clone(),
+                    from_left,
+                    to_left,
+                },
+                timeout_ms: parse_timeout(&tokens[5])?,
+            })
+        }
+        _ => Err(error("ERR unknown blocking command")),
+    }
+}
+
+/// Cheap readiness peek for a PARKED request: is there anything to pop right
+/// now? Wrong-typed keys are just "not ready" here — a parked client only
+/// wakes for compatible data, mirroring Redis.
+pub fn bpop_ready(db: &mut Db, req: &BPopReq) -> bool {
+    match &req.kind {
+        BPopKind::List { .. } | BPopKind::Move { .. } => req
+            .keys
+            .iter()
+            .any(|k| matches!(db.get(k), Some(Value::List(l)) if !l.is_empty())),
+        BPopKind::Z { .. } => req
+            .keys
+            .iter()
+            .any(|k| matches!(db.get(k), Some(Value::ZSet(z)) if !z.is_empty())),
+    }
+}
+
+/// The reply a blocked client gets on timeout — also how the hub recognizes
+/// "nothing there" from the immediate attempt. BLMOVE nils as a bulk, the
+/// rest as an array (Redis shapes).
+pub fn bpop_nil_reply(req: &BPopReq) -> Vec<u8> {
+    match req.kind {
+        BPopKind::Move { .. } => null_bulk(),
+        _ => null_array(),
+    }
+}
+
+/// The non-blocking execution: serve from the first ready key or reply nil.
+fn bpop_now(db: &mut Db, tokens: &[Vec<u8>]) -> Vec<u8> {
+    let req = match parse_bpop(tokens) {
+        Ok(r) => r,
+        Err(e) => return e,
+    };
+    match &req.kind {
+        BPopKind::List { front } => {
+            for key in &req.keys {
+                match db.get_mut(key) {
+                    Some(Value::List(l)) if !l.is_empty() => {
+                        let v = if *front {
+                            l.pop_front().unwrap()
+                        } else {
+                            l.pop_back().unwrap()
+                        };
+                        db.remove_if_empty(key);
+                        return array(&[bulk_string(key), bulk_string(&v)]);
+                    }
+                    Some(Value::List(_)) | None => {}
+                    Some(_) => return wrongtype(),
+                }
+            }
+            null_array()
+        }
+        BPopKind::Z { min } => {
+            for key in &req.keys {
+                match db.get_mut(key) {
+                    Some(Value::ZSet(z)) if !z.is_empty() => {
+                        let mut sorted = sorted_members(z);
+                        if !*min {
+                            sorted.reverse();
+                        }
+                        let (m, s) = sorted.into_iter().next().unwrap();
+                        z.remove(&m);
+                        db.remove_if_empty(key);
+                        return array(&[
+                            bulk_string(key),
+                            bulk_string(&m),
+                            bulk_string(&fmt_score(s)),
+                        ]);
+                    }
+                    Some(Value::ZSet(_)) | None => {}
+                    Some(_) => return wrongtype(),
+                }
+            }
+            null_array()
+        }
+        // Same machinery as LMOVE — delegate so the two can't drift.
+        BPopKind::Move {
+            dst,
+            from_left,
+            to_left,
+        } => {
+            let d = |left: &bool| -> Vec<u8> {
+                if *left {
+                    b"LEFT".to_vec()
+                } else {
+                    b"RIGHT".to_vec()
+                }
+            };
+            let t = vec![
+                b"LMOVE".to_vec(),
+                req.keys[0].clone(),
+                dst.clone(),
+                d(from_left),
+                d(to_left),
+            ];
+            lmove_cmd(db, &t)
+        }
+    }
+}
+
+// === multi-key pops + COPY ==================================================
+
+/// Shared LMPOP/ZMPOP scaffolding: numkeys + keys + direction word + [COUNT n].
+/// `first` in the result means LEFT (lists) / MIN (sorted sets).
+/// (keys, take_first, count) from a parsed LMPOP/ZMPOP, or an error reply.
+type MPopArgs<'a> = (&'a [Vec<u8>], bool, usize);
+
+fn parse_mpop<'a>(
+    tokens: &'a [Vec<u8>],
+    first_word: &[u8],
+    second_word: &[u8],
+) -> Result<MPopArgs<'a>, Vec<u8>> {
+    let numkeys = match tokens.get(1).and_then(|t| parse_int(t)) {
+        Some(n) if n > 0 => n as usize,
+        _ => return Err(error("ERR numkeys should be greater than 0")),
+    };
+    let mut i = 2 + numkeys;
+    if tokens.len() < i + 1 {
+        return Err(error("ERR syntax error"));
+    }
+    let keys = &tokens[2..i];
+    let dir = tokens[i].to_ascii_uppercase();
+    let first = if dir == first_word {
+        true
+    } else if dir == second_word {
+        false
+    } else {
+        return Err(error("ERR syntax error"));
+    };
+    i += 1;
+    let mut count = 1usize;
+    if i < tokens.len() {
+        if !tokens[i].eq_ignore_ascii_case(b"COUNT") || i + 1 >= tokens.len() {
+            return Err(error("ERR syntax error"));
+        }
+        match parse_int(&tokens[i + 1]) {
+            Some(c) if c > 0 => count = c as usize,
+            _ => return Err(error("ERR count should be greater than 0")),
+        }
+        i += 2;
+    }
+    if i != tokens.len() {
+        return Err(error("ERR syntax error"));
+    }
+    Ok((keys, first, count))
+}
+
+/// LMPOP numkeys key [key ...] LEFT|RIGHT [COUNT n] — pop up to n elements
+/// from the first non-empty list. Reply: [key, [element, ...]] or nil.
+fn lmpop_cmd(db: &mut Db, tokens: &[Vec<u8>]) -> Vec<u8> {
+    let (keys, left, count) = match parse_mpop(tokens, b"LEFT", b"RIGHT") {
+        Ok(p) => p,
+        Err(e) => return e,
+    };
+    for key in keys {
+        let popped: Vec<Vec<u8>> = match db.get_mut(key) {
+            Some(Value::List(l)) if !l.is_empty() => {
+                let n = count.min(l.len());
+                (0..n)
+                    .map(|_| {
+                        if left {
+                            l.pop_front().unwrap()
+                        } else {
+                            l.pop_back().unwrap()
+                        }
+                    })
+                    .collect()
+            }
+            Some(Value::List(_)) | None => continue,
+            Some(_) => return wrongtype(),
+        };
+        db.remove_if_empty(key);
+        let elems: Vec<Vec<u8>> = popped.iter().map(|e| bulk_string(e)).collect();
+        return array(&[bulk_string(key), array(&elems)]);
+    }
+    null_array()
+}
+
+/// ZMPOP numkeys key [key ...] MIN|MAX [COUNT n] — LMPOP for sorted sets.
+/// Reply: [key, [[member, score], ...]] or nil.
+fn zmpop_cmd(db: &mut Db, tokens: &[Vec<u8>]) -> Vec<u8> {
+    let (keys, min, count) = match parse_mpop(tokens, b"MIN", b"MAX") {
+        Ok(p) => p,
+        Err(e) => return e,
+    };
+    for key in keys {
+        let popped: Vec<(Vec<u8>, f64)> = match db.get_mut(key) {
+            Some(Value::ZSet(z)) if !z.is_empty() => {
+                let mut sorted = sorted_members(z);
+                if !min {
+                    sorted.reverse();
+                }
+                let take: Vec<(Vec<u8>, f64)> = sorted.into_iter().take(count).collect();
+                for (m, _) in &take {
+                    z.remove(m);
+                }
+                take
+            }
+            Some(Value::ZSet(_)) | None => continue,
+            Some(_) => return wrongtype(),
+        };
+        db.remove_if_empty(key);
+        let pairs: Vec<Vec<u8>> = popped
+            .iter()
+            .map(|(m, s)| array(&[bulk_string(m), bulk_string(&fmt_score(*s))]))
+            .collect();
+        return array(&[bulk_string(key), array(&pairs)]);
+    }
+    null_array()
+}
+
+/// COPY src dst [DB 0] [REPLACE] — full clone of the value AND the TTL.
+/// Locus is single-database, so only DB 0 is accepted.
+fn copy_cmd(db: &mut Db, tokens: &[Vec<u8>]) -> Vec<u8> {
+    if tokens.len() < 3 {
+        return wrong_args("copy");
+    }
+    let mut replace = false;
+    let mut i = 3;
+    while i < tokens.len() {
+        match tokens[i].to_ascii_uppercase().as_slice() {
+            b"REPLACE" => {
+                replace = true;
+                i += 1;
+            }
+            b"DB" if i + 1 < tokens.len() => {
+                if tokens[i + 1].as_slice() != b"0" {
+                    return error("ERR DB index is out of range");
+                }
+                i += 2;
+            }
+            _ => return error("ERR syntax error"),
+        }
+    }
+    if tokens[1] == tokens[2] {
+        return error("ERR source and destination objects are the same");
+    }
+    // Reading thaws a tiered source; the copy is a plain in-RAM value.
+    let Some(v) = db.get(&tokens[1]).cloned() else {
+        return integer(0);
+    };
+    let ttl = db.expire_at(&tokens[1]);
+    if db.contains(&tokens[2]) && !replace {
+        return integer(0);
+    }
+    db.insert(tokens[2].clone(), v);
+    match ttl {
+        Some(at) => db.set_expire(&tokens[2], at),
+        None => {
+            db.clear_expire(&tokens[2]);
+        }
+    }
+    integer(1)
 }
 
 // === sketches: Count-Min ====================================================
@@ -5345,6 +5801,123 @@ mod tests {
     }
 
     #[test]
+    fn hyperloglog_commands() {
+        let mut db = Db::new();
+        // Creation counts as a change; re-adding the same element doesn't.
+        assert_eq!(cmd(&mut db, &[b"PFADD", b"u", b"a"]), b":1\r\n".to_vec());
+        assert_eq!(cmd(&mut db, &[b"PFADD", b"u", b"a"]), b":0\r\n".to_vec());
+        cmd(&mut db, &[b"PFADD", b"u", b"b", b"c"]);
+        assert_eq!(cmd(&mut db, &[b"PFCOUNT", b"u"]), b":3\r\n".to_vec());
+        assert_eq!(cmd(&mut db, &[b"TYPE", b"u"]), b"+hll\r\n".to_vec());
+        // Empty PFADD: creates (1), then no-ops (0).
+        assert_eq!(cmd(&mut db, &[b"PFADD", b"fresh"]), b":1\r\n".to_vec());
+        assert_eq!(cmd(&mut db, &[b"PFADD", b"fresh"]), b":0\r\n".to_vec());
+        // Union count across keys (overlap collapses).
+        cmd(&mut db, &[b"PFADD", b"v", b"c", b"d"]);
+        assert_eq!(cmd(&mut db, &[b"PFCOUNT", b"u", b"v"]), b":4\r\n".to_vec());
+        // PFMERGE folds sources into dest.
+        assert_eq!(
+            cmd(&mut db, &[b"PFMERGE", b"all", b"u", b"v"]),
+            b"+OK\r\n".to_vec()
+        );
+        assert_eq!(cmd(&mut db, &[b"PFCOUNT", b"all"]), b":4\r\n".to_vec());
+        // Missing key counts 0; WRONGTYPE surfaces on both paths.
+        assert_eq!(cmd(&mut db, &[b"PFCOUNT", b"nope"]), b":0\r\n".to_vec());
+        cmd(&mut db, &[b"SET", b"s", b"x"]);
+        assert!(cmd(&mut db, &[b"PFADD", b"s", b"y"]).starts_with(b"-WRONGTYPE"));
+        assert!(cmd(&mut db, &[b"PFCOUNT", b"s"]).starts_with(b"-WRONGTYPE"));
+        assert!(cmd(&mut db, &[b"PFMERGE", b"all", b"s"]).starts_with(b"-WRONGTYPE"));
+    }
+
+    #[test]
+    fn lmpop_pops_first_nonempty_key() {
+        let mut db = Db::new();
+        cmd(&mut db, &[b"RPUSH", b"q2", b"a", b"b", b"c"]);
+        // Skips the missing q1, pops 2 from the LEFT of q2.
+        let r = cmd(
+            &mut db,
+            &[b"LMPOP", b"2", b"q1", b"q2", b"LEFT", b"COUNT", b"2"],
+        );
+        assert_eq!(
+            r,
+            b"*2\r\n$2\r\nq2\r\n*2\r\n$1\r\na\r\n$1\r\nb\r\n".to_vec()
+        );
+        // Drain the rest; the key disappears; then a nil reply.
+        cmd(&mut db, &[b"LMPOP", b"1", b"q2", b"RIGHT"]);
+        assert_eq!(cmd(&mut db, &[b"EXISTS", b"q2"]), b":0\r\n".to_vec());
+        assert_eq!(
+            cmd(&mut db, &[b"LMPOP", b"2", b"q1", b"q2", b"LEFT"]),
+            b"*-1\r\n".to_vec()
+        );
+        // Bad syntax is rejected.
+        assert!(cmd(&mut db, &[b"LMPOP", b"1", b"q1", b"SIDEWAYS"]).starts_with(b"-ERR"));
+    }
+
+    #[test]
+    fn zmpop_pops_by_score() {
+        let mut db = Db::new();
+        cmd(
+            &mut db,
+            &[b"ZADD", b"z", b"1", b"lo", b"9", b"hi", b"5", b"mid"],
+        );
+        let r = cmd(&mut db, &[b"ZMPOP", b"1", b"z", b"MIN", b"COUNT", b"2"]);
+        assert_eq!(
+            r,
+            b"*2\r\n$1\r\nz\r\n*2\r\n*2\r\n$2\r\nlo\r\n$1\r\n1\r\n*2\r\n$3\r\nmid\r\n$1\r\n5\r\n"
+                .to_vec()
+        );
+        let r = cmd(&mut db, &[b"ZMPOP", b"1", b"z", b"MAX"]);
+        assert_eq!(
+            r,
+            b"*2\r\n$1\r\nz\r\n*1\r\n*2\r\n$2\r\nhi\r\n$1\r\n9\r\n".to_vec()
+        );
+        assert_eq!(cmd(&mut db, &[b"EXISTS", b"z"]), b":0\r\n".to_vec());
+        assert_eq!(
+            cmd(&mut db, &[b"ZMPOP", b"1", b"z", b"MIN"]),
+            b"*-1\r\n".to_vec()
+        );
+    }
+
+    #[test]
+    fn copy_clones_value_and_ttl() {
+        let mut db = Db::new();
+        cmd(&mut db, &[b"SET", b"src", b"v"]);
+        cmd(&mut db, &[b"EXPIRE", b"src", b"100"]);
+        assert_eq!(cmd(&mut db, &[b"COPY", b"src", b"dst"]), b":1\r\n".to_vec());
+        assert_eq!(cmd(&mut db, &[b"GET", b"dst"]), b"$1\r\nv\r\n".to_vec());
+        // TTL travels with the copy.
+        let ttl = cmd(&mut db, &[b"TTL", b"dst"]);
+        assert!(
+            ttl.starts_with(b":9") || ttl.starts_with(b":100"),
+            "{ttl:?}"
+        );
+        // Existing destination refuses without REPLACE, yields with it.
+        cmd(&mut db, &[b"SET", b"dst2", b"old"]);
+        assert_eq!(
+            cmd(&mut db, &[b"COPY", b"src", b"dst2"]),
+            b":0\r\n".to_vec()
+        );
+        assert_eq!(
+            cmd(&mut db, &[b"COPY", b"src", b"dst2", b"REPLACE"]),
+            b":1\r\n".to_vec()
+        );
+        assert_eq!(cmd(&mut db, &[b"GET", b"dst2"]), b"$1\r\nv\r\n".to_vec());
+        // A non-volatile source clears any TTL left on the destination.
+        cmd(&mut db, &[b"SET", b"plain", b"p"]);
+        cmd(&mut db, &[b"COPY", b"plain", b"dst", b"REPLACE"]);
+        assert_eq!(cmd(&mut db, &[b"TTL", b"dst"]), b":-1\r\n".to_vec());
+        // Deep copy: mutating the copy leaves the source alone (collections).
+        cmd(&mut db, &[b"RPUSH", b"list", b"a", b"b"]);
+        cmd(&mut db, &[b"COPY", b"list", b"list2"]);
+        cmd(&mut db, &[b"RPUSH", b"list2", b"c"]);
+        assert_eq!(cmd(&mut db, &[b"LLEN", b"list"]), b":2\r\n".to_vec());
+        assert_eq!(cmd(&mut db, &[b"LLEN", b"list2"]), b":3\r\n".to_vec());
+        // Same key + missing source are refused/zero.
+        assert!(cmd(&mut db, &[b"COPY", b"x", b"x"]).starts_with(b"-ERR"));
+        assert_eq!(cmd(&mut db, &[b"COPY", b"ghost", b"y"]), b":0\r\n".to_vec());
+    }
+
+    #[test]
     fn count_min_sketch_commands() {
         let mut db = Db::new();
         // increments return the running (over-)estimate
@@ -5505,6 +6078,12 @@ mod tests {
             b"GEOSET",
             b"BFADD",
             b"BFLOAD",
+            b"PFADD",
+            b"PFMERGE",
+            b"PFLOAD",
+            b"LMPOP",
+            b"ZMPOP",
+            b"COPY",
             b"CMSINCRBY",
             b"CMSLOAD",
             b"TOPKRESERVE",

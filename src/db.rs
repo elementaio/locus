@@ -42,7 +42,7 @@ impl PartialOrd for Score {
 /// A sorted set: `member -> score` for O(1) lookup, paired with an ordered index
 /// of `(score, member)` for range/rank without re-sorting on every read. Mutate
 /// only through `insert`/`remove` so the two stay in lock-step.
-#[derive(Default)]
+#[derive(Default, Clone)]
 pub struct ZSet {
     map: HashMap<Vec<u8>, f64>,
     sorted: BTreeSet<(Score, Vec<u8>)>,
@@ -102,6 +102,7 @@ impl FromIterator<(Vec<u8>, f64)> for ZSet {
 }
 
 /// A stored value. Each variant is a distinct Redis type.
+#[derive(Clone)]
 pub enum Value {
     Str(Vec<u8>),
     List(VecDeque<Vec<u8>>),
@@ -124,6 +125,8 @@ pub enum Value {
     TopK(crate::sketch::TopK),
     /// A t-digest (streaming quantiles / percentiles).
     TDigest(crate::sketch::TDigest),
+    /// A HyperLogLog (approximate distinct-count; PFADD/PFCOUNT/PFMERGE).
+    Hll(crate::sketch::Hll),
     /// A TIERED value: the real bytes live in the on-disk value-log (see
     /// `tier`); RAM keeps only this stub — key identity, TTL (in `expires`,
     /// as usual), the disk address, and the original type tag so TYPE answers
@@ -144,6 +147,7 @@ pub type StreamId = (u64, u64);
 pub type StreamEntry = (StreamId, Vec<(Vec<u8>, Vec<u8>)>);
 
 /// An append-only stream of entries, ordered by id.
+#[derive(Clone)]
 pub struct Stream {
     pub entries: Vec<StreamEntry>,
     pub last_id: StreamId,
@@ -172,6 +176,7 @@ impl Value {
             Value::Cms(_) => "cms",
             Value::TopK(_) => "topk",
             Value::TDigest(_) => "tdigest",
+            Value::Hll(_) => "hll",
             // The stub remembers its original type, so TYPE stays disk-free.
             Value::Tiered { vtag, .. } => crate::rdb::tag_type_name(*vtag),
         }
@@ -190,6 +195,7 @@ impl Value {
             | Value::Cms(_)
             | Value::TopK(_)
             | Value::TDigest(_)
+            | Value::Hll(_)
             | Value::Tiered { .. } => false,
         }
     }
@@ -807,6 +813,7 @@ fn estimate_size(key_len: usize, v: &Value, volatile: bool) -> usize {
             t.cms.counters.len() * 4 + t.top.iter().map(|(it, _)| it.len() + 16).sum::<usize>()
         }
         Value::TDigest(t) => t.centroids.len() * 16 + 32,
+        Value::Hll(h) => h.regs.len(), // dense: 16 KB flat
         // The whole point: a tiered value costs RAM only for its stub.
         Value::Tiered { .. } => 32,
     };

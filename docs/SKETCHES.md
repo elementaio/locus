@@ -56,6 +56,22 @@ redis-cli TOPKADD hot a a a b c    # a now leads
 redis-cli TOPKLIST hot             # a, b, c
 ```
 
+## HyperLogLog — approximate distinct counts
+
+"How many unique users/IPs/queries?" without storing them. Dense 2^14 one-byte
+registers: a flat **16 KB per key** regardless of cardinality, standard error
+≈ **0.81%**, near-exact on small sets (linear counting).
+
+```
+PFADD  visitors u1 u2 u3      # 1 if the estimate may have changed
+PFCOUNT visitors              # ≈ distinct count
+PFCOUNT day1 day2             # the UNION's count, nothing mutated
+PFMERGE week day1 day2 ...    # fold days into a week key (register-wise max)
+```
+
+Merge is lossless (registers only grow), which is what makes per-shard /
+per-day HLLs foldable into totals.
+
 ## t-digest — quantiles / percentiles
 
 Streaming quantile estimation, accurate at the tails (live p99). Exact at min/max.

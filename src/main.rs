@@ -732,6 +732,8 @@ struct Hub {
     watched_keys: HashMap<Vec<u8>, HashSet<u64>>,
     // blocking XREAD
     blocked: Vec<BlockedReader>,
+    /// Clients parked on a blocking pop (BLPOP/BRPOP/BLMOVE/BZPOPMIN/BZPOPMAX).
+    blocked_pops: Vec<BlockedPop>,
     // negotiated RESP version per client (2 or 3)
     protos: HashMap<u64, u8>,
     // soft memory cap (bytes); None = unlimited
@@ -861,6 +863,16 @@ struct CdcGroup {
     pending: HashMap<u64, Vec<u8>>,
 }
 
+/// A client parked on a blocking pop. The original command is kept verbatim:
+/// serving = re-running it through `exec_one`, so AOF/replication/changefeed
+/// see a plain (deterministic, non-blocking) BLPOP/BLMOVE/… at serve time.
+struct BlockedPop {
+    id: u64,
+    tokens: Vec<Vec<u8>>,
+    req: commands::BPopReq,
+    deadline: Option<u64>, // now_ms + timeout; None = block forever
+}
+
 /// A client parked on a blocking XREAD.
 struct BlockedReader {
     id: u64,
@@ -945,6 +957,7 @@ impl Hub {
             txs: HashMap::new(),
             watched_keys: HashMap::new(),
             blocked: Vec::new(),
+            blocked_pops: Vec::new(),
             protos: HashMap::new(),
             maxmemory: std::env::var("LOCUS_MAXMEMORY")
                 .ok()
@@ -2393,7 +2406,10 @@ impl Hub {
         ));
         s.push_str("# Clients\r\n");
         s.push_str(&format!("connected_clients:{}\r\n", self.clients.len()));
-        s.push_str(&format!("blocked_clients:{}\r\n", self.blocked.len()));
+        s.push_str(&format!(
+            "blocked_clients:{}\r\n",
+            self.blocked.len() + self.blocked_pops.len()
+        ));
         s.push_str("# Memory\r\n");
         s.push_str(&format!("used_memory:{used}\r\n"));
         s.push_str(&format!(
@@ -2633,6 +2649,10 @@ impl Hub {
                         self.replicate(resp::command(&[b"EXEC".to_vec()]));
                     }
                     self.send(id, resp::array(&replies));
+                    if has_write {
+                        self.serve_blocked();
+                        self.serve_blocked_pops();
+                    }
                 }
             }
             b"WATCH" => {
@@ -2942,13 +2962,21 @@ impl Hub {
                 self.persist_and_exit(!nosave);
             }
 
+            b"BLPOP" | b"BRPOP" | b"BLMOVE" | b"BZPOPMIN" | b"BZPOPMAX" if id != MASTER_ID => {
+                self.handle_blocking_pop(id, tokens);
+            }
+
             // --- everything else (data commands) ---
             _ => {
                 let is_xadd = cmd.as_slice() == b"XADD";
+                let unblocks = !self.blocked_pops.is_empty() && aof::is_write(&cmd);
                 let reply = self.exec_one(id, tokens);
                 self.send(id, reply);
                 if is_xadd {
                     self.serve_blocked();
+                }
+                if unblocks {
+                    self.serve_blocked_pops();
                 }
             }
         }
@@ -2976,6 +3004,75 @@ impl Hub {
                 });
             }
             None => self.send(id, streams::nil()),
+        }
+    }
+
+    /// BLPOP/BRPOP/BLMOVE/BZPOPMIN/BZPOPMAX: try once through the normal write
+    /// path (its READONLY/MOVED/OOM/WRONGTYPE gates all short-circuit as
+    /// replies); an empty reply parks the client until a write readies a key
+    /// or the deadline passes.
+    fn handle_blocking_pop(&mut self, id: u64, tokens: Vec<Vec<u8>>) {
+        let req = match commands::parse_bpop(&tokens) {
+            Ok(r) => r,
+            Err(e) => return self.send(id, e),
+        };
+        let reply = self.exec_one(id, tokens.clone());
+        if reply != commands::bpop_nil_reply(&req) {
+            self.send(id, reply);
+            // A landed BLMOVE is itself a push — it may ready another waiter.
+            self.serve_blocked_pops();
+            return;
+        }
+        let deadline = req.timeout_ms.map(|ms| now_ms() + ms);
+        self.blocked_pops.push(BlockedPop {
+            id,
+            tokens,
+            req,
+            deadline,
+        });
+    }
+
+    /// After a write, hand newly-ready data to parked pops in FIFO (longest
+    /// waiting first) order. Loops to a fixpoint because a served BLMOVE can
+    /// itself ready a waiter earlier in the queue.
+    fn serve_blocked_pops(&mut self) {
+        while !self.blocked_pops.is_empty() {
+            let mut served = false;
+            let mut i = 0;
+            while i < self.blocked_pops.len() {
+                if !commands::bpop_ready(&mut self.db, &self.blocked_pops[i].req) {
+                    i += 1;
+                    continue;
+                }
+                let bp = self.blocked_pops.remove(i);
+                let reply = self.exec_one(bp.id, bp.tokens.clone());
+                if reply == commands::bpop_nil_reply(&bp.req) {
+                    // The peek raced something (defensive; hub is single-threaded).
+                    self.blocked_pops.insert(i, bp);
+                    i += 1;
+                } else {
+                    self.send(bp.id, reply);
+                    served = true;
+                }
+            }
+            if !served {
+                break;
+            }
+        }
+    }
+
+    /// Time out parked pops whose deadline has passed (nil, Redis-shaped).
+    fn expire_blocked_pops(&mut self) {
+        let now = now_ms();
+        let mut i = 0;
+        while i < self.blocked_pops.len() {
+            match self.blocked_pops[i].deadline {
+                Some(d) if d <= now => {
+                    let bp = self.blocked_pops.remove(i);
+                    self.send(bp.id, commands::bpop_nil_reply(&bp.req));
+                }
+                _ => i += 1,
+            }
         }
     }
 
@@ -4345,7 +4442,9 @@ fn write_modified(cmd: &[u8], reply: &[u8]) -> bool {
         // LINSERT: 0 (no key) or -1 (pivot not found) means nothing was inserted.
         b"LINSERT" => !(zero || reply.starts_with(b":-1\r\n")),
         // Conditional write / pop-and-move / delete: nil means it didn't happen.
-        b"SET" | b"GETDEL" | b"RPOPLPUSH" | b"LMOVE" | b"INCRCAP" => !nil,
+        b"SET" | b"GETDEL" | b"RPOPLPUSH" | b"LMOVE" | b"INCRCAP" | b"BLMOVE" => !nil,
+        // Blocking pops answer a null ARRAY when nothing was there.
+        b"BLPOP" | b"BRPOP" | b"BZPOPMIN" | b"BZPOPMAX" => reply != b"*-1\r\n",
         _ => true,
     }
 }
@@ -4442,6 +4541,7 @@ fn run_hub(rx: mpsc::Receiver<Msg>, tx: mpsc::SyncSender<Msg>) {
                     hub.unwatch_keys(&t.watched, id);
                 }
                 hub.blocked.retain(|r| r.id != id);
+                hub.blocked_pops.retain(|r| r.id != id);
                 hub.replica_acks.remove(&id);
                 hub.waiting.retain(|w| w.id != id);
                 hub.protos.remove(&id);
@@ -4584,6 +4684,7 @@ fn run_hub(rx: mpsc::Receiver<Msg>, tx: mpsc::SyncSender<Msg>) {
             }
             hub.dirty_expired_watchers();
             hub.expire_blocked();
+            hub.expire_blocked_pops();
             hub.check_waits();
         }
     }
