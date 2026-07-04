@@ -6,6 +6,22 @@ All notable changes to Locus are documented here. The format is based on
 
 ## [Unreleased]
 
+## [0.6.1] — 2026-07-04
+
+Maintenance release — the org move to **elementaio** plus docs/test polish. No behavior or
+wire-protocol changes; the binary is functionally identical to 0.6.0.
+
+### Changed
+- **Migrated to the `elementaio` organization**: all repo links, CI/license badges, and the
+  Docker image path now point at `github.com/elementaio/locus` and `ghcr.io/elementaio/locus`
+  (also published to Docker Hub as `elementaio/locus`).
+- **README**: disk tier and work queues added to the feature list, a use-case "recipes" section,
+  and refreshed command/line counts.
+
+### Tests
+- Made the slow-pub/sub-consumer disconnect test kernel-buffer-proof (it no longer depends on
+  socket send-buffer sizing, so it's deterministic across platforms/CI).
+
 ## [0.6.0] — 2026-07-03
 
 Broadened general-purpose Redis surface — queues + uniques:
