@@ -4,23 +4,15 @@ All notable changes to Locus are documented here. The format is based on
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and the project follows
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [Unreleased]
-
-### Fixed
-
-- **`AUTH`, `HELLO`, `RESET` and `QUIT` are no longer gated by a user's ACL command classes.** All
-  four class as `@connection`, so a least-privilege user — say `+@read ~app:` — was refused every one
-  of them: it could not re-authenticate, and because most modern clients open a connection with
-  `HELLO`, it could not complete a handshake at all. Redis marks exactly these four `no-auth`; Locus
-  now does the same. Only the command-class gate is lifted — key scope, channel scope, and the
-  fail-closed check for a deleted or disabled identity are unchanged, and the rest of `@connection`
-  (`PING`, `ECHO`, `CLIENT`, `COMMAND`, `SELECT`) stays gated as before.
-
 ## [0.7.0] — 2026-08-27
 
-Safety and the crash boundary. Four defects, every one reproduced against a running server: one that
-could take the whole node down, and three in the access-control boundary. **Upgrading is recommended
-for anyone running named ACL users.**
+Safety and performance recovery. Two halves. **Safety:** five defects, every one reproduced against a
+running server — one that could take the whole node down, three in the access-control boundary, and an
+unauthenticated inter-sentinel control plane that let one TCP line repoint a cluster's replication.
+**Performance:** the two defects that accounted for every large gap against Redis — building a
+collection was O(n²), and every sorted-set range read cloned the entire set. Collection writes are
+28–99× faster and a zset top-10 is 446× faster, both now within a small multiple of Redis.
+**Upgrading is recommended for anyone running named ACL users or a sentinel.**
 
 ### Security
 
@@ -142,6 +134,28 @@ for anyone running named ACL users.**
 
 ### Performance
 
+- **Sorted-set range reads no longer clone the whole set.** `ZRANGE`, `ZRANGEBYSCORE` and the pop and
+  remove variants all went through one helper that materialised *every* member — cloning the bytes of
+  the entire sorted set — and then took the handful of elements the caller had asked for. Returning
+  ten members from a 200k-member zset therefore cost ~34 ms, and because one thread owns the keyspace
+  that is a **global** stall: the whole server was capped at ~26 leaderboard queries per second. The
+  ordered index that makes this O(log n + m) was already built and maintained on every write; the read
+  path simply was not using it. It does now, and the pop paths walk only the elements they remove.
+
+  | Operation | Before | After | Speed-up | Gap to Redis |
+  |---|---:|---:|---:|---:|
+  | `ZRANGE key 0 9` on a 200k zset | 25.9 ops/s · 38.7 ms | **11,558 ops/s · 0.087 ms** | **446×** | 565× → **1.6×** |
+  | `ZRANGEBYSCORE` on a 200k zset | 26.9 ops/s · 37.2 ms | **11,116 ops/s · 0.090 ms** | **413×** | 676× → **1.7×** |
+
+  Replies are byte-for-byte what the old path produced — verified by replaying an 11,658-command
+  corpus (every index pair across negative, out-of-range and inverted bounds; `REV`; `WITHSCORES`;
+  exclusive and infinite score bounds; `LIMIT`; score ties; empty and single-member sets) against both
+  binaries and diffing the raw RESP bytes.
+
+  `ZRANK` is unchanged and still O(rank): `std` has no order-statistic tree, and adding the rank
+  bookkeeping to `insert`/`remove` would put the map-and-index-in-lock-step invariant at risk for a
+  gain on a cold path.
+
 - **Building a collection is no longer O(n²).** The hub recomputed a key's whole memory-size estimate
   after *every* write, and that estimate walks every element of the value — so each O(1) write into a
   collection was really O(n), and filling one was O(n²). It ran whether or not `maxmemory` was set, so
@@ -165,8 +179,17 @@ for anyone running named ACL users.**
   **Nothing observable was traded for it.** `INFO` settles every pending estimate before reporting, so
   `used_memory` is never stale; and the `maxmemory` gate carries a sound upper bound on the growth it
   has not folded in yet, so the cap holds exactly as before — it settles the estimate before deciding
-  whenever `used_memory + bound` would exceed the cap. Sorted-set *range reads* are a separate defect
-  and are unchanged here.
+  whenever `used_memory + bound` would exceed the cap.
+
+### Fixed
+
+- **`AUTH`, `HELLO`, `RESET` and `QUIT` are no longer gated by a user's ACL command classes.** All
+  four class as `@connection`, so a least-privilege user — say `+@read ~app:` — was refused every one
+  of them: it could not re-authenticate, and because most modern clients open a connection with
+  `HELLO`, it could not complete a handshake at all. Redis marks exactly these four `no-auth`; Locus
+  now does the same. Only the command-class gate is lifted — key scope, channel scope, and the
+  fail-closed check for a deleted or disabled identity are unchanged, and the rest of `@connection`
+  (`PING`, `ECHO`, `CLIENT`, `COMMAND`, `SELECT`) stays gated as before.
 
 ### Tests
 
@@ -183,6 +206,13 @@ for anyone running named ACL users.**
   *ratios* — a write into a 200k-element collection must stay within 5x of the same write into an
   empty one — so they catch per-write work that grows with the data instead of flaking on a loaded
   machine. `LOCUS_PERF_N` / `LOCUS_PERF_LIST` shrink the sizes for a quick run.
+- Coverage for the zset range readers: `zset_range_readers_match_a_materialised_reference`
+  (`src/db.rs`) checks every index pair, score bound and pop count against a brute-force reference
+  over distinct-score, tied-score, infinite-score, single-member and empty sets;
+  `zset_range_reads_keep_their_exact_replies` (`tests/integration.rs`) pins the command-level replies,
+  and passes on 0.6.1 too — which is what makes it a semantics guard rather than a restatement of the
+  new code. The harness gained a matching ratio floor (a top-10 from a big zset within 5× of a top-10
+  from a small one) that measured 24.4× before the fix and 0.84× after.
 - Regression coverage for the deferred memory accounting: `maxmemory_bounds_a_collection_growing_in_place`
   and `used_memory_reports_in_place_growth_without_waiting_for_a_sweep` in `tests/integration.rs`, plus
   `deferred_size_accounting_converges_to_the_eager_total`,

@@ -535,12 +535,18 @@ fn run_suite(port: u16, flavor: Flavor) -> Vec<Metric> {
             large,
         ));
 
-        // The big zset is alive right now — read ranges out of it before the
-        // flush. (Fixing those reads is session 3; this only measures them.)
+        // Both zsets are alive right now — read the same range out of each
+        // before the flush. The pair is the ratio the zset floor asserts on:
+        // a top-10 costs what a top-10 costs, whatever the set is sized at.
         if verb == b"ZADD" {
             let budget = Duration::from_secs(3);
             let (ops, d) = c.probe(&[b"ZRANGE", b"zset:big", b"0", b"9"], 5_000, budget);
             out.push(latency("ZRANGE key 0 9", ops_per_sec(ops, d)));
+            let (ops, d) = c.probe(&[b"ZRANGE", b"zset:small", b"0", b"9"], 5_000, budget);
+            out.push(latency(
+                &format!("ZRANGE key 0 9 on a {PROBE}-member zset"),
+                ops_per_sec(ops, d),
+            ));
             let args: &[&[u8]] = &[b"ZRANGEBYSCORE", b"zset:big", b"1000", b"1010"];
             let (ops, d) = c.probe(args, 5_000, budget);
             out.push(latency("ZRANGEBYSCORE 1000 1010", ops_per_sec(ops, d)));
@@ -703,6 +709,19 @@ fn perf_table() {
             ));
         }
     }
+    // The zset read floor, same ratio style: a top-10 costs what a top-10 costs.
+    // Before session 3 the read cloned the whole set, so this measured 20x on a
+    // 200k set against a 10k one; on the ordered index it sits near 1x.
+    let small = find(&l, &format!("ZRANGE key 0 9 on a {PROBE}-member zset")).ops;
+    let big = find(&l, "ZRANGE key 0 9").ops;
+    let ratio = small / big.max(f64::MIN_POSITIVE);
+    if ratio > 5.0 {
+        failures.push(format!(
+            "ZRANGE key 0 9 on a big zset is {ratio:.1}x slower than on a small one \
+             ({big:.0} vs {small:.0} ops/s) — the read is walking the whole set again"
+        ));
+    }
+
     // A catastrophic-regression tripwire, an order of magnitude below what this
     // model does, so it fires on a broken build and not on a busy machine.
     let set = find(&l, "SET / ").ops;

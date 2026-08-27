@@ -384,6 +384,8 @@ Release build, both servers on one 8-core machine, `redis-server 8.8.0` for comp
 | `ZADD` → 200k members of one sorted set | 91k ops/s | 428k ops/s | 4.7× |
 | `HSET` → 200k fields of one hash | 139k ops/s | 526k ops/s | 3.8× |
 | `RPUSH` → a 500k-element list | 157k ops/s | 815k ops/s | 5.2× |
+| `ZRANGE key 0 9` on a 200k sorted set | 11.6k ops/s · 0.087 ms | 18.7k ops/s | 1.6× |
+| `ZRANGEBYSCORE` on a 200k sorted set | 11.1k ops/s · 0.090 ms | 18.9k ops/s | 1.7× |
 | `GEOSET` ingest, 200k points | 102k ops/s | 219k ops/s | 2.1× |
 | `GEOSEARCH` 1 km `COUNT 10` | 1.27 ms | 0.23 ms | 5.6× |
 
@@ -392,11 +394,15 @@ per-write work does not grow with the collection, which is what the harness's fl
 down. Run-to-run spread on a desktop is ±10–25%; treat the ratios, not the absolute figures, as the
 signal.
 
-**The one outstanding gap:** sorted-set *range reads* (`ZRANGE`, `ZRANGEBYSCORE`) currently materialize
-the entire sorted set before slicing it, so reading the top 10 of a 200k-member zset costs tens of
-milliseconds — and on a single-hub design that is a stall for every client, not just the caller. The
-ordered index that makes it O(log n + m) is already built and maintained; wiring the read path to it is
-the next item on the performance track. Small sorted sets are unaffected.
+Sorted-set range reads were the last large gap and are now closed. Until 0.7.0 `ZRANGE` and
+`ZRANGEBYSCORE` materialized the entire sorted set before slicing it, so returning ten members from a
+200k-member zset cost ~38 ms — and on a single-hub design that is a stall for every client, not just
+the caller, which capped the whole server at about 26 such queries per second. The read path now walks
+the ordered index that was already being maintained on every write: the same query costs 0.087 ms, a
+446× improvement that brings it to 1.6× Redis. Replies are byte-for-byte unchanged, checked by
+replaying an 11,658-command corpus against both the old and new binaries and diffing the raw protocol
+output. `ZRANK` is the remaining O(n) read; it is O(rank) rather than O(log n), which matters only for
+high-ranked members of a large set.
 
 Throughput is otherwise bounded by the single-hub design (one channel hop per command) — the deliberate
 price of lock-free, serially-consistent execution, and the very property (one ordered point) that makes

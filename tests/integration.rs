@@ -4257,3 +4257,101 @@ mod tls_e2e {
         let _ = child.wait();
     }
 }
+
+/// Phase 2.2: the zset range reads walk the ordered index instead of cloning the
+/// whole set. These are the command-level replies the old materialise-then-slice
+/// path produced — captured from it verbatim, so a semantic drift shows up here
+/// rather than in a user's leaderboard.
+#[test]
+fn zset_range_reads_keep_their_exact_replies() {
+    let s = Server::start();
+    let mut c = s.connect();
+    c.cmd(&[
+        "ZADD", "z", "0", "a", "10", "b", "20", "c", "30", "d", "40", "e",
+    ]);
+
+    // Whole range, both directions, with and without scores.
+    assert_eq!(c.cmd(&["ZRANGE", "z", "0", "-1"]), "[a, b, c, d, e]");
+    assert_eq!(c.cmd(&["ZRANGE", "z", "0", "-1", "REV"]), "[e, d, c, b, a]");
+    assert_eq!(
+        c.cmd(&["ZRANGE", "z", "0", "1", "WITHSCORES"]),
+        "[a, 0, b, 10]"
+    );
+    assert_eq!(
+        c.cmd(&["ZRANGE", "z", "0", "1", "REV", "WITHSCORES"]),
+        "[e, 40, d, 30]"
+    );
+
+    // Negative indices, including ones that run off the front.
+    assert_eq!(c.cmd(&["ZRANGE", "z", "-3", "-1"]), "[c, d, e]");
+    assert_eq!(c.cmd(&["ZRANGE", "z", "-100", "-4"]), "[a, b]");
+    assert_eq!(c.cmd(&["ZRANGE", "z", "-100", "100"]), "[a, b, c, d, e]");
+    assert_eq!(c.cmd(&["ZRANGE", "z", "-3", "-1", "REV"]), "[c, b, a]");
+
+    // Empty results: start past the end, start > stop, and a reversed pair.
+    assert_eq!(c.cmd(&["ZRANGE", "z", "5", "10"]), "[]");
+    assert_eq!(c.cmd(&["ZRANGE", "z", "3", "1"]), "[]");
+    assert_eq!(c.cmd(&["ZRANGE", "z", "-1", "0"]), "[]");
+    assert_eq!(c.cmd(&["ZRANGE", "missing", "0", "-1"]), "[]");
+
+    // A single-member set — the degenerate case the index arithmetic can trip on.
+    c.cmd(&["ZADD", "one", "5", "only"]);
+    assert_eq!(c.cmd(&["ZRANGE", "one", "0", "-1"]), "[only]");
+    assert_eq!(c.cmd(&["ZRANGE", "one", "0", "-1", "REV"]), "[only]");
+    assert_eq!(c.cmd(&["ZRANGE", "one", "-1", "-1"]), "[only]");
+    assert_eq!(c.cmd(&["ZRANGE", "one", "1", "-1"]), "[]");
+
+    // Score bounds: inclusive, exclusive, and the infinities.
+    assert_eq!(
+        c.cmd(&["ZRANGEBYSCORE", "z", "-inf", "+inf"]),
+        "[a, b, c, d, e]"
+    );
+    assert_eq!(c.cmd(&["ZRANGEBYSCORE", "z", "10", "30"]), "[b, c, d]");
+    assert_eq!(c.cmd(&["ZRANGEBYSCORE", "z", "(10", "30"]), "[c, d]");
+    assert_eq!(c.cmd(&["ZRANGEBYSCORE", "z", "10", "(30"]), "[b, c]");
+    assert_eq!(c.cmd(&["ZRANGEBYSCORE", "z", "(10", "(30"]), "[c]");
+    assert_eq!(c.cmd(&["ZRANGEBYSCORE", "z", "(0", "(10"]), "[]");
+    assert_eq!(c.cmd(&["ZRANGEBYSCORE", "z", "30", "10"]), "[]");
+    assert_eq!(
+        c.cmd(&["ZRANGEBYSCORE", "z", "10", "20", "WITHSCORES"]),
+        "[b, 10, c, 20]"
+    );
+    assert_eq!(c.cmd(&["ZREVRANGEBYSCORE", "z", "30", "10"]), "[d, c, b]");
+
+    // LIMIT, including the negative count that means "to the end".
+    assert_eq!(
+        c.cmd(&["ZRANGEBYSCORE", "z", "-inf", "+inf", "LIMIT", "1", "2"]),
+        "[b, c]"
+    );
+    assert_eq!(
+        c.cmd(&["ZRANGEBYSCORE", "z", "-inf", "+inf", "LIMIT", "2", "-1"]),
+        "[c, d, e]"
+    );
+    assert_eq!(
+        c.cmd(&["ZRANGEBYSCORE", "z", "-inf", "+inf", "LIMIT", "10", "5"]),
+        "[]"
+    );
+
+    // Score ties: member bytes break them, ascending, and the tie order reverses.
+    c.cmd(&["ZADD", "tie", "1", "b", "1", "a", "1", "c"]);
+    assert_eq!(c.cmd(&["ZRANGE", "tie", "0", "-1"]), "[a, b, c]");
+    assert_eq!(c.cmd(&["ZRANGE", "tie", "0", "-1", "REV"]), "[c, b, a]");
+
+    // The pop and remove paths take only what they touch, and leave the rest.
+    assert_eq!(c.cmd(&["ZPOPMIN", "z", "2"]), "[a, 0, b, 10]");
+    assert_eq!(c.cmd(&["ZPOPMAX", "z"]), "[e, 40]");
+    assert_eq!(c.cmd(&["ZRANGE", "z", "0", "-1"]), "[c, d]");
+    assert_eq!(c.cmd(&["ZPOPMIN", "z", "0"]), "[]");
+    assert_eq!(c.cmd(&["ZPOPMIN", "missing", "3"]), "[]");
+
+    c.cmd(&[
+        "ZADD", "r", "0", "a", "1", "b", "2", "c", "3", "d", "4", "e",
+    ]);
+    assert_eq!(c.cmd(&["ZREMRANGEBYRANK", "r", "1", "2"]), "2");
+    assert_eq!(c.cmd(&["ZRANGE", "r", "0", "-1"]), "[a, d, e]");
+    assert_eq!(c.cmd(&["ZREMRANGEBYRANK", "r", "-1", "-1"]), "1");
+    assert_eq!(c.cmd(&["ZRANGE", "r", "0", "-1"]), "[a, d]");
+    assert_eq!(c.cmd(&["ZREMRANGEBYRANK", "r", "5", "9"]), "0");
+    assert_eq!(c.cmd(&["ZREMRANGEBYRANK", "r", "3", "1"]), "0");
+    assert_eq!(c.cmd(&["ZRANGE", "r", "0", "-1"]), "[a, d]");
+}

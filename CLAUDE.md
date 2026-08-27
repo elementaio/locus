@@ -106,21 +106,26 @@ or issue.
 | `plans/IMPROVEMENTS-AUDIT-2026-07.md` | The July multi-agent audit — 84 findings, mostly still open |
 | `docs/` | The published documentation (README's targets) |
 
-## Current state — updated 2026-08-27 after session 2
+## Current state — updated 2026-08-27 after session 3
 
 v0.7.0, ~18,000 lines of Rust (`std`-only except `src/tls.rs`, which is behind the optional feature),
-108 unit + 106 integration tests green. Phases 0 and 1 of the plan are done: the hub now has a panic
+110 unit + 111 integration tests green. Phases 0 and 1 of the plan are done: the hub now has a panic
 boundary, and the three live-verified ACL defects are closed. Session 1b then cleared the debt those
 left behind — the port flake, the ACL handshake gate, the release tags, and the publication gate.
+Session 2b pulled the sentinel peer-plane authentication forward out of phase 6 and corrected every
+document that claimed partition-safety.
 
-Phase 2 is half done. Session 2 landed the perf harness (`tests/perf.rs`) and item 2.1: the memory-size
+**Phase 2 is done.** Session 2 landed the perf harness (`tests/perf.rs`) and item 2.1: the memory-size
 estimate is now refreshed lazily instead of after every write, which took large-collection writes from
 60–268× Redis to **3.4–5.2×** (28–99× faster). Writing into a 200k-element collection now costs the
-same as writing a fresh key.
+same as writing a fresh key. Session 3 then landed item 2.2: the zset range reads walk the ordered
+index in place instead of cloning the whole set, taking `ZRANGE key 0 9` on a 200k-member zset from
+38.7 ms to **0.087 ms** (446×, 565× Redis → **1.6×**). Replies were proved byte-identical against the
+pre-fix binary over an 11,658-command corpus.
 
-Still open, and the reason the plan continues: **zset range reads** are unchanged — `ZRANGE key 0 9`
-on a 200k-member zset still clones the whole sorted set, ~33 ms and ~900× Redis, and on a single hub
-that is a global stall. That is item 2.2, session 3. See `plans/EXECUTION-PLAN-2026-08.md`.
+`ZRANK` remains O(rank) — deliberately. `std` has no order-statistic tree, and the bookkeeping needed
+to make it O(log n) would put the map-and-index-in-lock-step invariant at risk for a gain on a cold
+path. Next is phase 3 (durability holes); see `plans/EXECUTION-PLAN-2026-08.md`.
 
 **The `node exited early` flake is fixed** (session 1b). `free_port()` no longer bind-races: it hands
 out ports from a fixed window below every OS ephemeral range, walked by a process-wide counter and

@@ -2683,18 +2683,15 @@ fn bpop_now(db: &mut Db, tokens: &[Vec<u8>]) -> Vec<u8> {
             for key in &req.keys {
                 match db.get_mut(key) {
                     Some(Value::ZSet(z)) if !z.is_empty() => {
-                        let mut sorted = sorted_members(z);
-                        if !*min {
-                            sorted.reverse();
+                        if let Some((m, s)) = z.first_by_rank(1, !*min).into_iter().next() {
+                            z.remove(&m);
+                            db.remove_if_empty(key);
+                            return array(&[
+                                bulk_string(key),
+                                bulk_string(&m),
+                                bulk_string(&fmt_score(s)),
+                            ]);
                         }
-                        let (m, s) = sorted.into_iter().next().unwrap();
-                        z.remove(&m);
-                        db.remove_if_empty(key);
-                        return array(&[
-                            bulk_string(key),
-                            bulk_string(&m),
-                            bulk_string(&fmt_score(s)),
-                        ]);
                     }
                     Some(Value::ZSet(_)) | None => {}
                     Some(_) => return wrongtype(),
@@ -2815,11 +2812,7 @@ fn zmpop_cmd(db: &mut Db, tokens: &[Vec<u8>]) -> Vec<u8> {
     for key in keys {
         let popped: Vec<(Vec<u8>, f64)> = match db.get_mut(key) {
             Some(Value::ZSet(z)) if !z.is_empty() => {
-                let mut sorted = sorted_members(z);
-                if !min {
-                    sorted.reverse();
-                }
-                let take: Vec<(Vec<u8>, f64)> = sorted.into_iter().take(count).collect();
+                let take = z.first_by_rank(count, !min);
                 for (m, _) in &take {
                     z.remove(m);
                 }
@@ -3622,12 +3615,6 @@ fn in_range(s: f64, lo: f64, lo_ex: bool, hi: f64, hi_ex: bool) -> bool {
     above && below
 }
 
-/// Members in (score, then member bytes) ascending order — straight from the
-/// sorted set's ordered index, no per-call sort.
-fn sorted_members(z: &ZSet) -> Vec<(Vec<u8>, f64)> {
-    z.ordered().collect()
-}
-
 fn get_zset<'a>(db: &'a mut Db, key: &[u8]) -> Result<Option<&'a ZSet>, ()> {
     match db.get(key) {
         None => Ok(None),
@@ -3827,24 +3814,12 @@ fn zrank_cmd(db: &mut Db, tokens: &[Vec<u8>], rev: bool) -> Vec<u8> {
 }
 
 fn zrange_index(z: &ZSet, start: i64, stop: i64, withscores: bool, rev: bool) -> Vec<u8> {
-    let mut sorted = sorted_members(z);
-    if rev {
-        sorted.reverse();
-    }
-    let len = sorted.len();
-    let s = norm(start, len).max(0);
-    let mut e = norm(stop, len);
-    if e >= len as i64 {
-        e = len as i64 - 1;
-    }
-    if len == 0 || s > e || s >= len as i64 {
-        return bulk_array(&[]);
-    }
     let mut out: Vec<Vec<u8>> = Vec::new();
-    for (m, sc) in &sorted[s as usize..=e as usize] {
-        out.push(m.clone());
+    let sorted = z.range_by_rank(start, stop, rev);
+    for (m, sc) in sorted {
+        out.push(m);
         if withscores {
-            out.push(fmt_score(*sc));
+            out.push(fmt_score(sc));
         }
     }
     bulk_array(&out)
@@ -3945,10 +3920,7 @@ fn zrangebyscore_cmd(db: &mut Db, tokens: &[Vec<u8>], rev: bool) -> Vec<u8> {
         Ok(None) => return bulk_array(&[]),
         Ok(Some(z)) => z,
     };
-    let mut filtered: Vec<(Vec<u8>, f64)> = sorted_members(z)
-        .into_iter()
-        .filter(|(_, s)| in_range(*s, lo, lo_ex, hi, hi_ex))
-        .collect();
+    let mut filtered = z.range_by_score(lo, lo_ex, hi, hi_ex);
     if rev {
         filtered.reverse();
     }
@@ -4014,11 +3986,7 @@ fn zpop_cmd(db: &mut Db, tokens: &[Vec<u8>], max: bool) -> Vec<u8> {
     match db.get_mut(&tokens[1]) {
         None => return bulk_array(&[]),
         Some(Value::ZSet(z)) => {
-            let mut sorted = sorted_members(z);
-            if max {
-                sorted.reverse();
-            }
-            for (m, s) in sorted.into_iter().take(count) {
+            for (m, s) in z.first_by_rank(count, max) {
                 z.remove(&m);
                 popped.push((m, s));
             }
@@ -4047,23 +4015,10 @@ fn zremrangebyrank_cmd(db: &mut Db, tokens: &[Vec<u8>]) -> Vec<u8> {
         Some(Value::ZSet(z)) => z,
         Some(_) => return wrongtype(),
     };
-    let sorted = sorted_members(z);
-    let len = sorted.len();
-    let s = norm(start, len).max(0);
-    let mut e = norm(stop, len);
-    if e >= len as i64 {
-        e = len as i64 - 1;
-    }
-    if len == 0 || s > e || s >= len as i64 {
-        return integer(0);
-    }
-    let remove: Vec<Vec<u8>> = sorted[s as usize..=e as usize]
-        .iter()
-        .map(|(m, _)| m.clone())
-        .collect();
-    let n = remove.len();
-    for m in &remove {
-        z.remove(m);
+    let sorted = z.range_by_rank(start, stop, false);
+    let n = sorted.len();
+    for (m, _) in sorted {
+        z.remove(&m);
     }
     db.remove_if_empty(&tokens[1]);
     integer(n as i64)

@@ -45,7 +45,9 @@ See [CHANGEFEED.md](CHANGEFEED.md), [GEO.md](GEO.md), [SKETCHES.md](SKETCHES.md)
 - **HA + TLS:** built-in **sentinel** auto-failover (quorum + inter-sentinel agreement over an authenticated peer plane) — for a **trusted network**, and **not partition-safe** ([what it guarantees](DEPLOYMENT.md#what-failover-guarantees--and-what-it-does-not)); TLS via sidecar or the optional `tls` feature.
 - **Compat/observability:** `SCAN`/`COMMAND`/`CONFIG`/`SLOWLOG`/`INFO` (works with `redis_exporter`), RESP3 typed replies.
 - **Geo depth:** geohash **spatial index** (sub-linear `GEOSEARCH`) + combined `WHERE` attribute filters.
-- **Sorted sets:** ordered index (std `BTreeSet`) for range/rank without re-sorting on read.
+- **Sorted sets:** ordered index (std `BTreeSet`) for range/rank without re-sorting on read — and
+  since 0.7.0 the range reads walk it in place rather than cloning the set, so a top-10 is O(log n + m)
+  whatever the set is sized at.
 - **Spatial clustering (the flagship):** hash-slot routing (`MOVED`/`CROSSSLOT`/`CLUSTERDOWN`), **cell-in-key sharding** so a region co-locates and `GEOSEARCH` is a **bounded** cross-shard scatter, **live zero-loss resharding** (`MIGRATESLOT`), **per-shard failover** (the sentinel reassigns slots), and a **global HLC-ordered cross-shard changefeed** (`CLUSTER CDCMERGE`).
 
 ## Deferred (known, intentional)

@@ -80,14 +80,78 @@ impl ZSet {
     pub fn iter(&self) -> impl Iterator<Item = (&Vec<u8>, &f64)> {
         self.map.iter()
     }
-    /// (member, score) pairs in ascending (score, member) order — no per-call sort.
-    pub fn ordered(&self) -> impl Iterator<Item = (Vec<u8>, f64)> + '_ {
-        self.sorted.iter().map(|(s, m)| (m.clone(), s.0))
-    }
     /// 0-based ascending rank of a member, in O(rank) via the ordered index.
     pub fn rank(&self, member: &[u8]) -> Option<usize> {
         let score = *self.map.get(member)?;
         Some(self.sorted.range(..(Score(score), member.to_vec())).count())
+    }
+    /// Range by rank without materializing everything first. Collects only the
+    /// requested range. For rev=false, iterates ascending; for rev=true, descending.
+    pub fn range_by_rank(&self, start: i64, stop: i64, rev: bool) -> Vec<(Vec<u8>, f64)> {
+        let len = self.sorted.len() as i64;
+        let norm_start = if start < 0 {
+            (len + start).max(0)
+        } else {
+            start.min(len)
+        };
+        let mut norm_stop = if stop < 0 {
+            (len + stop).max(-1)
+        } else {
+            stop.min(len - 1)
+        };
+        if norm_stop >= len {
+            norm_stop = len - 1;
+        }
+
+        if norm_start > norm_stop || norm_start >= len {
+            return vec![];
+        }
+
+        let count = (norm_stop - norm_start + 1) as usize;
+        if rev {
+            self.sorted
+                .iter()
+                .rev()
+                .skip(norm_start as usize)
+                .take(count)
+                .map(|(s, m)| (m.clone(), s.0))
+                .collect()
+        } else {
+            self.sorted
+                .iter()
+                .skip(norm_start as usize)
+                .take(count)
+                .map(|(s, m)| (m.clone(), s.0))
+                .collect()
+        }
+    }
+    /// The first `n` members from whichever end the pop paths want. Walks only
+    /// `n` entries of the ordered index, never the whole set.
+    pub fn first_by_rank(&self, n: usize, from_high: bool) -> Vec<(Vec<u8>, f64)> {
+        let take = |it: &mut dyn Iterator<Item = &(Score, Vec<u8>)>| -> Vec<(Vec<u8>, f64)> {
+            it.take(n).map(|(s, m)| (m.clone(), s.0)).collect()
+        };
+        if from_high {
+            take(&mut self.sorted.iter().rev())
+        } else {
+            take(&mut self.sorted.iter())
+        }
+    }
+    /// Range by score without materializing everything first. Collects only
+    /// members whose score falls within (lo, hi). Direction is always ascending by score.
+    pub fn range_by_score(
+        &self,
+        lo: f64,
+        lo_ex: bool,
+        hi: f64,
+        hi_ex: bool,
+    ) -> Vec<(Vec<u8>, f64)> {
+        self.sorted
+            .iter()
+            .skip_while(|(s, _)| if lo_ex { s.0 <= lo } else { s.0 < lo })
+            .take_while(|(s, _)| if hi_ex { s.0 < hi } else { s.0 <= hi })
+            .map(|(s, m)| (m.clone(), s.0))
+            .collect()
     }
 }
 
@@ -1168,5 +1232,129 @@ mod tests {
         db.active_expire();
         assert_eq!(db.mem_used(), 0);
         assert_eq!(db.take_expired(), vec![k]);
+    }
+
+    /// Phase 2.2: the range readers walk the ordered index instead of cloning the
+    /// whole set. Their answers must match the materialise-then-slice path they
+    /// replaced, so this pins them against a brute-force reference over every
+    /// index and bound combination that used to be forgiving.
+    #[test]
+    fn zset_range_readers_match_a_materialised_reference() {
+        let build = |pairs: &[(&str, f64)]| -> ZSet {
+            let mut z = ZSet::new();
+            for (m, s) in pairs {
+                z.insert(m.as_bytes().to_vec(), *s);
+            }
+            z
+        };
+        // Distinct scores, score ties (member bytes break them), infinities, and
+        // the degenerate single-member and empty sets.
+        let sets = [
+            build(&[
+                ("a", 0.0),
+                ("b", 10.0),
+                ("c", 20.0),
+                ("d", 30.0),
+                ("e", 40.0),
+            ]),
+            build(&[("x", 1.0), ("y", 1.0), ("z", 1.0)]),
+            build(&[
+                ("lo", f64::NEG_INFINITY),
+                ("mid", 0.0),
+                ("hi", f64::INFINITY),
+            ]),
+            build(&[("only", 5.0)]),
+            ZSet::new(),
+        ];
+
+        for z in &sets {
+            // The reference: what the old path produced — everything, in order.
+            let all: Vec<(Vec<u8>, f64)> = z.sorted.iter().map(|(s, m)| (m.clone(), s.0)).collect();
+            let len = all.len();
+
+            for start in -8i64..=8 {
+                for stop in -8i64..=8 {
+                    for rev in [false, true] {
+                        // Reference: reverse first (as the old code did), then
+                        // normalise indices against the same length, then slice.
+                        let mut base = all.clone();
+                        if rev {
+                            base.reverse();
+                        }
+                        let s = if start < 0 { start + len as i64 } else { start }.max(0);
+                        let mut e = if stop < 0 { stop + len as i64 } else { stop };
+                        if e >= len as i64 {
+                            e = len as i64 - 1;
+                        }
+                        let want: Vec<(Vec<u8>, f64)> = if len == 0 || s > e || s >= len as i64 {
+                            vec![]
+                        } else {
+                            base[s as usize..=e as usize].to_vec()
+                        };
+                        assert_eq!(
+                            z.range_by_rank(start, stop, rev),
+                            want,
+                            "range_by_rank({start}, {stop}, rev={rev}) on a {len}-member set"
+                        );
+                    }
+                }
+            }
+
+            for lo in [
+                f64::NEG_INFINITY,
+                -1.0,
+                0.0,
+                1.0,
+                10.0,
+                20.0,
+                40.0,
+                f64::INFINITY,
+            ] {
+                for hi in [
+                    f64::NEG_INFINITY,
+                    -1.0,
+                    0.0,
+                    1.0,
+                    10.0,
+                    20.0,
+                    40.0,
+                    f64::INFINITY,
+                ] {
+                    for lo_ex in [false, true] {
+                        for hi_ex in [false, true] {
+                            let want: Vec<(Vec<u8>, f64)> = all
+                                .iter()
+                                .filter(|(_, s)| {
+                                    let above = if lo_ex { *s > lo } else { *s >= lo };
+                                    let below = if hi_ex { *s < hi } else { *s <= hi };
+                                    above && below
+                                })
+                                .cloned()
+                                .collect();
+                            assert_eq!(
+                                z.range_by_score(lo, lo_ex, hi, hi_ex),
+                                want,
+                                "range_by_score({lo}, ex={lo_ex}, {hi}, ex={hi_ex})"
+                            );
+                        }
+                    }
+                }
+            }
+
+            for n in 0..=len + 2 {
+                for from_high in [false, true] {
+                    let mut want = all.clone();
+                    if from_high {
+                        want.reverse();
+                    }
+                    want.truncate(n);
+                    assert_eq!(
+                        z.first_by_rank(n, from_high),
+                        want,
+                        "first_by_rank({n}, from_high={from_high})"
+                    );
+                }
+            }
+        }
     }
 }
