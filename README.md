@@ -63,11 +63,16 @@ $ redis-cli -p 6379 GEOSEARCH fleet FROMLONLAT 55.27 25.2 BYRADIUS 5 km ASC   # 
 **Security & operations** *(safe on a trusted network)*
 
 - **AUTH + ACL:** `requirepass`, **protected mode** (no accidental `0.0.0.0` exposure), and a simple
-  **multi-user ACL** (`ACL SETUSER` with command classes + key prefixes) — least-privilege users.
+  **multi-user ACL** (`ACL SETUSER` with command classes, key prefixes, and **pub/sub channel
+  patterns**) — least-privilege users, with real revocation: `ACL DELUSER` / `SETUSER … off` closes
+  that identity's live sessions.
 - **TLS:** a sidecar (zero-dep default), or **in-process** via the optional `tls` build feature
   (rustls) — the default build pulls in nothing. See the TLS note below.
 - **Observability:** a full `INFO` (works with `redis_exporter`), `SLOWLOG`, `CONFIG GET/SET`,
   structured leveled logging, graceful `SIGTERM` shutdown (drain → fsync → final save).
+- **Crash containment:** every command runs inside a panic boundary, so a bug in one command costs
+  that one command (`-ERR internal error`, counted in `INFO` as `panics_recovered`) instead of the
+  whole server.
 - **Resource safety:** per-connection read timeout, `TCP_NODELAY`, a max-connections cap.
 
 **Durability**
@@ -226,7 +231,7 @@ LOCUS_REQUIREPASS=s3cret cargo run --release
 redis-cli -p 6379 -a s3cret ping
 
 # a least-privilege, read-only user scoped to app:* keys
-redis-cli -p 6379 -a s3cret ACL SETUSER reader on '>pw' +@read '~app:'
+redis-cli -p 6379 -a s3cret ACL SETUSER reader on '>pw' +@read '~app:' '&app:*'
 
 # master + replica, then WAIT for the write to reach 1 replica
 redis-cli -p 6380 replicaof 127.0.0.1 6379

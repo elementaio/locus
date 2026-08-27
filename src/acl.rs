@@ -144,10 +144,17 @@ pub struct User {
     pub passwords: Vec<[u8; 32]>,
     pub classes: u8,
     pub key_prefix: Option<Vec<u8>>, // None => all keys
+    /// Pub/sub channel scope: glob patterns this user may subscribe to and
+    /// publish on. EMPTY means no channels — the secure default, matching
+    /// Redis 7's `resetchannels`. `allchannels` / `&*` stores a single `*`.
+    /// Channels are a scope of their own: `allkeys` does not grant them and
+    /// neither does `+@all`, because a channel name is not a key name.
+    pub channels: Vec<Vec<u8>>,
 }
 
 impl User {
-    /// A fresh, locked-down user: disabled, no password, no commands, no keys.
+    /// A fresh, locked-down user: disabled, no password, no commands, no keys,
+    /// no channels.
     pub fn new() -> User {
         User {
             enabled: false,
@@ -155,6 +162,7 @@ impl User {
             passwords: Vec::new(),
             classes: 0,
             key_prefix: Some(b"\x00locus-no-keys\x00".to_vec()), // matches nothing
+            channels: Vec::new(),                                // matches nothing
         }
     }
 
@@ -184,6 +192,27 @@ impl User {
         self.key_prefix.is_none()
     }
 
+    /// May this user SUBSCRIBE to / PUBLISH on this exact channel?
+    pub fn allows_channel(&self, channel: &[u8]) -> bool {
+        self.channels
+            .iter()
+            .any(|p| crate::pubsub::glob_match(p, channel))
+    }
+
+    /// May this user PSUBSCRIBE with this pattern? Gated on the PATTERN itself,
+    /// which must be one the user was literally granted (Redis's rule).
+    ///
+    /// Glob-testing the requested pattern against a granted one asks the wrong
+    /// question: text matching is not language containment. A user granted `&?`
+    /// — one-character channels — would pass `PSUBSCRIBE *`, because `?` matches
+    /// the one-character *text* `*`, and would then receive every channel on the
+    /// server.
+    pub fn allows_channel_pattern(&self, pattern: &[u8]) -> bool {
+        self.channels
+            .iter()
+            .any(|p| p.as_slice() == pattern || p.as_slice() == b"*")
+    }
+
     /// Apply one `ACL SETUSER` rule. Returns Err on an unrecognized rule.
     pub fn apply(&mut self, rule: &[u8]) -> Result<(), ()> {
         let lower = rule.to_ascii_lowercase();
@@ -200,6 +229,8 @@ impl User {
             }
             b"allkeys" | b"~*" => self.key_prefix = None,
             b"resetkeys" => self.key_prefix = Some(b"\x00locus-no-keys\x00".to_vec()),
+            b"allchannels" | b"&*" => self.channels = vec![b"*".to_vec()],
+            b"resetchannels" => self.channels.clear(),
             b"allcommands" | b"+@all" => self.classes = CLASS_ALL,
             b"nocommands" | b"-@all" => self.classes = 0,
             b"reset" => *self = User::new(),
@@ -216,6 +247,14 @@ impl User {
             _ if rule.starts_with(b"~") => {
                 let p = rule[1..].strip_suffix(b"*").unwrap_or(&rule[1..]);
                 self.key_prefix = Some(p.to_vec());
+            }
+            // `&pattern` adds one channel glob (`allchannels`/`&*` above is the
+            // catch-all form). Additive, like Redis, and deduplicated.
+            _ if rule.starts_with(b"&") => {
+                let pat = rule[1..].to_vec();
+                if !self.channels.contains(&pat) {
+                    self.channels.push(pat);
+                }
             }
             _ => return Err(()),
         }
@@ -238,6 +277,15 @@ impl User {
             None => "~*".to_string(),
             Some(p) => format!("~{}*", String::from_utf8_lossy(p)),
         };
+        let channels = if self.channels.is_empty() {
+            "resetchannels".to_string()
+        } else {
+            self.channels
+                .iter()
+                .map(|p| format!("&{}", String::from_utf8_lossy(p)))
+                .collect::<Vec<_>>()
+                .join(" ")
+        };
         let passinfo = if self.nopass {
             "nopass".to_string()
         } else {
@@ -256,6 +304,8 @@ impl User {
             cmds.into_bytes(),
             b"keys".to_vec(),
             keys.into_bytes(),
+            b"channels".to_vec(),
+            channels.into_bytes(),
         ]
     }
 }
@@ -296,5 +346,41 @@ mod tests {
         u.apply(b"allkeys").unwrap();
         assert!(u.allows_class(CLASS_WRITE) && u.allows_key(b"anything"));
         assert!(u.apply(b"+@bogus").is_err());
+    }
+
+    #[test]
+    fn channel_scope_defaults_closed_and_is_its_own_axis() {
+        let mut u = User::new();
+        // A new user has NO channels, and neither allkeys nor allcommands is a
+        // channel grant — a channel name is not a key name.
+        u.apply(b"allkeys").unwrap();
+        u.apply(b"allcommands").unwrap();
+        assert!(!u.allows_channel(b"anything"));
+        assert!(!u.allows_channel_pattern(b"*"));
+
+        u.apply(b"&news.*").unwrap();
+        assert!(u.allows_channel(b"news.tech") && !u.allows_channel(b"secret"));
+        // PSUBSCRIBE is gated on the pattern literally.
+        assert!(u.allows_channel_pattern(b"news.*") && !u.allows_channel_pattern(b"*"));
+        // Why literally: text-matching the request against the grant is not
+        // language containment. `?` matches the one-character text `*`, so a
+        // glob test would hand a `&?` user every channel on the server.
+        let mut narrow = User::new();
+        narrow.apply(b"&?").unwrap();
+        assert!(crate::pubsub::glob_match(b"?", b"*")); // the trap...
+        assert!(!narrow.allows_channel_pattern(b"*")); // ...which we don't fall into
+        // Additive and deduplicated.
+        u.apply(b"&news.*").unwrap();
+        u.apply(b"&ops.*").unwrap();
+        assert_eq!(u.channels.len(), 2);
+        assert!(u.allows_channel(b"ops.deploy"));
+
+        u.apply(b"resetchannels").unwrap();
+        assert!(!u.allows_channel(b"news.tech"));
+        u.apply(b"allchannels").unwrap();
+        assert!(u.allows_channel(b"anything") && u.allows_channel_pattern(b"whatever"));
+        // `reset` drops back to the closed default.
+        u.apply(b"reset").unwrap();
+        assert!(!u.allows_channel(b"anything"));
     }
 }

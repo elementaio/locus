@@ -30,8 +30,10 @@ Checklist before exposing a port:
 
 - [ ] `LOCUS_REQUIREPASS` set to a high-entropy secret (32+ random chars).
 - [ ] Least-privilege **ACL** users for apps that don't need everything:
-      `ACL SETUSER app on >apppw +@read +@write ~app:` (see [the ACL section of
-      COMMANDS.md](COMMANDS.md)). Keep the unrestricted `default` user for admins only.
+      `ACL SETUSER app on >apppw +@read +@write +@pubsub '~app:' '&app:*'` (see
+      [Access control (ACL)](COMMANDS.md#access-control-acl)). Keep the unrestricted `default` user
+      for admins only — it is the only identity that can read `CONFIG GET requirepass`, and a named
+      user's channel scope must be granted explicitly (`&pattern`), since it starts empty.
 - [ ] Firewall / security group restricts the port to known clients.
 - [ ] TLS in front of the port (next section) if traffic crosses any untrusted link.
 
@@ -190,7 +192,9 @@ connections gracefully and keeps serving (it never crashes on thread exhaustion)
   [`redis_exporter`](https://github.com/oliver006/redis_exporter) — point it at
   Locus (with auth) and you get the standard Redis dashboards. Watch
   `connected_clients`, `used_memory`, `master_link_status` (on replicas),
-  `master_repl_offset`, and `rdb_last_bgsave_status`.
+  `master_repl_offset`, `rdb_last_bgsave_status`, and `panics_recovered` — a non-zero
+  `panics_recovered` means the hub caught and survived a command panic; the log line names the
+  command, and the value it was writing may be partially mutated. Alert on it.
 - **Slow queries:** `SLOWLOG GET` (threshold via `LOCUS_SLOWLOG_US`, default 10ms).
 - **Logs:** structured, leveled to stderr; set `LOCUS_LOGLEVEL=info` (or `debug`).
 - **Health check:** `redis-cli -a $PW PING` → `PONG`.

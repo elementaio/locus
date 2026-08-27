@@ -122,15 +122,39 @@ struct Conn {
 }
 
 impl Conn {
-    /// Send one command (no reply read) — used to park a blocking command.
-    fn send(&mut self, args: &[&str]) {
+    /// Encode one command as a RESP array of bulk strings.
+    fn encode(args: &[&str]) -> Vec<u8> {
         let mut out = format!("*{}\r\n", args.len()).into_bytes();
         for a in args {
             out.extend_from_slice(format!("${}\r\n", a.len()).as_bytes());
             out.extend_from_slice(a.as_bytes());
             out.extend_from_slice(b"\r\n");
         }
+        out
+    }
+
+    /// Send one command (no reply read) — used to park a blocking command.
+    fn send(&mut self, args: &[&str]) {
+        let out = Self::encode(args);
         self.stream.write_all(&out).unwrap();
+    }
+
+    /// Like `cmd`, but tolerates the server having closed the connection:
+    /// returns `None` when the socket is shut down (or errors) instead of
+    /// panicking. Used by the ACL-revocation tests, where a *closed* session
+    /// and a *refused* command are both acceptable outcomes. Reads one line
+    /// only, so callers must expect a single-line reply (`+`/`-`/`:`).
+    fn try_cmd(&mut self, args: &[&str]) -> Option<String> {
+        let out = Self::encode(args);
+        self.stream.write_all(&out).ok()?;
+        let mut line = Vec::new();
+        if self.reader.read_until(b'\n', &mut line).ok()? == 0 {
+            return None; // clean EOF: the server hung up
+        }
+        while line.last() == Some(&b'\n') || line.last() == Some(&b'\r') {
+            line.pop();
+        }
+        Some(String::from_utf8_lossy(&line).to_string())
     }
 
     /// Send a command and read exactly one reply, rendered as a readable string.
@@ -1836,6 +1860,188 @@ fn acl_checks_every_key_not_just_the_first() {
     assert!(b.cmd(&["RANDOMKEY"]).starts_with("-NOPERM"));
     // And the secret is still there, unread and unrenamed.
     assert_eq!(admin.cmd(&["GET", "secret:x"]), "s3cr3t");
+}
+
+/// P1-1.1 — a panic inside a command must not take the hub down. Before the
+/// boundary landed, the hub thread died while the PROCESS stayed alive: the
+/// listener kept accepting and every connection was then silently dropped
+/// forever, with no log, no exit, and nothing for a supervisor to restart.
+#[test]
+fn a_command_panic_is_contained_and_counted() {
+    let s = Server::start();
+    let mut c = s.connect();
+    assert_eq!(c.cmd(&["SET", "before", "1"]), "OK");
+    assert_eq!(info_field(&mut c, "panics_recovered"), 0);
+
+    // DEBUG PANIC unwinds inside the command implementation (debug builds only).
+    assert!(
+        c.cmd(&["DEBUG", "PANIC"])
+            .starts_with("-ERR internal error"),
+        "the panicking client should get an error, not silence"
+    );
+
+    // The same connection is still served...
+    assert_eq!(c.cmd(&["PING"]), "PONG");
+    assert_eq!(c.cmd(&["GET", "before"]), "1");
+    // ...and so is a brand-new one, on the same still-owned keyspace.
+    let mut fresh = s.connect();
+    assert_eq!(fresh.cmd(&["SET", "after", "2"]), "OK");
+    assert_eq!(fresh.cmd(&["GET", "after"]), "2");
+    // The recovery is visible to an operator, not silent.
+    assert_eq!(info_field(&mut fresh, "panics_recovered"), 1);
+}
+
+/// P1-1.2 — deleting a user (or switching it `off`) must REVOKE its live
+/// session. It used to promote it: the ACL gate looked the user up in the table
+/// and, finding nothing, fell through to the unrestricted `default`, so
+/// `ACL DELUSER` — the standard response to a leaked credential — handed that
+/// credential's open connection the whole keyspace.
+#[test]
+fn acl_deluser_revokes_the_live_session_instead_of_promoting_it() {
+    let s = Server::start();
+    let mut admin = s.connect();
+    assert_eq!(
+        admin.cmd(&["ACL", "SETUSER", "bob", "on", ">pw", "+@all", "~app:"]),
+        "OK"
+    );
+
+    let mut b = s.connect();
+    assert_eq!(b.cmd(&["AUTH", "bob", "pw"]), "OK");
+    assert_eq!(b.cmd(&["SET", "app:x", "1"]), "OK"); // in scope
+    assert!(b.cmd(&["SET", "secret:y", "1"]).starts_with("-NOPERM")); // out of scope
+
+    assert_eq!(admin.cmd(&["ACL", "DELUSER", "bob"]), "1");
+    // Closed socket, or a refused command — never OK.
+    let after = b.try_cmd(&["SET", "secret:z", "1"]);
+    assert!(
+        after.as_deref().is_none_or(|r| r.starts_with('-')),
+        "deleted user's live session still had access: {after:?}"
+    );
+    assert_eq!(admin.cmd(&["GET", "secret:z"]), "(nil)");
+
+    // `ACL SETUSER <name> off` disables an identity for the same reason and
+    // must revoke the same way.
+    assert_eq!(
+        admin.cmd(&["ACL", "SETUSER", "carol", "on", ">pw", "+@all", "~app:"]),
+        "OK"
+    );
+    let mut c = s.connect();
+    assert_eq!(c.cmd(&["AUTH", "carol", "pw"]), "OK");
+    assert_eq!(c.cmd(&["SET", "app:c", "1"]), "OK");
+    assert_eq!(admin.cmd(&["ACL", "SETUSER", "carol", "off"]), "OK");
+    let after = c.try_cmd(&["SET", "app:c", "2"]);
+    assert!(
+        after.as_deref().is_none_or(|r| r.starts_with('-')),
+        "disabled user's live session still had access: {after:?}"
+    );
+    assert_eq!(admin.cmd(&["GET", "app:c"]), "1");
+}
+
+/// P1-1.3 — pub/sub channels used to ignore ACL scoping entirely: a user
+/// confined to `~app:` could subscribe to, and publish on, any other tenant's
+/// channel. Channels are now their own scope (`&pattern` / `allchannels` /
+/// `resetchannels`), and a new user gets NONE by default.
+#[test]
+fn acl_scopes_pubsub_channels() {
+    let s = Server::start();
+    let mut admin = s.connect();
+    assert_eq!(
+        admin.cmd(&["ACL", "SETUSER", "bob", "on", ">pw", "+@all", "~app:"]),
+        "OK"
+    );
+    let mut b = s.connect();
+    assert_eq!(b.cmd(&["AUTH", "bob", "pw"]), "OK");
+
+    // Secure default: a user granted no channels gets no channels.
+    assert!(b.cmd(&["SUBSCRIBE", "secret-chan"]).starts_with("-NOPERM"));
+    assert!(b.cmd(&["PSUBSCRIBE", "*"]).starts_with("-NOPERM"));
+    assert!(
+        b.cmd(&["PUBLISH", "secret-chan", "x"])
+            .starts_with("-NOPERM")
+    );
+    assert!(b.cmd(&["ACL", "GETUSER", "bob"]).contains("resetchannels"));
+
+    // Granted one pattern: only that pattern.
+    assert_eq!(admin.cmd(&["ACL", "SETUSER", "bob", "&app:*"]), "OK");
+    assert_eq!(b.cmd(&["PUBLISH", "app:news", "hi"]), "0");
+    assert!(
+        b.cmd(&["PUBLISH", "secret-chan", "x"])
+            .starts_with("-NOPERM")
+    );
+    // PSUBSCRIBE is gated on the PATTERN, literally (Redis's rule): `*` is not
+    // covered by `&app:*` even though `app:*` is.
+    assert!(b.cmd(&["PSUBSCRIBE", "*"]).starts_with("-NOPERM"));
+    // PUBSUB introspection can't leak another tenant's channel names either.
+    let mut other_tenant = s.connect(); // default user, so unrestricted
+    assert_eq!(
+        other_tenant.cmd(&["SUBSCRIBE", "secret-chan"]),
+        "[subscribe, secret-chan, 1]"
+    );
+    let mut probe = s.connect();
+    assert_eq!(probe.cmd(&["AUTH", "bob", "pw"]), "OK");
+    let chans = probe.cmd(&["PUBSUB", "CHANNELS"]);
+    assert!(
+        !chans.contains("secret-chan"),
+        "leaked channel names: {chans}"
+    );
+
+    // In scope, subscribing works and the connection enters push mode.
+    assert_eq!(
+        b.cmd(&["SUBSCRIBE", "app:news"]),
+        "[subscribe, app:news, 1]"
+    );
+
+    // resetchannels takes them away again; allchannels grants everything.
+    assert_eq!(admin.cmd(&["ACL", "SETUSER", "bob", "resetchannels"]), "OK");
+    assert!(
+        probe
+            .cmd(&["PUBLISH", "app:news", "x"])
+            .starts_with("-NOPERM")
+    );
+    assert_eq!(admin.cmd(&["ACL", "SETUSER", "bob", "allchannels"]), "OK");
+    assert_eq!(probe.cmd(&["PUBLISH", "secret-chan", "x"]), "1");
+    assert_eq!(probe.cmd(&["PSUBSCRIBE", "*"]), "[psubscribe, *, 1]");
+}
+
+/// P1-1.4 — `CONFIG GET requirepass` handed the master password, in cleartext,
+/// to a confined user, who could then open a fresh connection, authenticate as
+/// `default`, and step straight out of its own key scope. And `AUTH <pw>` — the
+/// `AUTH default <pw>` shorthand — replied `+OK` without switching identity, so
+/// the connection stayed bound to the old user.
+#[test]
+fn scoped_user_cannot_read_credentials_and_auth_switches_identity() {
+    let s = Server::start_inner(&[("LOCUS_REQUIREPASS", "pw")]);
+    let mut admin = s.connect();
+    assert_eq!(admin.cmd(&["AUTH", "pw"]), "OK");
+    assert_eq!(
+        admin.cmd(&["ACL", "SETUSER", "bob", "on", ">bobpw", "+@all", "~app:"]),
+        "OK"
+    );
+    // `default` still sees it — it is the identity that set it.
+    assert_eq!(
+        admin.cmd(&["CONFIG", "GET", "requirepass"]),
+        "[requirepass, pw]"
+    );
+
+    let mut b = s.connect();
+    assert_eq!(b.cmd(&["AUTH", "bob", "bobpw"]), "OK");
+    assert_eq!(b.cmd(&["ACL", "WHOAMI"]), "bob");
+    // Masked for anyone but `default` — the value is a credential.
+    assert_eq!(b.cmd(&["CONFIG", "GET", "requirepass"]), "[requirepass, ]");
+    // Non-credential config is still readable.
+    assert!(
+        b.cmd(&["CONFIG", "GET", "maxmemory"])
+            .starts_with("[maxmemory,")
+    );
+
+    // `AUTH <pw>` means `AUTH default <pw>`: it must actually switch identity.
+    assert_eq!(b.cmd(&["AUTH", "pw"]), "OK");
+    assert_eq!(b.cmd(&["ACL", "WHOAMI"]), "default");
+    assert_eq!(b.cmd(&["SET", "secret:y", "1"]), "OK");
+    assert_eq!(
+        b.cmd(&["CONFIG", "GET", "requirepass"]),
+        "[requirepass, pw]"
+    );
 }
 
 #[test]

@@ -6,6 +6,79 @@ All notable changes to Locus are documented here. The format is based on
 
 ## [Unreleased]
 
+## [0.7.0] — 2026-08-27
+
+Safety and the crash boundary. Four defects, every one reproduced against a running server: one that
+could take the whole node down, and three in the access-control boundary. **Upgrading is recommended
+for anyone running named ACL users.**
+
+### Security
+
+- **`ACL DELUSER` now revokes a live session instead of promoting it.** Deleting a user — the
+  standard response to a leaked credential — left that user's open connections authenticated but
+  *unmatched* in the ACL table, and the permission check fell through to the unrestricted `default`
+  user. A confined session was therefore *widened* to the whole keyspace by the very act meant to
+  end it. `ACL DELUSER` and `ACL SETUSER <name> off` now force-disconnect every connection bound to
+  that identity, and the permission check fails closed for anything already in flight: an identity
+  that no longer exists gets *no* permissions.
+- **Pub/sub channels are now inside the ACL boundary.** Key scoping was never applied to channels, so
+  a user confined to `~app:` could `SUBSCRIBE` to — and `PUBLISH` on — any other tenant's channel, and
+  read every channel name out of `PUBSUB CHANNELS`. Users now carry channel patterns
+  (`&pattern` / `allchannels` / `resetchannels`), enforced on `SUBSCRIBE`, `PSUBSCRIBE`, `PUBLISH`
+  (RESP3 push included), with `PUBSUB CHANNELS`/`NUMSUB` filtered to the caller's own scope.
+- **`CONFIG GET requirepass` no longer leaks the master password.** It returned the value in
+  cleartext to any user, so a key-scoped user could read it, reconnect as `default`, and step
+  straight out of its own confinement. `requirepass` and `masterauth` are now masked (name listed,
+  value empty) for every user but `default`.
+- **`AUTH <password>` now actually switches identity.** It replied `+OK` while leaving the connection
+  bound to whatever named user it had — an identity change the client was told had happened but that
+  never did. `AUTH <pw>` is `AUTH default <pw>`, in `AUTH` and in `HELLO … AUTH`.
+
+### Added
+
+- **A panic boundary around the hub.** One thread owns the keyspace, so an unwind out of any command
+  used to kill it while the *process stayed alive*: the listener kept accepting and every connection
+  was then silently dropped, with no log, no exit, and nothing for a supervisor to restart. Commands
+  now run inside `catch_unwind` — the panicking client gets `-ERR internal error`, the panic is logged
+  with its command name and source location, and the hub keeps serving. If the hub loop ever unwinds
+  outside that boundary, the process aborts rather than lingering as a zombie.
+  *Stated tradeoff:* a panic mid-command can leave one value partially mutated. That is strictly
+  better than losing everything unpersisted, and unlike an outage it is counted and logged.
+- **`INFO` reports `panics_recovered`** — alert on it being non-zero.
+- **`DEBUG PANIC`** (debug builds only) so the boundary is testable end to end over the wire. A
+  release binary refuses it.
+- **`ACL GETUSER` reports a `channels` field** alongside `keys`.
+- **Documentation:** `docs/COMMANDS.md` gains the *Access control (ACL)* section that
+  `docs/DEPLOYMENT.md` had been linking to.
+
+### BREAKING
+
+- **A named ACL user now starts with NO pub/sub channels**, matching Redis 7's `resetchannels`
+  default. Commands, keys, and channels are three independent grants: `allkeys` is not a channel
+  grant and neither is `+@all`, because a channel name is not a key name. The implicit `default` user
+  is unaffected and keeps all channels.
+
+  **Migration** — for each named user that uses pub/sub, grant the channels it needs:
+
+  ```
+  ACL SETUSER <name> '&app:*'      # scoped to one pattern (preferred)
+  ACL SETUSER <name> allchannels   # or restore the pre-0.7.0 behaviour wholesale
+  ```
+
+  `PSUBSCRIBE` is checked against the **pattern itself, literally** (Redis's rule): a user granted
+  `&news.*` may `PSUBSCRIBE news.*` but not `PSUBSCRIBE *`.
+- **`ACL SETUSER <name> off` and `ACL DELUSER <name>` now close that user's live connections.** This
+  is the point of the fix, but it is a behaviour change for anyone who relied on a disabled user's
+  existing sessions continuing to work.
+
+### Tests
+
+- A regression test per finding in `tests/integration.rs`
+  (`a_command_panic_is_contained_and_counted`,
+  `acl_deluser_revokes_the_live_session_instead_of_promoting_it`, `acl_scopes_pubsub_channels`,
+  `scoped_user_cannot_read_credentials_and_auth_switches_identity`), each confirmed to fail on 0.6.1,
+  plus a unit test for the channel-scope rules in `src/acl.rs`.
+
 ## [0.6.1] — 2026-07-04
 
 Maintenance release — the org move to **elementaio** plus docs/test polish. No behavior or

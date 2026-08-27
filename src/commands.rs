@@ -447,9 +447,8 @@ pub fn command_meta(cmd: &[u8]) -> Option<CmdMeta> {
         | b"EXISTS" | b"TOUCH" | b"KEYS" | b"MGET" | b"SINTER" | b"SUNION" | b"SDIFF"
         | b"WATCH" | b"SUBSCRIBE" | b"PSUBSCRIBE" | b"PUBSUB" | b"BITCOUNT" | b"SRANDMEMBER"
         | b"SELECT" | b"CDCREAD" | b"CDCPENDING" | b"GEOPOS" | b"TOPKLIST" | b"IDXDROP"
-        | b"AUTH" | b"SCAN" | b"OBJECT" | b"CLIENT" | b"SLOWLOG" | b"ACL" | b"PFCOUNT" => {
-            (2, false)
-        }
+        | b"AUTH" | b"SCAN" | b"OBJECT" | b"CLIENT" | b"SLOWLOG" | b"ACL" | b"PFCOUNT"
+        | b"DEBUG" => (2, false),
         // arity 2 writes
         b"PERSIST" | b"INCR" | b"DECR" | b"GETDEL" | b"LPOP" | b"RPOP" | b"SPOP" | b"ZPOPMIN"
         | b"ZPOPMAX" | b"DEL" | b"UNLINK" | b"GETEX" | b"TIER" | b"PFADD" | b"PFMERGE" => (2, true),
@@ -507,9 +506,8 @@ pub fn command_class(cmd: &[u8]) -> u8 {
         | b"CLIENT" => CLASS_CONNECTION,
         b"CONFIG" | b"CLUSTER" | b"SLOWLOG" | b"INFO" | b"DBSIZE" | b"REPLICAOF" | b"SLAVEOF"
         | b"REPLCONF" | b"PSYNC" | b"SYNC" | b"SHUTDOWN" | b"SAVE" | b"BGSAVE"
-        | b"BGREWRITEAOF" | b"FLUSHALL" | b"FLUSHDB" | b"ACL" | b"IDXCREATE" | b"IDXDROP" => {
-            CLASS_ADMIN
-        }
+        | b"BGREWRITEAOF" | b"FLUSHALL" | b"FLUSHDB" | b"ACL" | b"IDXCREATE" | b"IDXDROP"
+        | b"DEBUG" => CLASS_ADMIN,
         b"SUBSCRIBE" | b"UNSUBSCRIBE" | b"PSUBSCRIBE" | b"PUNSUBSCRIBE" | b"PUBLISH"
         | b"PUBSUB" => CLASS_PUBSUB,
         // Changefeed commands READ keyspace data (snapshot + values), so they
@@ -557,6 +555,7 @@ static COMMAND_NAMES: &[&[u8]] = &[
     b"CONFIG",
     b"COPY",
     b"DBSIZE",
+    b"DEBUG",
     b"DECR",
     b"DECRBY",
     b"DEL",

@@ -15,7 +15,9 @@ works. This is a curated subset of Redis — the common, useful commands per typ
 | `RESET` | abort MULTI, UNWATCH, exit subscribe mode, drop to RESP2 |
 | `SELECT 0` | single logical DB; `SELECT 0` is OK, other indexes error |
 | `QUIT` | |
-| `COMMAND` / `CONFIG GET` | minimal stubs so clients connect cleanly |
+| `COMMAND` / `CONFIG GET` | minimal stubs so clients connect cleanly. `CONFIG GET` masks credential values (`requirepass`, `masterauth`) for every user but `default` — the name is still listed, the value comes back empty |
+| `AUTH [user] pw` | `AUTH pw` is shorthand for `AUTH default pw` and **switches the connection to `default`** |
+| `DEBUG PANIC` \| `DEBUG HELP` | debug-build only: `PANIC` makes the command panic on purpose, to exercise the hub's panic boundary. A release binary refuses it |
 | `CLUSTER INFO\|MYID\|SLOTS\|SHARDS\|NODES\|LINKS\|KEYSLOT key\|COUNTKEYSINSLOT slot\|CELL lon lat\|SETSLOT slot NODE addr\|MIGRATESLOT slot dst\|REASSIGN old new\|CDCMERGE since [COUNT n]` | introspection + topology. With `LOCUS_CLUSTER_ENABLED` it reports real slot ownership and routes keys (`MOVED`/`CROSSSLOT`, `CLUSTERDOWN` for an unowned slot); off, `cluster_enabled:0`. `KEYSLOT` = CRC16 + `{hashtag}`; `CELL` = the cell tag for a point (`{cell}id` geo keys); `SETSLOT … NODE` reassigns a slot's owner; `MIGRATESLOT` moves a slot's keys to `dst` (zero-loss, two-phase) then hands it ownership (gossip propagates the change to the other nodes); `REASSIGN old new` repoints **all** of `old`'s slots to `new` (the sentinel broadcasts it on per-shard failover); `CDCMERGE since-hlc [COUNT n]` returns the **global** changefeed — this node's changes merged with every shard's in HLC order up to the cross-shard watermark (pass `0` to start, then advance `since` to the last `hlc`). Ownership changes (`SETSLOT`/`REASSIGN`/`MIGRATESLOT`) are HLC-epoch-stamped and converge across nodes via background gossip, so they need not be pushed to every node manually |
 
 ## Generic / keyspace
@@ -217,6 +219,49 @@ Every change carries a **monotonic offset**. Retention for `CDCREAD` is opt-in v
 high-water offset, so a dropped subscriber can reconnect and `CDCREAD` that offset to catch up, then
 resubscribe. Values are inlined for string keys; other types signal change-only (client re-fetches).
 (Consumer groups / geo-region filters are the next phases.)
+
+## Access control (ACL)
+
+A deliberately simple user model — coarse command **classes**, one key **prefix**, and a set of
+channel **patterns** — not Redis's full selector grammar. `requirepass` sits underneath it: the
+implicit `default` user is unrestricted, and every named user is least-privilege.
+
+| Command | Notes |
+|---|---|
+| `ACL SETUSER <name> <rule> [rule ...]` | create/modify a user; rules are applied in order |
+| `ACL GETUSER <name>` | `flags`, `passwords` (hashes only), `commands`, `keys`, `channels` |
+| `ACL DELUSER <name> [name ...]` | delete users; **force-disconnects their live sessions** |
+| `ACL LIST` / `ACL USERS` / `ACL WHOAMI` / `ACL CAT` | introspection |
+
+**Rules**
+
+| Rule | Meaning |
+|---|---|
+| `on` / `off` | enable / disable the user. `off` **force-disconnects its live sessions** |
+| `>password` / `nopass` / `resetpass` | add a password (stored SHA-256) / accept any / clear all |
+| `+@read` `+@write` `+@admin` `+@connection` `+@pubsub` | grant a command class (`-@…` revokes) |
+| `allcommands` / `+@all` · `nocommands` / `-@all` | every class / none |
+| `~prefix` · `allkeys` / `~*` · `resetkeys` | key scope: one prefix / all keys / none |
+| `&pattern` · `allchannels` / `&*` · `resetchannels` | channel scope: add a glob / all channels / none |
+| `reset` | back to a fresh, fully locked-down user |
+
+**Three scopes, three separate grants.** Commands, keys, and channels are independent: `allkeys` is
+not a channel grant and neither is `+@all`, because a channel name is not a key name. A new user
+starts with **no channels** — grant them explicitly with `&pattern`.
+
+`SUBSCRIBE` and `PUBLISH` match the channel against the user's patterns. `PSUBSCRIBE` is checked
+against the **pattern itself, literally**: a user granted `&news.*` may `PSUBSCRIBE news.*` but not
+`PSUBSCRIBE *`. (Redis's rule — glob-testing the pattern would let `*` through.) `PUBSUB
+CHANNELS`/`NUMSUB` only report channels inside the user's scope.
+
+```console
+# a tenant app: read+write its own keys, its own channels, nothing else
+ACL SETUSER app on >apppw +@read +@write +@pubsub '~app:' '&app:*'
+```
+
+**Revocation is real.** `ACL DELUSER` and `ACL SETUSER <name> off` close every connection currently
+authenticated as that user, and any command already in flight from one is refused. An identity that
+no longer exists gets *no* permissions.
 
 ## Transactions
 

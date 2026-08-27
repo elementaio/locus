@@ -31,6 +31,7 @@ mod tls;
 use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 use std::io::{self, Read, Write};
 use std::net::{TcpListener, TcpStream, ToSocketAddrs};
+use std::panic::{self, AssertUnwindSafe};
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, mpsc};
 use std::thread;
@@ -47,6 +48,11 @@ const MASTER_ID: u64 = 0;
 /// Cap on the replication backlog ring (bytes). A replica that fell further behind
 /// than this must take a full resync. ~4 MiB mirrors Redis's repl-backlog-size.
 const REPL_BACKLOG_MAX: usize = 4 * 1024 * 1024;
+
+/// Config parameters whose value is a credential: never shown to anyone but the
+/// implicit `default` user. `masterauth` is listed ahead of being exposed, so it
+/// can't be added to `config_params` later without inheriting the masking.
+const SENSITIVE_CONFIG: &[&str] = &["requirepass", "masterauth"];
 
 /// Returned to a non-loopback client when protected mode is active (no password
 /// set). Mirrors Redis's protected-mode guidance.
@@ -195,6 +201,7 @@ fn install_signal_handlers() {
 
 fn main() -> io::Result<()> {
     log::init();
+    install_panic_hook();
     raise_fd_limit();
     // Sentinel mode: run as a failover monitor instead of a data node (never
     // returns). Enabled by pointing LOCUS_SENTINEL at a master's host:port.
@@ -781,6 +788,9 @@ struct Hub {
     // observability: process start (uptime) + a cheap command counter for INFO.
     start: Instant,
     commands_processed: u64,
+    // how many command panics the hub boundary has caught and survived. Exposed
+    // as INFO `panics_recovered` so a recovery is an alarm, not a silent event.
+    panics_recovered: u64,
     // per-client name set via CLIENT SETNAME (for CLIENT GETNAME / LIST).
     client_names: HashMap<u64, Vec<u8>>,
     // SLOWLOG: a bounded ring of commands slower than the threshold (newest first).
@@ -1014,6 +1024,7 @@ impl Hub {
             bgsave_in_progress: Arc::new(AtomicBool::new(false)),
             start: Instant::now(),
             commands_processed: 0,
+            panics_recovered: 0,
             client_names: HashMap::new(),
             slowlog: VecDeque::new(),
             slowlog_next_id: 0,
@@ -2164,6 +2175,12 @@ impl Hub {
         match tokens.get(1).map(|t| t.to_ascii_uppercase()).as_deref() {
             Some(b"GET") if tokens.len() >= 3 => {
                 let params = self.config_params();
+                // Only the `default` user sees credential values. Handing the
+                // master password to a confined user in cleartext defeated the
+                // confinement outright: it could open a fresh connection, AUTH
+                // as `default`, and walk out of its own key scope. Hidden the
+                // way Redis hides them — the name is still listed, empty.
+                let masked = self.current_user.contains_key(&id);
                 let mut out: Vec<Vec<u8>> = Vec::new();
                 for (name, val) in &params {
                     if tokens[2..]
@@ -2171,7 +2188,11 @@ impl Hub {
                         .any(|pat| pubsub::glob_match(pat, name.as_bytes()))
                     {
                         out.push(name.as_bytes().to_vec());
-                        out.push(val.clone().into_bytes());
+                        if masked && SENSITIVE_CONFIG.contains(name) {
+                            out.push(Vec::new());
+                        } else {
+                            out.push(val.clone().into_bytes());
+                        }
                     }
                 }
                 let proto = self.protos.get(&id).copied().unwrap_or(2);
@@ -2297,6 +2318,106 @@ impl Hub {
         }
     }
 
+    /// The ACL gate for one command, or `None` when it is allowed. A connection
+    /// with no entry in `current_user` is the implicit `default` user and is
+    /// unrestricted — that is the only way to be unrestricted.
+    ///
+    /// FAIL CLOSED when the bound user is not in the table. `ACL DELUSER` (and
+    /// `SETUSER … off`) force-disconnects that user's live sessions, but a
+    /// command the connection had ALREADY queued can still arrive at the hub
+    /// afterwards. The old shape looked the user up and, on a miss, skipped the
+    /// whole check — so a deleted identity was promoted to unrestricted access
+    /// instead of losing it. An identity that no longer exists gets NO
+    /// permissions, never all of them.
+    fn acl_check(&self, id: u64, cmd: &[u8], tokens: &[Vec<u8>]) -> Option<Vec<u8>> {
+        let uname = self.current_user.get(&id)?;
+        let Some(user) = self.users.get(uname) else {
+            return Some(resp::error(&format!(
+                "NOPERM User {} no longer exists",
+                String::from_utf8_lossy(uname)
+            )));
+        };
+        if !user.enabled {
+            return Some(resp::error(&format!(
+                "NOPERM User {} is disabled",
+                String::from_utf8_lossy(uname)
+            )));
+        }
+        let class = commands::command_class(cmd);
+        if !user.allows_class(class) {
+            return Some(resp::error(&format!(
+                "NOPERM User {} has no permissions to run the '{}' command",
+                String::from_utf8_lossy(uname),
+                String::from_utf8_lossy(cmd).to_ascii_lowercase()
+            )));
+        }
+        if (class == acl::CLASS_READ || class == acl::CLASS_WRITE)
+            && !acl_keys_allowed(user, cmd, tokens)
+        {
+            return Some(resp::error("NOPERM No permissions to access a key"));
+        }
+        if class == acl::CLASS_PUBSUB && !acl_channels_allowed(user, cmd, tokens) {
+            return Some(resp::error(
+                "NOPERM No permissions to access a pub/sub channel",
+            ));
+        }
+        None
+    }
+
+    /// Force-disconnect every live connection bound to `name`. Used when an
+    /// identity stops existing (`ACL DELUSER`) or stops being usable
+    /// (`ACL SETUSER … off`) — the two things an operator does when a credential
+    /// leaks. Reuses the slow-consumer kill handle the hub already holds.
+    ///
+    /// `current_user` is deliberately NOT cleared here: the reader thread files
+    /// a `Disconnect` that cleans it up, and until then the binding is what
+    /// makes `acl_check` above fail closed for anything already in flight.
+    fn revoke_acl_sessions(&mut self, name: &[u8]) {
+        let ids: Vec<u64> = self
+            .current_user
+            .iter()
+            .filter(|(_, u)| u.as_slice() == name)
+            .map(|(cid, _)| *cid)
+            .collect();
+        for cid in ids {
+            self.authed.remove(&cid);
+            if let Some(out) = self.clients.get(&cid) {
+                out.doomed.store(true, Ordering::Relaxed);
+                if let Some(k) = &out.kill {
+                    let _ = k.shutdown(std::net::Shutdown::Both);
+                }
+            }
+            log::info(&format!(
+                "acl: disconnected client {cid} — user '{}' was deleted or disabled",
+                String::from_utf8_lossy(name)
+            ));
+        }
+    }
+
+    /// DEBUG — a deliberately tiny debug surface (Redis has the precedent for the
+    /// name). The only subcommand is `PANIC`, and only in a debug build: it
+    /// exists so the hub's panic boundary can be tested end to end over the real
+    /// wire. A release binary has no way to ask the server to panic.
+    fn handle_debug(&mut self, id: u64, tokens: &[Vec<u8>]) {
+        match tokens.get(1).map(|t| t.to_ascii_uppercase()).as_deref() {
+            Some(b"PANIC") if cfg!(debug_assertions) => {
+                panic!("DEBUG PANIC: deliberate panic requested by client {id}")
+            }
+            Some(b"PANIC") => self.send(
+                id,
+                resp::error("ERR DEBUG PANIC is only available in a debug build"),
+            ),
+            Some(b"HELP") => self.send(
+                id,
+                resp::simple_string("DEBUG PANIC (debug builds only) | DEBUG HELP"),
+            ),
+            _ => self.send(
+                id,
+                resp::error("ERR Unknown DEBUG subcommand or wrong number of arguments"),
+            ),
+        }
+    }
+
     fn handle_acl(&mut self, id: u64, tokens: &[Vec<u8>]) {
         match tokens.get(1).map(|t| t.to_ascii_uppercase()).as_deref() {
             Some(b"SETUSER") if tokens.len() >= 3 => {
@@ -2313,7 +2434,14 @@ impl Hub {
                         );
                     }
                 }
-                self.users.insert(name, user);
+                // Switching an identity OFF is what an operator does when a
+                // credential leaks: it must end that identity's live sessions
+                // too, not just refuse the next AUTH.
+                let disabled = !user.enabled;
+                self.users.insert(name.clone(), user);
+                if disabled {
+                    self.revoke_acl_sessions(&name);
+                }
                 self.send(id, resp::simple_string("OK"));
             }
             Some(b"GETUSER") if tokens.len() == 3 => match self.users.get(&tokens[2]) {
@@ -2324,6 +2452,8 @@ impl Hub {
                 let mut n = 0;
                 for name in &tokens[2..] {
                     if name.as_slice() != b"default" && self.users.remove(name).is_some() {
+                        // An identity that no longer exists keeps no session.
+                        self.revoke_acl_sessions(name);
                         n += 1;
                     }
                 }
@@ -2451,6 +2581,7 @@ impl Hub {
             "total_commands_processed:{}\r\n",
             self.commands_processed
         ));
+        s.push_str(&format!("panics_recovered:{}\r\n", self.panics_recovered));
         s.push_str("# Replication\r\n");
         s.push_str(&format!("role:{role}\r\n"));
         s.push_str(&format!("connected_slaves:{}\r\n", self.replicas.len()));
@@ -2511,29 +2642,13 @@ impl Hub {
             return self.send(id, resp::error("NOAUTH Authentication required."));
         }
 
-        // ACL: a named user is restricted to its allowed command classes + key
-        // prefix. The implicit "default" user (and open mode) has no entry here
-        // and stays unrestricted.
+        // ACL: a named user is restricted to its allowed command classes, key
+        // prefix, and channel patterns. The implicit "default" user (and open
+        // mode) has no entry here and stays unrestricted.
         if id != MASTER_ID
-            && let Some(uname) = self.current_user.get(&id)
-            && let Some(user) = self.users.get(uname)
+            && let Some(err) = self.acl_check(id, &cmd, &tokens)
         {
-            let class = commands::command_class(&cmd);
-            if !user.allows_class(class) {
-                return self.send(
-                    id,
-                    resp::error(&format!(
-                        "NOPERM User {} has no permissions to run the '{}' command",
-                        String::from_utf8_lossy(uname),
-                        String::from_utf8_lossy(&cmd).to_ascii_lowercase()
-                    )),
-                );
-            }
-            if (class == acl::CLASS_READ || class == acl::CLASS_WRITE)
-                && !acl_keys_allowed(user, &cmd, &tokens)
-            {
-                return self.send(id, resp::error("NOPERM No permissions to access a key"));
-            }
+            return self.send(id, err);
         }
 
         // A connection in pub/sub or changefeed "push mode" may only run the
@@ -2909,6 +3024,7 @@ impl Hub {
             b"CLIENT" => self.handle_client(id, &tokens),
             b"SLOWLOG" => self.handle_slowlog(id, &tokens),
             b"ACL" => self.handle_acl(id, &tokens),
+            b"DEBUG" => self.handle_debug(id, &tokens),
 
             // --- persistence (owner-side) ---
             b"BGREWRITEAOF" => {
@@ -3877,7 +3993,13 @@ impl Hub {
                 ),
             ),
             Some(secret) if ct_eq(secret, pass) => {
+                // `AUTH <pw>` IS `AUTH default <pw>` (Redis semantics), so it
+                // must actually switch identity. It used to reply +OK and leave
+                // the connection bound to whatever named user it had — an
+                // identity change the client was told happened but that never
+                // did.
                 self.authed.insert(id);
+                self.current_user.remove(&id);
                 self.send(id, resp::simple_string("OK"));
             }
             Some(_) => self.send(
@@ -3945,7 +4067,10 @@ impl Hub {
                     }
                 };
                 if ok {
+                    // Same rule as AUTH: this clause only accepts `default`, so
+                    // succeeding here means the connection IS `default` now.
                     self.authed.insert(id);
+                    self.current_user.remove(&id);
                 } else {
                     return self.send(
                         id,
@@ -4263,6 +4388,15 @@ impl Hub {
     }
 
     fn handle_pubsub_introspect(&self, id: u64, tokens: &[Vec<u8>]) {
+        // Introspection is channel data too: a channel-scoped user must not
+        // learn another tenant's channel names (or their subscriber counts)
+        // just because it cannot subscribe to them. The `default` user — no
+        // entry in `current_user` — sees everything, as before.
+        let scope = self
+            .current_user
+            .get(&id)
+            .and_then(|uname| self.users.get(uname));
+        let visible = |c: &Vec<u8>| scope.is_none_or(|u| u.allows_channel(c));
         let sub = tokens.get(1).map(|t| t.to_ascii_uppercase());
         let reply = match sub.as_deref() {
             Some(b"CHANNELS") => {
@@ -4271,7 +4405,7 @@ impl Hub {
                     .pubsub
                     .active_channels()
                     .into_iter()
-                    .filter(|c| pat.is_none_or(|p| pubsub::glob_match(p, c)))
+                    .filter(|c| pat.is_none_or(|p| pubsub::glob_match(p, c)) && visible(c))
                     .collect();
                 resp::bulk_array(&chans)
             }
@@ -4279,7 +4413,14 @@ impl Hub {
                 let mut out = Vec::new();
                 for ch in &tokens[2..] {
                     out.push(resp::bulk_string(ch));
-                    out.push(resp::integer(self.pubsub.numsub(ch)));
+                    // Out of scope reads as zero, not as a refusal — the shape
+                    // of the reply is fixed and must stay parseable.
+                    let n = if visible(ch) {
+                        self.pubsub.numsub(ch)
+                    } else {
+                        0
+                    };
+                    out.push(resp::integer(n));
                 }
                 resp::array(&out)
             }
@@ -4339,6 +4480,27 @@ fn acl_keys_allowed(user: &acl::User, cmd: &[u8], tokens: &[Vec<u8>]) -> bool {
         );
     }
     keys.iter().all(|k| user.allows_key(k))
+}
+
+/// Channel-scope check for a PUBSUB-class command under a channel-restricted
+/// user. Key scoping never applied to channels at all, so a user confined to
+/// `~app:` could subscribe to — and publish on — any other tenant's channel.
+///
+/// SUBSCRIBE/PUBLISH match the channel against the user's `&patterns`.
+/// PSUBSCRIBE is checked against the PATTERN literally (Redis's rule): asking
+/// whether the requested pattern's *text* matches a granted pattern is not the
+/// same as asking whether it is a subset of it — a user granted `&?` would pass
+/// `PSUBSCRIBE *`. Unsubscribing is always allowed: giving a subscription up
+/// can't leak anything.
+fn acl_channels_allowed(user: &acl::User, cmd: &[u8], tokens: &[Vec<u8>]) -> bool {
+    match cmd {
+        b"SUBSCRIBE" => tokens[1..].iter().all(|c| user.allows_channel(c)),
+        b"PSUBSCRIBE" => tokens[1..].iter().all(|p| user.allows_channel_pattern(p)),
+        b"PUBLISH" => tokens.get(1).is_some_and(|c| user.allows_channel(c)),
+        // UNSUBSCRIBE / PUNSUBSCRIBE, and PUBSUB introspection — whose *results*
+        // are filtered to the user's own channels at the call site instead.
+        _ => true,
+    }
 }
 
 fn allowed_in_push_mode(cmd: &[u8]) -> bool {
@@ -4494,21 +4656,96 @@ const MAINT_EVERY: Duration = Duration::from_millis(100);
 
 /// Run one command through the hub with slow-log timing — shared by client
 /// commands and the master's replicated stream.
+///
+/// The command runs inside a PANIC BOUNDARY. One hub thread owns the keyspace,
+/// so an unwind out of any command implementation used to kill it while the
+/// process stayed alive: the listener kept accepting, every connection was then
+/// silently dropped, and there was no log, no exit, and nothing for a supervisor
+/// to restart. Containing it turns "any bug = total outage" into "one failed
+/// command + an alarm" (`INFO panics_recovered`).
+///
+/// The accepted tradeoff: a panic mid-command can leave one value partially
+/// mutated. That is strictly better than losing the whole server — and unlike an
+/// outage, it is counted and logged rather than silent.
 fn dispatch_hub_command(hub: &mut Hub, id: u64, tokens: Vec<Vec<u8>>) {
-    if hub.slowlog_threshold_us >= 0 {
+    // Kept for the log line — `tokens` moves into the guarded call below.
+    let name = tokens.first().cloned().unwrap_or_default();
+    let panicked = if hub.slowlog_threshold_us >= 0 {
         let snap = slowlog_snapshot(&tokens);
         let t0 = Instant::now();
-        hub.handle_command(id, tokens);
+        let panicked = run_guarded(hub, id, tokens);
         let us = t0.elapsed().as_micros() as i64;
         if us >= hub.slowlog_threshold_us {
             hub.push_slowlog(us as u64, snap);
         }
+        panicked
     } else {
-        hub.handle_command(id, tokens);
+        run_guarded(hub, id, tokens)
+    };
+    if panicked {
+        hub.panics_recovered = hub.panics_recovered.saturating_add(1);
+        log::error(&format!(
+            "recovered from a panic in '{}' — that client got -ERR internal error and the hub kept serving; \
+             the value it was writing may be partially mutated (INFO panics_recovered:{})",
+            String::from_utf8_lossy(&name).to_ascii_lowercase(),
+            hub.panics_recovered
+        ));
+        hub.send(id, resp::error("ERR internal error"));
+    }
+}
+
+/// Execute one command with `catch_unwind`; true when it panicked. `Hub` is not
+/// `UnwindSafe` (nothing that owns a keyspace is), and that is precisely the
+/// tradeoff documented above — assert it deliberately.
+fn run_guarded(hub: &mut Hub, id: u64, tokens: Vec<Vec<u8>>) -> bool {
+    panic::catch_unwind(AssertUnwindSafe(|| hub.handle_command(id, tokens))).is_err()
+}
+
+/// Log a panic in our format (timestamped, leveled, on stderr with everything
+/// else) before it unwinds, so a recovered command panic leaves a usable trace
+/// instead of the bare default handler's line.
+fn install_panic_hook() {
+    panic::set_hook(Box::new(|info| {
+        let loc = info
+            .location()
+            .map(|l| format!("{}:{}:{}", l.file(), l.line(), l.column()))
+            .unwrap_or_else(|| "unknown location".to_string());
+        let payload = info.payload();
+        let msg = payload
+            .downcast_ref::<&str>()
+            .map(|s| (*s).to_string())
+            .or_else(|| payload.downcast_ref::<String>().cloned())
+            .unwrap_or_else(|| "Box<dyn Any>".to_string());
+        log::error(&format!("panic at {loc}: {msg}"));
+    }));
+}
+
+/// Belt and braces for the hub thread. Every command already runs inside
+/// `catch_unwind`; if the hub loop unwinds ANYWAY — a panic in the maintenance
+/// sweep, in message bookkeeping, anywhere outside that boundary — the keyspace
+/// owner is gone and the process must not linger as a zombie that accepts
+/// connections it can never answer. Abort, so a supervisor restarts it.
+struct HubAliveGuard {
+    clean: bool,
+}
+
+impl Drop for HubAliveGuard {
+    fn drop(&mut self) {
+        if !self.clean {
+            log::error(
+                "FATAL: the hub thread unwound outside the per-command panic boundary — \
+                 the keyspace owner is gone; aborting so a supervisor restarts this process",
+            );
+            std::process::abort();
+        }
     }
 }
 
 fn run_hub(rx: mpsc::Receiver<Msg>, tx: mpsc::SyncSender<Msg>) {
+    // Aborts on Drop unless the loop below exits cleanly. `persist_and_exit`
+    // leaves via `process::exit`, which runs no destructors — so a shutdown
+    // never trips it either.
+    let mut alive = HubAliveGuard { clean: false };
     let mut hub = Hub::new(tx);
     let mut last_maint = Instant::now();
     loop {
@@ -4662,10 +4899,12 @@ fn run_hub(rx: mpsc::Receiver<Msg>, tx: mpsc::SyncSender<Msg>) {
         if last_maint.elapsed() >= MAINT_EVERY {
             last_maint = Instant::now();
             if SHUTDOWN.load(Ordering::Relaxed) {
-                // Drain anything already queued, then persist and exit.
+                // Drain anything already queued, then persist and exit. The
+                // drain goes through the same panic boundary: an unwind here
+                // would otherwise skip the final save.
                 while let Ok(msg) = rx.try_recv() {
                     if let Msg::Command { id, tokens } = msg {
-                        hub.handle_command(id, tokens);
+                        dispatch_hub_command(&mut hub, id, tokens);
                     }
                 }
                 hub.persist_and_exit(true);
@@ -4688,6 +4927,9 @@ fn run_hub(rx: mpsc::Receiver<Msg>, tx: mpsc::SyncSender<Msg>) {
             hub.check_waits();
         }
     }
+    // The channel closed: every sender is gone, so there is nothing left to
+    // serve. A clean end, not a crash.
+    alive.clean = true;
 }
 
 // === replica side: connect to a master and apply its stream =================
