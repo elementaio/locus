@@ -380,6 +380,12 @@ cargo test                 # unit + integration (parser fuzz, crash-recovery, re
 cargo test --features tls  # also runs the TLS handshake / round-trip tests
 cargo clippy               # lints (clippy-clean under -D warnings)
 cargo fmt                  # formatting
+
+# the performance harness — #[ignore]d, so it never runs in the normal suite.
+# Spawns a server, drives it over a raw socket, and prints the table below;
+# it spawns a redis-server too when the machine has one, and skips that
+# column cleanly when it doesn't.
+cargo test --release --test perf -- --ignored --nocapture
 ```
 
 ## Contributing

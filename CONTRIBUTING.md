@@ -23,6 +23,19 @@ cargo test            # all tests pass
 
 CI runs all three on every push and PR.
 
+Changing anything on the write path? Run the performance harness before and after — it is `#[ignore]`d,
+so it never slows the normal suite down, and it prints a table you can paste straight into the PR:
+
+```console
+cargo test --release --test perf -- --ignored --nocapture
+```
+
+It measures the cases where a mistake actually shows: writes into a large collection, range reads out of
+a big sorted set, and `GEOSEARCH` over a dense point cloud — against a real `redis-server` when one is
+installed. Its assertions are deliberately *ratios* (writing into a 200k-element collection must stay
+within 5× of writing into an empty one), so they catch per-write work that grows with the data instead
+of flaking on a busy machine. `LOCUS_PERF_N` and `LOCUS_PERF_LIST` shrink it for a quick check.
+
 ## Adding a command
 
 Most commands are small:

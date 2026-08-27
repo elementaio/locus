@@ -57,8 +57,8 @@ cargo test
 cargo test --features tls
 ```
 
-Performance work additionally runs the harness (once it exists, session 2):
-`cargo test --release -- --ignored --nocapture`.
+Performance work additionally runs the harness (`tests/perf.rs`, landed in session 2):
+`cargo test --release --test perf -- --ignored --nocapture`.
 
 ## Commit rules
 
@@ -99,6 +99,7 @@ or issue.
 | `src/sketch.rs` | Bloom, HyperLogLog, Count-Min, Top-K, t-digest |
 | `src/pubsub.rs` · `src/streams.rs` · `src/acl.rs` · `src/tier.rs` · `src/sentinel.rs` · `src/hlc.rs` · `src/log.rs` | One subsystem each |
 | `tests/integration.rs` | 104 end-to-end tests — failover, resharding, partial resync, crash recovery |
+| `tests/perf.rs` | The perf harness — `#[ignore]`d; spawns a server (and a `redis-server`, if present) and prints the comparison table |
 | `plans/EXECUTION-PLAN-2026-08.md` | **The current plan.** What we are fixing and why |
 | `plans/SESSIONS.md` | **The session ledger.** Briefs, delivery reports, manager reviews |
 | `plans/DESIGN-PRINCIPLES.md` | The identity above, argued in full |

@@ -88,6 +88,14 @@ for anyone running named ACL users.**
   `acl_deluser_revokes_the_live_session_instead_of_promoting_it`, `acl_scopes_pubsub_channels`,
   `scoped_user_cannot_read_credentials_and_auth_switches_identity`), each confirmed to fail on 0.6.1,
   plus a unit test for the channel-scope rules in `src/acl.rs`.
+- **A performance harness, `tests/perf.rs`** — `#[ignore]`d, so it never runs in the normal suite:
+  `cargo test --release --test perf -- --ignored --nocapture`. Zero-dep like the rest of the tests, it
+  spawns the built binary, drives it over a raw socket, and prints the measured table; where a
+  `redis-server` is installed it spawns one too and prints both columns side by side, and where there
+  is none it prints the Locus column alone rather than failing. Its assertions are deliberately
+  *ratios* — a write into a 200k-element collection must stay within 5x of the same write into an
+  empty one — so they catch per-write work that grows with the data instead of flaking on a loaded
+  machine. `LOCUS_PERF_N` / `LOCUS_PERF_LIST` shrink the sizes for a quick run.
 
 ## [0.6.1] — 2026-07-04
 
