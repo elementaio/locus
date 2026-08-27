@@ -745,6 +745,11 @@ struct Hub {
     protos: HashMap<u64, u8>,
     // soft memory cap (bytes); None = unlimited
     maxmemory: Option<usize>,
+    /// A sound upper bound on the keyspace growth the size estimate has not
+    /// folded in yet (see `write_growth_bound`), reset whenever the estimate is
+    /// settled. Only maintained while `maxmemory` is set — it exists solely so
+    /// the eviction gate can tell "certainly under the cap" from "have to look".
+    pending_growth: usize,
     // changefeed subscribers: client id -> filter (key prefix or geo region)
     changefeeds: HashMap<u64, CdcFilter>,
     // retained change-log (for CDCREAD catch-up); empty/unused when maxlen == 0
@@ -973,6 +978,7 @@ impl Hub {
                 .ok()
                 .and_then(|s| parse_mem(&s))
                 .filter(|&m| m > 0),
+            pending_growth: 0,
             changefeeds: HashMap::new(),
             cdc_log: VecDeque::new(),
             cdc_bytes: 0,
@@ -2204,6 +2210,10 @@ impl Hub {
                     b"maxmemory" => {
                         self.maxmemory =
                             parse_mem(&String::from_utf8_lossy(&tokens[3])).filter(|&m| m > 0);
+                        // Writes before this point were not tracked (there was no
+                        // cap to track them for), so assume the worst until the
+                        // next gate settles the estimate.
+                        self.pending_growth = usize::MAX;
                     }
                     b"requirepass" => {
                         // Rotation: new auth attempts use the new secret; existing
@@ -3019,7 +3029,16 @@ impl Hub {
                 }
             }
             b"REPLICAOF" | b"SLAVEOF" => self.handle_replicaof(id, &tokens),
-            b"INFO" => self.send(id, self.render_info()),
+            b"INFO" => {
+                // Sizes are re-estimated lazily off the write path, so settle
+                // them before reporting: `used_memory` is what an operator and
+                // `redis_exporter` act on, and a stale figure there would be a
+                // worse trade than the walk it saves. Bounded work — the dirty
+                // set holds at most the keys written since the last drain.
+                self.db.drain_dirty_sizes(usize::MAX);
+                self.pending_growth = 0;
+                self.send(id, self.render_info());
+            }
             // DBSIZE sums all shards in cluster mode (XDBSIZE is the internal,
             // local-only variant peers answer); plain DBSIZE otherwise.
             b"DBSIZE" => self.handle_dbsize(id),
@@ -4191,10 +4210,22 @@ impl Hub {
         // and would thaw the stub right back.
         let is_tiering = matches!(cmd.as_slice(), b"TIER" | b"TIERREF");
         if !errored && is_write {
-            // Keep the memory estimate in sync with whatever the command changed
-            // (including in-place collection growth like LPUSH/SADD).
+            // Note what the command changed so the memory estimate can catch up
+            // (including in-place collection growth like LPUSH/SADD). Marking is
+            // O(1); re-estimating a value is O(elements), and doing that here —
+            // after every single write — is what made building any collection
+            // O(n²). `Db::mark_size_dirty` documents where the number is settled.
+            // Only `maxmemory` needs the bound; without a cap nothing reads it.
+            // (`CONFIG SET maxmemory` re-arms it, so turning the cap on mid-run
+            // cannot inherit an under-count from the writes before it.)
+            if self.maxmemory.is_some() {
+                self.pending_growth = match write_growth_bound(&cmd, &tokens) {
+                    Some(b) => self.pending_growth.saturating_add(b),
+                    None => usize::MAX,
+                };
+            }
             for key in write_keys(&tokens) {
-                self.db.resync_size(key);
+                self.db.mark_size_dirty(key);
                 if !is_tiering {
                     self.reindex_key(key); // keep secondary indexes in sync (no drift)
                 }
@@ -4273,6 +4304,19 @@ impl Hub {
             Some(m) => m,
             None => return true,
         };
+        // Size estimates are refreshed lazily off the write path, so the number
+        // below can be stale — and this is the one consumer that must not act on
+        // a stale number. `pending_growth` is a *sound upper bound* on what the
+        // estimate is missing (see `write_growth_bound`), so `used + pending` is
+        // an over-estimate of the truth: while it fits under the cap, the real
+        // figure certainly does, and there is nothing to decide. Only when it
+        // does not do we pay for the walk — which is what keeps a write into a
+        // large collection O(1) here as well, instead of only when `maxmemory`
+        // happens to be off.
+        if self.mem_used_total().saturating_add(self.pending_growth) > max {
+            self.db.drain_dirty_sizes(usize::MAX);
+            self.pending_growth = 0;
+        }
         while self.mem_used_total() > max {
             match self.db.evict_one() {
                 Some(key) => {
@@ -4595,6 +4639,88 @@ fn write_keys(tokens: &[Vec<u8>]) -> Vec<&[u8]> {
     }
 }
 
+/// A sound upper bound on how much `Db::estimate_size` can grow for the keys a
+/// command writes — or `None` when the growth is *not* derivable from the
+/// command's own arguments, in which case the caller must settle the estimate
+/// rather than guess.
+///
+/// This is what lets the `maxmemory` gate skip the O(elements) walk that the
+/// write path defers: while `used_memory + Σ bounds` still fits under the cap,
+/// the real figure certainly does too.
+///
+/// **Fail-closed, like `write_modified` above.** Only commands whose result is
+/// built out of their own arguments are listed. Everything else — a value
+/// derived from *other* keys (`SINTERSTORE`, `COPY`, `PFMERGE`), an
+/// offset-driven string (`SETRANGE`, `SETBIT`), a sketch sized by a numeric
+/// argument (`TOPKRESERVE`, `PFADD`'s 16 KB register array), a bulk load
+/// (`BFLOAD`) — falls through to `None` and is accounted exactly. Leaving a
+/// command off this list costs a little speed under `maxmemory`; putting the
+/// wrong one *on* it would loosen the cap, so the default is off.
+///
+/// The arithmetic: the costliest element `estimate_size` charges for is a zset
+/// member, at `1.5 × 2 × (len + 8 + 16)` = `3·len + 72`, and an element is never
+/// longer than the argument that carried it. Summing that over the arguments —
+/// plus a fixed allowance for the per-key and side-table terms — bounds the lot.
+fn write_growth_bound(cmd: &[u8], tokens: &[Vec<u8>]) -> Option<usize> {
+    const ARG_FED: &[&[u8]] = &[
+        b"SET",
+        b"SETNX",
+        b"SETEX",
+        b"PSETEX",
+        b"GETSET",
+        b"APPEND",
+        b"MSET",
+        b"MSETNX",
+        b"GETDEL",
+        b"GETEX",
+        b"INCR",
+        b"DECR",
+        b"INCRBY",
+        b"DECRBY",
+        b"INCRBYFLOAT",
+        b"DEL",
+        b"UNLINK",
+        b"EXPIRE",
+        b"PEXPIRE",
+        b"EXPIREAT",
+        b"PEXPIREAT",
+        b"PERSIST",
+        b"HSET",
+        b"HSETNX",
+        b"HINCRBY",
+        b"HDEL",
+        b"SADD",
+        b"SREM",
+        b"SPOP",
+        b"ZADD",
+        b"ZINCRBY",
+        b"ZREM",
+        b"ZREMRANGEBYRANK",
+        b"ZREMRANGEBYSCORE",
+        b"ZPOPMIN",
+        b"ZPOPMAX",
+        b"ZMPOP",
+        b"LPUSH",
+        b"RPUSH",
+        b"LPUSHX",
+        b"RPUSHX",
+        b"LSET",
+        b"LINSERT",
+        b"LPOP",
+        b"RPOP",
+        b"LREM",
+        b"LTRIM",
+        b"LMPOP",
+        b"XADD",
+        b"GEOSET",
+    ];
+    if !ARG_FED.contains(&cmd) {
+        return None;
+    }
+    let bytes: usize = tokens.iter().map(|t| t.len()).sum();
+    Some(3 * bytes + 72 * tokens.len() + 256)
+}
+
 /// Did a successful write actually change its key? Used so no-op writes don't
 /// log to the AOF, replicate, or dirty a WATCHer (Redis signals a key modified
 /// only when it really changed). Conservative by design: when in doubt this
@@ -4662,8 +4788,18 @@ fn slowlog_snapshot(tokens: &[Vec<u8>]) -> Vec<Vec<u8>> {
 }
 
 /// How often the hub runs its maintenance sweep (expiry, blocked-reader and
-/// WAIT deadlines, everysec fsync, shutdown), busy or idle.
+/// WAIT deadlines, everysec fsync, deferred size estimates, shutdown), busy or
+/// idle.
 const MAINT_EVERY: Duration = Duration::from_millis(100);
+
+/// Keys re-estimated per maintenance sweep (see `Db::drain_dirty_sizes`). Set
+/// above the whole server's measured write ceiling — ~150k ops/s, so ~15k
+/// distinct keys in one 100 ms sweep — which means in practice the set is
+/// emptied every time and `used_memory` is never more than one sweep behind.
+/// The cap is a safety valve, not a promise: it is what stops a pathological
+/// burst from turning a single sweep into a long stall on the thread that owns
+/// the keyspace.
+const SIZE_DRAIN_BUDGET: usize = 16_384;
 
 /// Run one command through the hub with slow-log timing — shared by client
 /// commands and the master's replicated stream.
@@ -4933,6 +5069,15 @@ fn run_hub(rx: mpsc::Receiver<Msg>, tx: mpsc::SyncSender<Msg>) {
                 hub.db.active_expire();
             }
             hub.dirty_expired_watchers();
+            // Catch the memory estimate up on whatever was written in place
+            // since the last sweep — the work the write path deliberately
+            // deferred (see `Db::mark_size_dirty`).
+            hub.db.drain_dirty_sizes(SIZE_DRAIN_BUDGET);
+            // Only a *complete* drain retires the bound — a budget-truncated one
+            // leaves keys unaccounted, and forgetting them would under-count.
+            if hub.db.sizes_settled() {
+                hub.pending_growth = 0;
+            }
             hub.expire_blocked();
             hub.expire_blocked_pops();
             hub.check_waits();

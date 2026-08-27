@@ -81,6 +81,34 @@ for anyone running named ACL users.**
   is the point of the fix, but it is a behaviour change for anyone who relied on a disabled user's
   existing sessions continuing to work.
 
+### Performance
+
+- **Building a collection is no longer O(n²).** The hub recomputed a key's whole memory-size estimate
+  after *every* write, and that estimate walks every element of the value — so each O(1) write into a
+  collection was really O(n), and filling one was O(n²). It ran whether or not `maxmemory` was set, so
+  every deployment paid for a feature most do not use. A write now marks its key (O(1)) and the deltas
+  are folded in on the 100 ms maintenance sweep. Measured on one 8-core machine against
+  `redis-server 8.8.0`, at 200k members (500k for the list):
+
+  | Operation | Before | After | Speed-up | Gap to Redis |
+  |---|---:|---:|---:|---:|
+  | `SADD` into a 200k-member set | 2,590 ops/s | 130,252 ops/s | **50×** | 209× → 4.3× |
+  | `ZADD` into a 200k-member zset | 2,118 ops/s | 80,715 ops/s | **38×** | 187× → 4.9× |
+  | `HSET` into a 200k-field hash | 1,430 ops/s | 141,191 ops/s | **99×** | 342× → 3.5× |
+  | `RPUSH` into a 500k-element list | 1,693 ops/s | 162,305 ops/s | **96×** | 454× → 4.3× |
+  | build a 200k-member set from empty | 4,714 ops/s | 131,088 ops/s | **28×** | 128× → 4.6× |
+  | build a 500k-element list from empty | 4,058 ops/s | 156,929 ops/s | **39×** | 203× → 5.2× |
+
+  Writing into a large collection now costs the same as writing a fresh key (130,252 vs 132,261 ops/s)
+  — per-write work no longer grows with the collection, which is the property the harness asserts on.
+  Reproduce it all with `cargo test --release --test perf -- --ignored --nocapture`.
+
+  **Nothing observable was traded for it.** `INFO` settles every pending estimate before reporting, so
+  `used_memory` is never stale; and the `maxmemory` gate carries a sound upper bound on the growth it
+  has not folded in yet, so the cap holds exactly as before — it settles the estimate before deciding
+  whenever `used_memory + bound` would exceed the cap. Sorted-set *range reads* are a separate defect
+  and are unchanged here.
+
 ### Tests
 
 - A regression test per finding in `tests/integration.rs`
@@ -96,6 +124,11 @@ for anyone running named ACL users.**
   *ratios* — a write into a 200k-element collection must stay within 5x of the same write into an
   empty one — so they catch per-write work that grows with the data instead of flaking on a loaded
   machine. `LOCUS_PERF_N` / `LOCUS_PERF_LIST` shrink the sizes for a quick run.
+- Regression coverage for the deferred memory accounting: `maxmemory_bounds_a_collection_growing_in_place`
+  and `used_memory_reports_in_place_growth_without_waiting_for_a_sweep` in `tests/integration.rs`, plus
+  `deferred_size_accounting_converges_to_the_eager_total`,
+  `drain_dirty_sizes_honors_its_budget_and_finishes_later` and `removing_a_key_retires_its_pending_size`
+  in `src/db.rs`.
 
 ## [0.6.1] — 2026-07-04
 

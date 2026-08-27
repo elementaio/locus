@@ -240,6 +240,13 @@ pub struct Db {
     /// `estimate_size`) — enough to bound growth, not byte-exact like Redis.
     mem_used: usize,
     sizes: HashMap<Vec<u8>, usize>,
+    /// Keys whose entry in `sizes` is stale because the value was written in
+    /// place. Re-estimating a value costs O(elements) — doing it on every write
+    /// made building any collection O(n²), which is what phase 2.1 of the
+    /// execution plan measured at 60-268× Redis. So a write only *marks* its key
+    /// here (O(1)) and `drain_dirty_sizes` folds the deltas in later, off the
+    /// hot path. See `mark_size_dirty` for the accuracy contract.
+    dirty_sizes: HashSet<Vec<u8>>,
     /// Spatial index for geo points: geohash cell id -> the keys in that cell,
     /// plus a key -> cell reverse map so updates/removals are exact. Maintained on
     /// insert and on every removal (via `forget_size`). GEOSEARCH range-scans only
@@ -263,6 +270,7 @@ impl Db {
             tier_lost: 0,
             mem_used: 0,
             sizes: HashMap::new(),
+            dirty_sizes: HashSet::new(),
             geo_index: BTreeMap::new(),
             geo_cell: HashMap::new(),
         }
@@ -489,9 +497,16 @@ impl Db {
     }
 
     /// Recompute one key's estimated size and fold the delta into the total.
-    /// The hub calls this after every write so in-place collection growth
-    /// (LPUSH, SADD, …) is accounted for, not just whole-value inserts.
+    /// O(elements): it walks the whole value, which is why the write path marks
+    /// instead of calling this (see `mark_size_dirty`). Still used directly
+    /// wherever a key is installed *whole* — a snapshot load, a RESTORE, a
+    /// tier/thaw — where one walk per key is inherent and there is no O(n²).
+    ///
+    /// Exact whenever it runs, stale entry or not: the delta is measured against
+    /// `sizes[key]` (the last value folded into the total), so the invariant
+    /// `mem_used == Σ sizes[key]` holds either way.
     pub fn resync_size(&mut self, key: &[u8]) {
+        self.dirty_sizes.remove(key); // settled now — no need to redo it later
         let volatile = self.expires.contains_key(key);
         let new = self
             .data
@@ -510,10 +525,59 @@ impl Db {
         }
     }
 
+    /// Note that `key`'s size estimate is stale — O(1), and it allocates a key
+    /// copy only the first time a key goes dirty. This is what the hub calls
+    /// after every write.
+    ///
+    /// **The accuracy contract.** `mem_used` has exactly two consumers, and both
+    /// are made exact before they read it rather than on every write:
+    ///
+    /// - `INFO used_memory` drains fully first, so what an operator (or
+    ///   `redis_exporter`) sees is never stale.
+    /// - the `maxmemory` eviction gate drains fully once the estimate is near
+    ///   the cap, so eviction decides on a settled number.
+    ///
+    /// Everywhere else the estimate simply catches up on the maintenance tick.
+    /// This preserves the existing contract — a coarse figure that deliberately
+    /// over-counts — while taking an O(elements) walk off every single write.
+    pub fn mark_size_dirty(&mut self, key: &[u8]) {
+        if !self.dirty_sizes.contains(key) {
+            self.dirty_sizes.insert(key.to_vec());
+        }
+    }
+
+    /// Is every key's size estimate up to date?
+    pub fn sizes_settled(&self) -> bool {
+        self.dirty_sizes.is_empty()
+    }
+
+    /// Re-estimate up to `budget` stale keys and fold their deltas into the
+    /// total; returns how many were done. `usize::MAX` settles everything.
+    ///
+    /// The budget is what keeps one maintenance tick bounded: without it a burst
+    /// that dirtied a very large number of keys would be paid for in a single
+    /// sweep, and the hub thread owns the keyspace — a long sweep is a stall for
+    /// every client.
+    pub fn drain_dirty_sizes(&mut self, budget: usize) -> usize {
+        if budget == 0 || self.dirty_sizes.is_empty() {
+            return 0;
+        }
+        let batch: Vec<Vec<u8>> = if self.dirty_sizes.len() <= budget {
+            std::mem::take(&mut self.dirty_sizes).into_iter().collect()
+        } else {
+            self.dirty_sizes.iter().take(budget).cloned().collect()
+        };
+        for key in &batch {
+            self.resync_size(key); // also drops it from dirty_sizes
+        }
+        batch.len()
+    }
+
     /// Drop per-key tracking when a key is removed (called from every removal
     /// path): memory accounting, the geo-key index, and tier accounting (a
     /// dead stub may empty — and thus delete — its log segment).
     fn forget_size(&mut self, key: &[u8]) {
+        self.dirty_sizes.remove(key); // nothing left to re-estimate
         if let Some(sz) = self.sizes.remove(key) {
             self.mem_used = self.mem_used.saturating_sub(sz);
         }
@@ -721,6 +785,7 @@ impl Db {
         self.expiry_pool.clear();
         self.evict_pool.clear();
         self.sizes.clear();
+        self.dirty_sizes.clear();
         self.mem_used = 0;
         self.geo_index.clear();
         self.geo_cell.clear();
@@ -845,6 +910,107 @@ mod tests {
 
         // Removal returns to zero.
         db.remove(b"k");
+        assert_eq!(db.mem_used(), 0);
+    }
+
+    /// Phase 2.1: the write path only *marks* a key's size estimate stale, and
+    /// the total is folded in later. The deferred total must land on exactly the
+    /// number the old eager path produced — same keyspace, same figure.
+    #[test]
+    fn deferred_size_accounting_converges_to_the_eager_total() {
+        let build = |mut db: Db, defer: bool| -> Db {
+            for i in 0..200u32 {
+                let key = format!("k{}", i % 7).into_bytes();
+                match db.get_mut(&key) {
+                    Some(Value::Set(set)) => {
+                        set.insert(format!("member-{i}").into_bytes());
+                    }
+                    _ => {
+                        let mut set = std::collections::HashSet::new();
+                        set.insert(format!("member-{i}").into_bytes());
+                        db.insert(key.clone(), Value::Set(set));
+                    }
+                }
+                if defer {
+                    db.mark_size_dirty(&key);
+                } else {
+                    db.resync_size(&key);
+                }
+            }
+            db
+        };
+        let eager = build(Db::new(), false);
+        let mut deferred = build(Db::new(), true);
+
+        // Before the drain the deferred total is behind — that is the whole point.
+        assert!(deferred.mem_used() < eager.mem_used());
+        assert!(!deferred.sizes_settled());
+
+        deferred.drain_dirty_sizes(usize::MAX);
+        assert!(deferred.sizes_settled());
+        assert_eq!(
+            deferred.mem_used(),
+            eager.mem_used(),
+            "a drained estimate must equal what per-write re-syncing produced"
+        );
+
+        // And it is idempotent: draining again changes nothing.
+        deferred.drain_dirty_sizes(usize::MAX);
+        assert_eq!(deferred.mem_used(), eager.mem_used());
+    }
+
+    /// The budget is what keeps one maintenance sweep bounded, so it has to
+    /// actually stop — and the remainder has to survive to the next sweep.
+    #[test]
+    fn drain_dirty_sizes_honors_its_budget_and_finishes_later() {
+        let mut db = Db::new();
+        for i in 0..10u32 {
+            let k = format!("k{i}").into_bytes();
+            db.insert(k.clone(), Value::Str(vec![b'x'; 100]));
+            db.mark_size_dirty(&k);
+        }
+        assert_eq!(db.mem_used(), 0, "nothing folded in yet");
+
+        assert_eq!(db.drain_dirty_sizes(4), 4);
+        let partial = db.mem_used();
+        assert!(partial > 0 && !db.sizes_settled());
+
+        assert_eq!(db.drain_dirty_sizes(usize::MAX), 6);
+        assert!(db.sizes_settled());
+        assert!(db.mem_used() > partial);
+
+        // A settled keyspace drains to a no-op.
+        assert_eq!(db.drain_dirty_sizes(usize::MAX), 0);
+
+        // Marking the same key repeatedly costs one entry, not one per write.
+        for _ in 0..100 {
+            db.mark_size_dirty(b"k0");
+        }
+        assert_eq!(db.drain_dirty_sizes(usize::MAX), 1);
+    }
+
+    /// A key that dies before its pending re-estimate lands must take the
+    /// pending entry with it — otherwise the drain re-visits a ghost, and the
+    /// removal's own delta could be applied twice.
+    #[test]
+    fn removing_a_key_retires_its_pending_size() {
+        let mut db = Db::new();
+        db.insert(b"k".to_vec(), Value::Str(vec![b'x'; 100]));
+        db.resync_size(b"k");
+        let accounted = db.mem_used();
+        assert!(accounted > 0);
+
+        // Grow it in place, defer the estimate, then delete the key outright.
+        db.insert(b"k".to_vec(), Value::Str(vec![b'x'; 10_000]));
+        db.mark_size_dirty(b"k");
+        db.remove(b"k");
+
+        assert!(
+            db.sizes_settled(),
+            "a removed key has nothing to re-estimate"
+        );
+        assert_eq!(db.mem_used(), 0);
+        db.drain_dirty_sizes(usize::MAX);
         assert_eq!(db.mem_used(), 0);
     }
 

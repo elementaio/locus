@@ -323,18 +323,42 @@ which is what makes the reliable changefeed and live geo-queries possible. Each 
 
 ## Performance
 
-Locus prioritizes **clarity and predictable single-threaded semantics** over peak throughput. Measured
-with the official `redis-benchmark` (release build, single instance):
+Locus prioritizes **clarity and predictable single-threaded semantics** over peak throughput. The
+numbers below come from the harness in the repository, so you can reproduce them on your own machine
+in one command — against a real `redis-server` if you have one installed:
 
-| Mode | Throughput (approx) |
-|---|---|
-| Non-pipelined (`-c 50`) | ~8k–12k ops/sec per command type |
-| Pipelined (`-P 16`) | ~58k SET / ~80k GET ops/sec |
+```console
+cargo test --release --test perf -- --ignored --nocapture
+```
 
-Throughput is bounded by the single-hub design (one channel hop per command) — the deliberate price of
-lock-free, serially-consistent execution, and the very property (one ordered point) that makes the
-changefeed and live geo-queries possible. The path to more is **horizontal** — spatial sharding across
-nodes (P6), each shard its own single-threaded hub — rather than threading the hub itself.
+Release build, both servers on one 8-core machine, `redis-server 8.8.0` for comparison:
+
+| Operation | Locus | Redis 8.8 | Gap |
+|---|---:|---:|---:|
+| `SET` / `GET`, 50 connections | 69k / 81k ops/s | 99k / 110k ops/s | 1.3–1.4× |
+| `SET` → 200k separate keys (pipelined) | 132k ops/s | 596k ops/s | 4.5× |
+| `SADD` → 200k members of one set | 131k ops/s | 609k ops/s | 4.6× |
+| `ZADD` → 200k members of one sorted set | 91k ops/s | 428k ops/s | 4.7× |
+| `HSET` → 200k fields of one hash | 139k ops/s | 526k ops/s | 3.8× |
+| `RPUSH` → a 500k-element list | 157k ops/s | 815k ops/s | 5.2× |
+| `GEOSET` ingest, 200k points | 102k ops/s | 219k ops/s | 2.1× |
+| `GEOSEARCH` 1 km `COUNT 10` | 1.27 ms | 0.23 ms | 5.6× |
+
+Writing into a large collection costs the same as writing a fresh key (131k vs 132k ops/s above) — the
+per-write work does not grow with the collection, which is what the harness's floor assertions pin
+down. Run-to-run spread on a desktop is ±10–25%; treat the ratios, not the absolute figures, as the
+signal.
+
+**The one outstanding gap:** sorted-set *range reads* (`ZRANGE`, `ZRANGEBYSCORE`) currently materialize
+the entire sorted set before slicing it, so reading the top 10 of a 200k-member zset costs tens of
+milliseconds — and on a single-hub design that is a stall for every client, not just the caller. The
+ordered index that makes it O(log n + m) is already built and maintained; wiring the read path to it is
+the next item on the performance track. Small sorted sets are unaffected.
+
+Throughput is otherwise bounded by the single-hub design (one channel hop per command) — the deliberate
+price of lock-free, serially-consistent execution, and the very property (one ordered point) that makes
+the changefeed and live geo-queries possible. The path to more is **horizontal** — spatial sharding
+across nodes (P6), each shard its own single-threaded hub — rather than threading the hub itself.
 
 ---
 

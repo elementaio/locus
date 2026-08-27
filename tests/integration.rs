@@ -1359,6 +1359,72 @@ fn maxmemory_evicts_to_stay_bounded() {
     assert_eq!(c.cmd(&["PING"]), "PONG"); // still responsive
 }
 
+/// Phase 2.1 made the size estimate lazy — a write marks its key and the total
+/// is folded in off the hot path. `maxmemory` is a hard cap, so growth that has
+/// not been folded in yet must still stop the writer: the gate carries a sound
+/// upper bound on what it is missing and settles the estimate before deciding.
+///
+/// The burst below finishes in a few milliseconds — far inside the 100 ms
+/// maintenance sweep — so the sweep cannot be what saves it. Without the bound,
+/// the estimate reads 0 throughout and the list grows to many times the cap.
+#[test]
+fn maxmemory_bounds_a_collection_growing_in_place() {
+    let cap_bytes: u64 = 200 * 1024;
+    let s = Server::start_inner(&[("LOCUS_MAXMEMORY", "200kb")]);
+    let mut c = s.connect();
+
+    // Filler keys, so eviction has victims other than the list itself.
+    for i in 0..40 {
+        c.cmd(&["SET", &format!("filler:{i}"), &"f".repeat(200)]);
+    }
+    // One list, grown in place — the case the old eager re-sync made O(n²) and
+    // the new lazy one could have made invisible. Pipelined, so it lands fast.
+    let element = "x".repeat(100);
+    for _ in 0..6 {
+        for _ in 0..500 {
+            c.send(&["RPUSH", "big", &element]);
+        }
+        for _ in 0..500 {
+            c.read_reply();
+        }
+    }
+
+    let used = info_field(&mut c, "used_memory");
+    assert!(
+        used <= cap_bytes + 8192,
+        "used_memory {used} should stay near the {cap_bytes}-byte cap even though \
+         the growth was in place (3000 x 100-byte elements is ~450 KB unbounded)"
+    );
+    assert_eq!(c.cmd(&["PING"]), "PONG"); // still responsive
+}
+
+/// The other consumer of the estimate. `used_memory` is what an operator and
+/// `redis_exporter` act on, so INFO settles the deferred estimates before
+/// reporting rather than showing a figure that is one maintenance sweep behind.
+#[test]
+fn used_memory_reports_in_place_growth_without_waiting_for_a_sweep() {
+    let s = Server::start();
+    let mut c = s.connect();
+    let before = info_field(&mut c, "used_memory");
+
+    // ~600 KB of in-place growth, pipelined so it completes well inside the
+    // 100 ms sweep — INFO must still see it.
+    let element = "x".repeat(200);
+    for _ in 0..3000 {
+        c.send(&["RPUSH", "big", &element]);
+    }
+    for _ in 0..3000 {
+        c.read_reply();
+    }
+
+    let after = info_field(&mut c, "used_memory");
+    assert!(
+        after > before + 500_000,
+        "used_memory went {before} -> {after}; in-place growth must be visible \
+         immediately, not one maintenance sweep later"
+    );
+}
+
 #[test]
 fn select_zero_ok_others_rejected() {
     let s = Server::start();

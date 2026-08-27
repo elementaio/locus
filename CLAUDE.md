@@ -106,17 +106,21 @@ or issue.
 | `plans/IMPROVEMENTS-AUDIT-2026-07.md` | The July multi-agent audit — 84 findings, mostly still open |
 | `docs/` | The published documentation (README's targets) |
 
-## Current state — updated 2026-08-27 after session 1b
+## Current state — updated 2026-08-27 after session 2
 
 v0.7.0, ~18,000 lines of Rust (`std`-only except `src/tls.rs`, which is behind the optional feature),
-105 unit + 104 integration tests green. Phases 0 and 1 of the plan are done: the hub now has a panic
+108 unit + 106 integration tests green. Phases 0 and 1 of the plan are done: the hub now has a panic
 boundary, and the three live-verified ACL defects are closed. Session 1b then cleared the debt those
 left behind — the port flake, the ACL handshake gate, the release tags, and the publication gate.
 
-Still open, and the reason the plan continues: measured against `redis-server 8.8` on the same
-machine, simple ops are within 1.2× and `GEOSEARCH` within 6×, but large-collection writes are 60–268×
-slower and zset range reads 390–632× slower — both from two localized defects that sessions 2 and 3
-own. See `plans/EXECUTION-PLAN-2026-08.md` for the full picture and the sequence.
+Phase 2 is half done. Session 2 landed the perf harness (`tests/perf.rs`) and item 2.1: the memory-size
+estimate is now refreshed lazily instead of after every write, which took large-collection writes from
+60–268× Redis to **3.4–5.2×** (28–99× faster). Writing into a 200k-element collection now costs the
+same as writing a fresh key.
+
+Still open, and the reason the plan continues: **zset range reads** are unchanged — `ZRANGE key 0 9`
+on a 200k-member zset still clones the whole sorted set, ~33 ms and ~900× Redis, and on a single hub
+that is a global stall. That is item 2.2, session 3. See `plans/EXECUTION-PLAN-2026-08.md`.
 
 **The `node exited early` flake is fixed** (session 1b). `free_port()` no longer bind-races: it hands
 out ports from a fixed window below every OS ephemeral range, walked by a process-wide counter and

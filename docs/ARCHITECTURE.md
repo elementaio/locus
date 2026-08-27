@@ -135,12 +135,26 @@ commands avoid tying up a thread per blocked client.
 ## Memory accounting & eviction
 
 `maxmemory` (`LOCUS_MAXMEMORY`) bounds dataset growth. The keyspace keeps an approximate `used_memory`
-total: a per-key size estimate is folded in by `resync_size` after every write (so in-place collection
-growth counts) and dropped on every removal path. Before a write on a master, the hub evicts arbitrary
-keys until under the cap; if it still can't fit, the write is rejected with `OOM`. Evictions are
-streamed to replicas/AOF as `DEL` and dirty WATCHers — exactly like a client delete, so snapshots and
-replicas stay consistent. Accounting is deliberately coarse (no allocator introspection in zero-deps
-`std`) — enough to bound growth, not byte-exact. `INFO` exposes `used_memory` and `maxmemory`.
+total: a per-key size estimate, folded in as a delta and dropped on every removal path. Before a write
+on a master, the hub evicts arbitrary keys until under the cap; if it still can't fit, the write is
+rejected with `OOM`. Evictions are streamed to replicas/AOF as `DEL` and dirty WATCHers — exactly like
+a client delete, so snapshots and replicas stay consistent. Accounting is deliberately coarse (no
+allocator introspection in zero-deps `std`) — enough to bound growth, not byte-exact.
+
+**The estimate is refreshed lazily.** Re-estimating a value walks all of its elements, so doing it
+after every write made building any collection O(n²) — the single largest performance defect the
+project has had. A write now only *marks* its key (O(1)) and the deltas are folded in off the hot path,
+on the 100 ms maintenance sweep. The two things that actually read the total are made exact first, so
+nothing observable is traded away:
+
+- **`INFO`** settles every pending key before reporting, so `used_memory` is never stale to an operator
+  or to `redis_exporter`.
+- **The eviction gate** carries a sound upper bound on the growth it has not folded in yet (derived
+  from each write command's own arguments; commands whose result is built out of *other* keys are
+  excluded and accounted exactly). While `used_memory + bound` fits under the cap the real figure
+  certainly does, so there is nothing to decide and no walk to pay for; when it doesn't, the estimate
+  is settled before eviction runs. The cap therefore holds regardless of what the estimate happens to
+  say between sweeps.
 
 ## The changefeed (reactive layer)
 
