@@ -1822,6 +1822,49 @@ fn acl_user_least_privilege() {
     assert!(admin.cmd(&["ACL", "USERS"]).contains("alice"));
 }
 
+/// S1b-1.2 — the four handshake verbs are never gated by the ACL command class.
+/// `AUTH`, `HELLO`, `RESET` and `QUIT` all class as `@connection`, so a
+/// `+@read` user used to be refused every one of them: it could not
+/// re-authenticate, and — because most modern drivers open the connection with
+/// `HELLO` — could not complete a handshake at all. Redis marks exactly these
+/// four `no-auth`; we now do the same. Only the class gate is lifted: the rest
+/// of `@connection` stays gated, and key scope and the write class still bite.
+#[test]
+fn acl_never_gates_the_handshake_verbs() {
+    let s = Server::start();
+    let mut admin = s.connect();
+    assert_eq!(
+        admin.cmd(&["ACL", "SETUSER", "eve", "on", ">pw", "+@read", "~app:"]),
+        "OK"
+    );
+    admin.cmd(&["SET", "app:k", "v"]);
+    admin.cmd(&["SET", "other", "v"]);
+
+    let mut e = s.connect();
+    assert_eq!(e.cmd(&["AUTH", "eve", "pw"]), "OK");
+    // All four, with no `+@connection` anywhere in eve's grants.
+    assert_eq!(e.cmd(&["AUTH", "eve", "pw"]), "OK");
+    assert!(
+        e.cmd(&["HELLO", "3"]).contains("proto"),
+        "HELLO must complete for a least-privilege user"
+    );
+    assert_eq!(e.cmd(&["RESET"]), "RESET");
+    // The rest of `@connection` is still gated — Redis gates these too.
+    assert!(e.cmd(&["PING"]).starts_with("-NOPERM"));
+    assert!(e.cmd(&["ECHO", "x"]).starts_with("-NOPERM"));
+
+    // RESET clears per-connection state but NOT the identity: an unrestricted
+    // connection must not be one RESET away. Reads in scope still work; writes
+    // and out-of-scope reads still do not.
+    assert_eq!(e.cmd(&["GET", "app:k"]), "v");
+    assert!(e.cmd(&["SET", "app:k", "x"]).starts_with("-NOPERM"));
+    assert!(e.cmd(&["GET", "other"]).starts_with("-NOPERM"));
+
+    // QUIT closes the connection rather than being refused (`try_cmd` keeps
+    // the RESP tag and tolerates the hang-up that follows).
+    assert_eq!(e.try_cmd(&["QUIT"]).as_deref(), Some("+OK"));
+}
+
 #[test]
 fn acl_checks_every_key_not_just_the_first() {
     let s = Server::start();
@@ -2619,13 +2662,49 @@ fn sentinel_holds_failover_without_quorum() {
     );
 }
 
-/// Grab an OS-assigned free port, then release it (brief race, fine for a test).
+/// Hand out a TCP port for a child that has to be *told* its port before it
+/// starts — cluster and sentinel nodes, whose peers are named on the command
+/// line, so `LOCUS_PORT=0` and read-it-back (what `Server::spawn_at` does) is
+/// not available to them.
+///
+/// The old shape — bind `:0`, keep the number, drop the listener — left a race
+/// the suite lost about one run in four. Between the drop and the child's own
+/// bind, the kernel is free to hand that same ephemeral port to anything else
+/// asking for `:0`: another test's `Server::start()`, or a second `cargo test`
+/// process. The child then dies at startup on `EADDRINUSE` and the test fails
+/// with "node exited early", far from the actual cause.
+///
+/// So allocate out of a fixed window that sits *below* every platform's
+/// ephemeral range (Linux assigns from 32768, macOS from 49152), which the
+/// kernel therefore never hands out on its own, and walk it with a
+/// process-wide counter so no two callers here can be given the same number.
+/// The window is sliced by pid so concurrent test processes — whose pids are
+/// consecutive — start in different slices and cannot overlap either. Each
+/// candidate is still bind-checked, in case something unrelated on the machine
+/// is holding it.
 fn free_port() -> u16 {
-    TcpListener::bind("127.0.0.1:0")
-        .unwrap()
-        .local_addr()
-        .unwrap()
-        .port()
+    const BASE: u32 = 20_000;
+    const SLICE: u32 = 96; // ports per process; the suite draws ~35
+    const SLICES: u32 = 128;
+    const SPAN: u32 = SLICE * SLICES; // 20_000..32_288
+    static NEXT: AtomicU64 = AtomicU64::new(0);
+
+    let start = (std::process::id() % SLICES) * SLICE;
+    for _ in 0..SPAN {
+        let n = (NEXT.fetch_add(1, Ordering::Relaxed) % u64::from(SPAN)) as u32;
+        let port = (BASE + (start + n) % SPAN) as u16;
+        match TcpListener::bind(("127.0.0.1", port)) {
+            // Dropped at once — the child re-binds it. Safe now: this process
+            // will not hand the number out again, and the kernel does not
+            // allocate from this window.
+            Ok(listener) => {
+                drop(listener);
+                return port;
+            }
+            Err(_) => continue,
+        }
+    }
+    panic!("no free port in {}..{}", BASE, BASE + SPAN);
 }
 
 #[test]
@@ -2756,6 +2835,49 @@ fn cluster_routing_moved_and_crossslot() {
     assert!(cs.starts_with("-CROSSSLOT"), "{cs}");
 }
 
+/// Block until a spawned cluster/sentinel node prints its listening banner, or
+/// panic with the reason it did not. The old shape asserted `read_line > 0`
+/// with the message "node exited early" and sent the child's stderr to
+/// `/dev/null`, so the one thing needed to diagnose it — the bind error — was
+/// thrown away. Keep the child's stderr and put it in the panic.
+fn await_listening(child: &mut Child, port: u16, stderr: Option<std::process::ChildStderr>) {
+    let mut stderr = stderr;
+    let mut reader = BufReader::new(child.stdout.take().unwrap());
+    loop {
+        let mut l = String::new();
+        if reader.read_line(&mut l).unwrap() > 0 {
+            if l.contains("listening on") {
+                break;
+            }
+            continue;
+        }
+        // EOF on stdout: the child is gone. `main` returns `io::Result`, so a
+        // failed bind is reported on stderr — say what it said on the way out.
+        let mut why = String::new();
+        if let Some(mut e) = stderr.take() {
+            let _ = e.read_to_string(&mut why);
+        }
+        let status = child.wait().ok();
+        panic!(
+            "node on port {port} exited early (status {status:?}): {}",
+            why.trim()
+        );
+    }
+    // Listening. Both pipes must now be drained for the life of the child, or
+    // it blocks the first time a full one backs up — the server logs to stderr
+    // on every gossip round, so this is not hypothetical.
+    std::thread::spawn(move || {
+        let mut sink = Vec::new();
+        let _ = reader.read_to_end(&mut sink);
+    });
+    if let Some(mut e) = stderr {
+        std::thread::spawn(move || {
+            let mut sink = Vec::new();
+            let _ = e.read_to_end(&mut sink);
+        });
+    }
+}
+
 fn spawn_cluster_node(port: u16, nodes: &str) -> Child {
     spawn_cluster_node_cells(port, nodes, 0)
 }
@@ -2779,23 +2901,13 @@ fn spawn_cluster_node_env(port: u16, nodes: &str, extra: &[(&str, &str)]) -> Chi
         .env("LOCUS_CDC_MAXLEN", "1000")
         .env("LOCUS_CLUSTER_GOSSIP_MS", "200")
         .stdout(Stdio::piped())
-        .stderr(Stdio::null());
+        .stderr(Stdio::piped());
     for (k, v) in extra {
         cmd.env(k, v);
     }
     let mut child = cmd.spawn().expect("spawn cluster node");
-    let mut reader = BufReader::new(child.stdout.take().unwrap());
-    loop {
-        let mut l = String::new();
-        assert!(reader.read_line(&mut l).unwrap() > 0, "node exited early");
-        if l.contains("listening on") {
-            break;
-        }
-    }
-    std::thread::spawn(move || {
-        let mut sink = Vec::new();
-        let _ = reader.read_to_end(&mut sink);
-    });
+    let stderr = child.stderr.take();
+    await_listening(&mut child, port, stderr);
     child
 }
 
@@ -2819,23 +2931,13 @@ fn spawn_cluster_node_cells(port: u16, nodes: &str, cell_bits: u32) -> Child {
         .env("LOCUS_CDC_MAXLEN", "1000") // retain changes for CLUSTER CDCMERGE
         .env("LOCUS_CLUSTER_GOSSIP_MS", "200") // fast topology convergence in tests
         .stdout(Stdio::piped())
-        .stderr(Stdio::null());
+        .stderr(Stdio::piped());
     if cell_bits > 0 {
         cmd.env("LOCUS_CLUSTER_CELL_BITS", cell_bits.to_string());
     }
     let mut child = cmd.spawn().expect("spawn cluster node");
-    let mut reader = BufReader::new(child.stdout.take().unwrap());
-    loop {
-        let mut l = String::new();
-        assert!(reader.read_line(&mut l).unwrap() > 0, "node exited early");
-        if l.contains("listening on") {
-            break;
-        }
-    }
-    std::thread::spawn(move || {
-        let mut sink = Vec::new();
-        let _ = reader.read_to_end(&mut sink);
-    });
+    let stderr = child.stderr.take();
+    await_listening(&mut child, port, stderr);
     child
 }
 

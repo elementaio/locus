@@ -71,10 +71,17 @@ Performance work additionally runs the harness (once it exists, session 2):
 
 ## Security note
 
-`elementaio/locus` is a **public** repository. `plans/` is currently gitignored and contains working
-reproduction steps for unpatched defects. Do not commit `plans/` until the manager says the gate is
-open (see plan item 0.1). Do not put an unfixed vulnerability's repro in a public commit message,
-CHANGELOG entry, or issue.
+`elementaio/locus` is a **public** repository, and `plans/` still holds working reproduction steps for
+unpatched defects — so publication is gated **per file**, not all-or-nothing. The criterion (plan item
+0.1, corrected in the session 1 review): *publish a document when nothing in it maps a defect that is
+still exploitable.*
+
+`.gitignore` enforces it fail-closed — `/plans/*` ignores everything and each published file is
+un-ignored by name. **A note you add under `plans/` is private until someone lists it there**, which is
+the manager's call, not a session's. Session 1b opened the gate for the design corpus (16 files); the
+execution plan, the session ledger, the July audit and the July hardening review stay held until phase
+6 is decided. Do not put an unfixed vulnerability's repro in a public commit message, CHANGELOG entry,
+or issue.
 
 ---
 
@@ -88,19 +95,35 @@ CHANGELOG entry, or issue.
 | `src/rdb.rs` · `src/aof.rs` | Snapshot and append-only persistence |
 | `src/resp.rs` | RESP2/RESP3 parsing and encoding (resumable, adversarial-input hardened) |
 | `src/geohash.rs` | 52-bit interleaved cell ids — the spatial index and the shard key |
+| `src/tls.rs` | In-process TLS termination — **only** compiled under the optional `tls` feature |
 | `src/sketch.rs` | Bloom, HyperLogLog, Count-Min, Top-K, t-digest |
 | `src/pubsub.rs` · `src/streams.rs` · `src/acl.rs` · `src/tier.rs` · `src/sentinel.rs` · `src/hlc.rs` · `src/log.rs` | One subsystem each |
-| `tests/integration.rs` | 99 end-to-end tests — failover, resharding, partial resync, crash recovery |
+| `tests/integration.rs` | 104 end-to-end tests — failover, resharding, partial resync, crash recovery |
 | `plans/EXECUTION-PLAN-2026-08.md` | **The current plan.** What we are fixing and why |
 | `plans/SESSIONS.md` | **The session ledger.** Briefs, delivery reports, manager reviews |
 | `plans/DESIGN-PRINCIPLES.md` | The identity above, argued in full |
 | `plans/IMPROVEMENTS-AUDIT-2026-07.md` | The July multi-agent audit — 84 findings, mostly still open |
 | `docs/` | The published documentation (README's targets) |
 
-## Current state — 2026-08-27
+## Current state — updated 2026-08-27 after session 1b
 
-v0.6.1, 17,689 lines of `std`-only Rust, 133 commits, 99 integration tests green. Measured against
-`redis-server 8.8` on the same machine: simple ops within 1.2×, `GEOSEARCH` within 6× — but
-large-collection writes 60–268× slower and zset range reads 390–632× slower, both from two localized
-defects. Three live-verified security defects are open. See the plan for the full picture and the
-sequence.
+v0.7.0, ~18,000 lines of Rust (`std`-only except `src/tls.rs`, which is behind the optional feature),
+105 unit + 104 integration tests green. Phases 0 and 1 of the plan are done: the hub now has a panic
+boundary, and the three live-verified ACL defects are closed. Session 1b then cleared the debt those
+left behind — the port flake, the ACL handshake gate, the release tags, and the publication gate.
+
+Still open, and the reason the plan continues: measured against `redis-server 8.8` on the same
+machine, simple ops are within 1.2× and `GEOSEARCH` within 6×, but large-collection writes are 60–268×
+slower and zset range reads 390–632× slower — both from two localized defects that sessions 2 and 3
+own. See `plans/EXECUTION-PLAN-2026-08.md` for the full picture and the sequence.
+
+**The `node exited early` flake is fixed** (session 1b). `free_port()` no longer bind-races: it hands
+out ports from a fixed window below every OS ephemeral range, walked by a process-wide counter and
+sliced by pid, so neither another test nor another `cargo test` process can take a port out from under
+a spawning node. If a cluster node ever does die at startup again, the panic now carries the child's
+exit status and stderr instead of just "node exited early".
+
+**Still flaky, and not yet owned by any session:** `disk_tier_survives_kill9_with_aof_and_rewrite`
+waits a fixed 300 ms for `BGREWRITEAOF` to land. That holds in a normal run but not on a heavily loaded
+machine — measured 8 red in 24 with eight suites running at once, and 0 in 20 running normally. It is a
+test-timing bug, not a product bug. Re-run before diagnosing, and say so in your report.

@@ -6,6 +6,16 @@ All notable changes to Locus are documented here. The format is based on
 
 ## [Unreleased]
 
+### Fixed
+
+- **`AUTH`, `HELLO`, `RESET` and `QUIT` are no longer gated by a user's ACL command classes.** All
+  four class as `@connection`, so a least-privilege user — say `+@read ~app:` — was refused every one
+  of them: it could not re-authenticate, and because most modern clients open a connection with
+  `HELLO`, it could not complete a handshake at all. Redis marks exactly these four `no-auth`; Locus
+  now does the same. Only the command-class gate is lifted — key scope, channel scope, and the
+  fail-closed check for a deleted or disabled identity are unchanged, and the rest of `@connection`
+  (`PING`, `ECHO`, `CLIENT`, `COMMAND`, `SELECT`) stays gated as before.
+
 ## [0.7.0] — 2026-08-27
 
 Safety and the crash boundary. Four defects, every one reproduced against a running server: one that
@@ -445,7 +455,13 @@ milestone. Zero third-party dependencies (pure `std`).
   a skiplist for O(log n) sorted-set ops; full RESP3 typing of every reply; thread-per-core execution.
 - No authentication or TLS yet — bind to a trusted network only.
 
-[Unreleased]: https://github.com/elementaio/locus/compare/v0.3.0...HEAD
+[Unreleased]: https://github.com/elementaio/locus/compare/v0.7.0...HEAD
+[0.7.0]: https://github.com/elementaio/locus/compare/v0.6.1...v0.7.0
+[0.6.1]: https://github.com/elementaio/locus/compare/v0.6.0...v0.6.1
+[0.6.0]: https://github.com/elementaio/locus/compare/v0.5.1...v0.6.0
+[0.5.1]: https://github.com/elementaio/locus/compare/v0.5.0...v0.5.1
+[0.5.0]: https://github.com/elementaio/locus/compare/v0.4.0...v0.5.0
+[0.4.0]: https://github.com/elementaio/locus/compare/v0.3.0...v0.4.0
 [0.3.0]: https://github.com/elementaio/locus/compare/v0.2.0...v0.3.0
 [0.2.0]: https://github.com/elementaio/locus/compare/v0.1.0...v0.2.0
 [0.1.0]: https://github.com/elementaio/locus/releases/tag/v0.1.0

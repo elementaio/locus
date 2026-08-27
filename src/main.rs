@@ -2344,7 +2344,15 @@ impl Hub {
             )));
         }
         let class = commands::command_class(cmd);
-        if !user.allows_class(class) {
+        // The four handshake verbs bypass the command-class gate — Redis's
+        // `no-auth` flag, applied to ACLs as well as to the password gate. They
+        // are `CLASS_CONNECTION`, so without this a `+@read` user is refused
+        // AUTH, HELLO, RESET and QUIT alike: it cannot re-authenticate, and
+        // since most modern drivers send HELLO on connect it cannot complete a
+        // handshake at all. Only the class gate is lifted; the key- and
+        // channel-scope checks below still run (none of the four names either),
+        // and so do the fail-closed missing/disabled checks above.
+        if !is_no_auth(cmd) && !user.allows_class(class) {
             return Some(resp::error(&format!(
                 "NOPERM User {} has no permissions to run the '{}' command",
                 String::from_utf8_lossy(uname),
@@ -4525,8 +4533,11 @@ fn is_tx_control(cmd: &[u8]) -> bool {
     )
 }
 
-/// Commands a not-yet-authenticated connection may run when a password is set:
-/// the connection-setup verbs needed to perform (or precede) AUTH.
+/// Commands a connection may always run: the setup verbs needed to perform (or
+/// precede) AUTH. Gates both the `requirepass` check and — because a
+/// least-privilege user must still be able to hand-shake and re-authenticate —
+/// the ACL command-class gate in [`Hub::acl_check`]. Mirrors Redis's `no-auth`
+/// command flag, which carries exactly these four names.
 fn is_no_auth(cmd: &[u8]) -> bool {
     matches!(cmd, b"AUTH" | b"HELLO" | b"QUIT" | b"RESET")
 }

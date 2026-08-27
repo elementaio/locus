@@ -249,6 +249,13 @@ implicit `default` user is unrestricted, and every named user is least-privilege
 not a channel grant and neither is `+@all`, because a channel name is not a key name. A new user
 starts with **no channels** — grant them explicitly with `&pattern`.
 
+**The handshake is never gated.** `AUTH`, `HELLO`, `RESET` and `QUIT` run whatever the user's classes
+are — Redis's `no-auth` set, and the same four names. Without that, a `+@read` user cannot
+re-authenticate and cannot answer the `HELLO` most modern clients open with, so it cannot use a
+standard Redis client at all. This lifts the *command-class* gate only: key scope, channel scope, and
+the fail-closed check for a deleted or disabled identity all still apply, and the rest of
+`@connection` (`PING`, `ECHO`, `CLIENT`, `COMMAND`, `SELECT`) still needs `+@connection`.
+
 `SUBSCRIBE` and `PUBLISH` match the channel against the user's patterns. `PSUBSCRIBE` is checked
 against the **pattern itself, literally**: a user granted `&news.*` may `PSUBSCRIBE news.*` but not
 `PSUBSCRIBE *`. (Redis's rule — glob-testing the pattern would let `*` through.) `PUBSUB

@@ -1,6 +1,27 @@
 # Rust build artifacts
 /target
-/plans
+
+# Working notes. Private by DEFAULT: `/plans/*` ignores everything under it, and
+# a document is published only by being listed below. The gate (plan item 0.1) is
+# per file — publish a document when nothing in it maps a defect that is still
+# exploitable. New notes stay ignored until someone makes that call explicitly.
+/plans/*
+!/plans/00-first-step.md
+!/plans/BUILD.md
+!/plans/CHANGE-LOG-DESIGN.md
+!/plans/CLUSTER.md
+!/plans/COMMANDS.md
+!/plans/DESIGN-PRINCIPLES.md
+!/plans/DIFFERENTIATORS.md
+!/plans/GEO-DESIGN.md
+!/plans/HARD-PARTS.md
+!/plans/IMPROVEMENTS.md
+!/plans/INTEGRATION.md
+!/plans/LANDSCAPE.md
+!/plans/PRODUCTION-READINESS.md
+!/plans/README.md
+!/plans/REFERENCE.md
+!/plans/ROADMAP.md
 
 # Persistence files written at runtime
 *.rdb
