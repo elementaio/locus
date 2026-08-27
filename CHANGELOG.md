@@ -24,6 +24,26 @@ for anyone running named ACL users.**
 
 ### Security
 
+- **The inter-sentinel control plane is authenticated, and no longer listens to the world.**
+  `serve_peers` bound `0.0.0.0:$LOCUS_SENTINEL_PORT` and accepted every verb from any client with no
+  credential at all — including `SWITCH <master> <epoch>`, which a sentinel adopts whenever the epoch
+  beats its own. One unauthenticated TCP line therefore repointed a whole cluster's replication at a
+  machine the attacker controlled, and the data followed. (`LOCUS_SENTINEL_AUTH` is the password
+  presented to monitored *data nodes*; it never guarded this listener.)
+
+  Two layers, both on by default:
+
+  - **`LOCUS_SENTINEL_PEER_SECRET`** is required on **every** verb — `SWITCH`, but also `GETMASTER`
+    (which hands out the topology) and `ISDOWN` (which feeds another sentinel's failover decision) —
+    compared in constant time. Set the same value on every sentinel.
+  - **`LOCUS_SENTINEL_PEER_BIND` defaults to `127.0.0.1`**, not `0.0.0.0`. Widen it deliberately, to a
+    private address.
+
+  *What the secret does and does not defend against, plainly:* it is a shared bearer token on a
+  cleartext line protocol. It stops an unauthenticated stranger from driving the control plane — the
+  hole it exists to close — but it is not channel-bound, so a passive on-path attacker can read it and
+  replay a verb. Run the peer plane on a trusted network or inside a tunnel.
+
 - **`ACL DELUSER` now revokes a live session instead of promoting it.** Deleting a user — the
   standard response to a leaked credential — left that user's open connections authenticated but
   *unmatched* in the ACL table, and the permission check fell through to the unrestricted `default`
@@ -43,6 +63,11 @@ for anyone running named ACL users.**
 - **`AUTH <password>` now actually switches identity.** It replied `+OK` while leaving the connection
   bound to whatever named user it had — an identity change the client was told had happened but that
   never did. `AUTH <pw>` is `AUTH default <pw>`, in `AUTH` and in `HELLO … AUTH`.
+- **`HELLO <proto> AUTH <user> <pass>` authenticates named ACL users.** The HELLO clause was a second,
+  narrower copy of `AUTH` that only ever accepted `default`, so a valid named pair came back
+  `-WRONGPASS`: a least-privilege user could complete a handshake but could not authenticate through
+  one — which is how every modern driver connects. Both verbs now decide identity on a single shared
+  path, so they cannot drift apart again.
 
 ### Added
 
@@ -55,6 +80,8 @@ for anyone running named ACL users.**
   *Stated tradeoff:* a panic mid-command can leave one value partially mutated. That is strictly
   better than losing everything unpersisted, and unlike an outage it is counted and logged.
 - **`INFO` reports `panics_recovered`** — alert on it being non-zero.
+- **`INFO` reports `aof_rewrite_in_progress`** (0/1), mirroring `rdb_bgsave_in_progress`, so a rewrite's
+  completion is observable rather than something to sleep on and hope for.
 - **`DEBUG PANIC`** (debug builds only) so the boundary is testable end to end over the wire. A
   release binary refuses it.
 - **`ACL GETUSER` reports a `channels` field** alongside `keys`.
@@ -63,6 +90,19 @@ for anyone running named ACL users.**
 
 ### BREAKING
 
+- **A sentinel configured with peers but no peer secret refuses to start.** If either
+  `LOCUS_SENTINEL_PORT` or `LOCUS_SENTINEL_PEERS` is set and `LOCUS_SENTINEL_PEER_SECRET` is not, the
+  process logs the reason and exits non-zero instead of opening an unauthenticated control plane. Fail
+  closed, the same stance the ACL took above.
+
+  **Migration** — generate one secret and give it to every sentinel in the group:
+
+  ```
+  LOCUS_SENTINEL_PEER_SECRET=$(openssl rand -hex 32)   # same value on every sentinel
+  ```
+
+  Peers on other hosts also need `LOCUS_SENTINEL_PEER_BIND=<this sentinel's private address>`, since
+  the listener is now loopback-only by default.
 - **A named ACL user now starts with NO pub/sub channels**, matching Redis 7's `resetchannels`
   default. Commands, keys, and channels are three independent grants: `allkeys` is not a channel
   grant and neither is `+@all`, because a channel name is not a key name. The implicit `default` user
@@ -80,6 +120,25 @@ for anyone running named ACL users.**
 - **`ACL SETUSER <name> off` and `ACL DELUSER <name>` now close that user's live connections.** This
   is the point of the fix, but it is a behaviour change for anyone who relied on a disabled user's
   existing sessions continuing to work.
+
+### Documentation — a guarantee we were not keeping
+
+- **Locus's failover is not partition-safe, and the documents now say so.**
+  `plans/PRODUCTION-READINESS.md` recorded HA-3 as shipped with "majority + bully-style leader
+  election → **no dual promotion**". That claim was false. The majority gate and the leader rule
+  narrow the window; they do not close it — an *asymmetric* partition (sentinels that reach each
+  other but not the master, while clients still reach it) can still promote twice. HA-3's actual
+  content, **fencing a partitioned old master, was never built**: such a master keeps accepting
+  writes while cut off and they are silently discarded when it is reconciled back to a replica. Config
+  epochs are wall-clock HLC stamps, not coordinated consensus numbers, so clock skew can invert an
+  ordering.
+
+  Nothing about the code changed here — only what we claim about it. README, `docs/DEPLOYMENT.md`
+  (new *What failover guarantees — and what it does not*), `docs/ARCHITECTURE.md`, `docs/ROADMAP.md`
+  and `plans/PRODUCTION-READINESS.md` now state the limits plainly: failover is an **orchestration
+  hook for a trusted network** with a bounded, documented data-loss window. If you need
+  partition-safety, drive failover from an orchestrator that provides it and use the building blocks
+  (`REPLICAOF`, config epochs, `WAIT`, `CLUSTER REASSIGN`) instead of the automatic mode.
 
 ### Performance
 
@@ -307,6 +366,9 @@ dependency-free; the optional `tls` feature is the only thing that pulls a crate
   reconciliation.
 - **Inter-sentinel agreement** — multiple sentinels (`LOCUS_SENTINEL_PEERS`/`_PORT`/`_ID`) require a
   majority to see the master down, and only the elected leader promotes (no dual promotion).
+  > **Correction (0.7.0).** "No dual promotion" was overstated: the gate narrows the window, it does
+  > not close it, and failover is not partition-safe. See *Documentation — a guarantee we were not
+  > keeping* under [0.7.0]. The peer plane described here was also unauthenticated until 0.7.0.
 
 ### Added — TLS (optional)
 - **In-process TLS** via the opt-in `tls` cargo feature (rustls + ring; no OpenSSL/C). `LOCUS_TLS_PORT`/

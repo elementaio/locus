@@ -234,9 +234,13 @@ LOCUS_SENTINEL_QUORUM=1 \
 It health-checks the master and, when it's been unreachable past `DOWN_AFTER_MS`
 **and** a quorum of replicas confirm their link is down, promotes the most
 up-to-date replica (`REPLICAOF NO ONE`) and repoints the rest. While the master is
-healthy it reconciles stray nodes (e.g. a returned old master) back to replicas —
-basic split-brain protection. Repoint **clients** via your service discovery /
-proxy / DNS after a switch.
+healthy it reconciles stray nodes (e.g. a returned old master) back to replicas,
+which narrows the split-brain window. Repoint **clients** via your service
+discovery / proxy / DNS after a switch.
+
+> **Read [what failover guarantees](#what-failover-guarantees--and-what-it-does-not)
+> before you depend on this.** It is an orchestration hook for a trusted network,
+> not a consensus protocol, and it is **not partition-safe**.
 
 **Run several sentinels** so failover survives a sentinel failure. Give each a
 `LOCUS_SENTINEL_PORT` and list the others in `LOCUS_SENTINEL_PEERS`:
@@ -247,15 +251,39 @@ LOCUS_SENTINEL=master.host:6379 \
 LOCUS_SENTINEL_REPLICAS=replica1:6379,replica2:6379 \
 LOCUS_SENTINEL_PORT=26379 \
 LOCUS_SENTINEL_PEERS=sentinelB:26379,sentinelC:26379 \
+LOCUS_SENTINEL_PEER_SECRET=$PEER_SECRET \
+LOCUS_SENTINEL_PEER_BIND=10.0.0.11 \
   locus
 ```
 
 A failover then also requires a **majority of sentinels** to agree the master is
 down, and only the **leader** (lowest id among the down-seeing sentinels) performs
-the promotion — the majority gate blocks a partitioned minority, the leader rule
-prevents two sentinels promoting different replicas. Use an odd number (3 or 5) so
-a majority is well-defined. This is a bully-style election over a small line
-protocol, not full Raft (epoch consensus is a later step).
+the promotion — the majority gate blocks a partitioned *minority*, the leader rule
+prevents two sentinels promoting different replicas in the same round. Use an odd
+number (3 or 5) so a majority is well-defined. This is a bully-style election over
+a small line protocol, not Raft and not an equivalent of it.
+
+**Lock the peer control plane — it is not optional.** The line protocol the
+sentinels speak to each other carries `SWITCH`, which repoints the cluster's
+replication, plus `GETMASTER` (topology) and `ISDOWN` (failover input). All three
+require `LOCUS_SENTINEL_PEER_SECRET`, the same value on every sentinel:
+
+| Variable | Default | Meaning |
+|---|---|---|
+| `LOCUS_SENTINEL_PEER_SECRET` | _(off)_ | Shared secret required on **every** peer verb. **Mandatory** when `LOCUS_SENTINEL_PORT` or `LOCUS_SENTINEL_PEERS` is set — the sentinel refuses to start without it |
+| `LOCUS_SENTINEL_PEER_BIND` | `127.0.0.1` | Address the peer listener binds. Set it to the sentinel's private-network address when peers are on other hosts |
+
+- The listener binds **loopback only** by default. Widen it to a *private* address
+  (as above), never `0.0.0.0` on a public interface.
+- A sentinel configured with peers and no secret **fails to start**, loudly. That
+  is deliberate: an unauthenticated control plane is a remote takeover of your
+  replication topology, so it is not a mode we let you run in by accident.
+- **What the secret does and does not defend against.** It is a shared bearer
+  token on a cleartext line protocol: it stops an unauthenticated stranger from
+  driving the plane, which is the hole it exists to close. It is *not* channel-
+  bound — a passive on-path attacker can read it and replay any verb. Keep the
+  peer plane on a trusted network or inside a tunnel (WireGuard, stunnel, a
+  service mesh). Do not expose it to the internet.
 
 **Per-shard failover (cluster mode).** Each shard is a master that owns slots plus
 its replicas. Give the sentinel the cluster's node list and it repoints the dead
@@ -271,6 +299,34 @@ LOCUS_SENTINEL_CLUSTER_NODES=shard1-master:6379,shard2-master:6379,shard1-replic
 On promotion the sentinel broadcasts `CLUSTER REASSIGN <old-master> <new-master>`
 to every node, so the cluster routes the dead master's slots to its successor (the
 replica already holds the data). Run one sentinel set per shard.
+
+### What failover guarantees — and what it does not
+
+Stated plainly, because the difference decides whether you can rely on it.
+
+**It does:** detect a dead master and promote the most up-to-date *reachable*
+replica automatically; require replica corroboration and a sentinel majority
+first, so one partitioned sentinel cannot act alone; stamp every promotion with a
+config epoch that data nodes use to reject a stale sentinel's `REPLICAOF`; and
+reconcile a returned old master back into a replica.
+
+**It does not:**
+
+- **It is not partition-safe.** The gates above narrow the window; they do not
+  close it. An *asymmetric* partition — the sentinels can reach each other but not
+  the master, while clients still can — can still produce a **double promotion**.
+- **A partitioned old master is never fenced.** It goes on accepting writes while
+  cut off, and those writes are **silently discarded** when it is reconciled back
+  to a replica. Fence it at the network/orchestrator layer if that loss matters
+  (see the manual runbook below).
+- **Replication is asynchronous** — an unacknowledged write can be lost on
+  promotion. `WAIT` bounds that window; it does not remove it.
+- **Config epochs are wall-clock HLC stamps**, not coordinated consensus numbers;
+  large clock skew between nodes can invert an ordering.
+
+If you need partition-safety, drive failover from an orchestrator that provides it
+(a Kubernetes operator, Consul, etcd) and use the building blocks — `REPLICAOF`,
+config epochs, `WAIT`, `CLUSTER REASSIGN` — instead of the automatic mode.
 
 ### Manual failover (runbook / fallback)
 

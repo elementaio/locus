@@ -25,7 +25,8 @@ durable, observable, and capable on its own.
 
 > **STATUS — 2026-06-27:** **P0–P5 are DONE and on `main`.** P0–P4 = security, durability,
 > driver-compat + observability, replication-v2 (partial-resync + `WAIT`), HA (sentinel failover +
-> quorum + inter-sentinel agreement), TLS (sidecar + optional `tls` feature). P5 = geohash spatial
+> quorum + inter-sentinel agreement — trusted-network only, **not** partition-safe; see the P4
+> correction in §3), TLS (sidecar + optional `tls` feature). P5 = geohash spatial
 > index, `GEOSEARCH … WHERE` filters, ordered-index sorted sets, CRC16 routing seam, RESP3 push. The
 > default build is still 100% zero-dependency. **PERF-1 / REPL-6 / MULTIDB were dismissed** (see §3 P5).
 > **Only P6 (spatial clustering) remains — the flagship, done last.**
@@ -36,7 +37,7 @@ durable, observable, and capable on its own.
 | **P1** | **Trust the data** | Durability you can rely on | No acked-write loss beyond the fsync window; differentiator state survives restart; crash tests green | ✅ **done** |
 | **P2** | **Look like real Redis** | Drop-in for off-the-shelf drivers + observability | `redis_exporter` works; SCAN/COMMAND/CONFIG/RESP3 real; no driver fallbacks | ✅ **done** |
 | **P3** | **Replicate correctly** | Resumable, non-diverging replication | partial resync on reconnect; `WAIT`; no expiry divergence | ✅ **done** |
-| **P4** | **Survive node failure** | Automatic failover + TLS | sentinel failover (quorum + inter-sentinel agreement); native `--features tls` + sidecar | ✅ **done** |
+| **P4** | **Survive node failure** | Automatic failover + TLS | sentinel failover (quorum + inter-sentinel agreement; trusted-network, **not** partition-safe — see the P4 correction); native `--features tls` + sidecar | ◑ **mostly** |
 | **P5** | **Depth & scale-up** | Deep geo + sharper single node | sub-linear GEOSEARCH + `WHERE` filters; ordered-index zsets; CRC16 routing seam; RESP3 push | ✅ **done** |
 | **P6** | **Scale out** | Spatial-locality clustering (the flagship) | Bounded scatter-gather GEOSEARCH across shards; static-cell cluster solid | ⬜ **next (last)** |
 
@@ -222,17 +223,30 @@ behaves correctly. *Est: 3–5 wk.*
 the wire can be encrypted.
 
 > ✅ **Shipped:** sentinel auto-failover (HA-1/HA-2) + replica-corroboration quorum +
-> inter-sentinel agreement (HA-3, majority + bully-style leader election → no dual promotion) +
-> `WAIT` bounded-loss (HA-5); TLS-1 sidecar guide + TLS-2 stream abstraction + TLS-3 optional
-> `tls` (rustls) feature, default build still zero-dep. **Lighter than the full spec on:** HA-4
-> client redirection (documented, not automated), QA-6 linearizability checker (targeted tests
-> instead), COMPAT-11 push SDK (deferred to P5 polish).
+> inter-sentinel agreement (HA-3 *in part*: majority + bully-style leader election over an
+> authenticated peer plane) + `WAIT` bounded-loss (HA-5); TLS-1 sidecar guide + TLS-2 stream
+> abstraction + TLS-3 optional `tls` (rustls) feature, default build still zero-dep.
+> **Lighter than the full spec on:** HA-4 client redirection (documented, not automated), QA-6
+> linearizability checker (targeted tests instead), COMPAT-11 push SDK (deferred to P5 polish).
+>
+> ⚠️ **Correction (session 2b, 2026-08-27).** This entry used to read
+> "HA-3, majority + bully-style leader election → **no dual promotion**". **That claim was false
+> and is withdrawn.** The code does not support it: the majority gate and the leader rule narrow
+> the window, they do not close it. An *asymmetric* partition can still promote twice, and
+> **HA-3's actual content — fencing the partitioned old master — was never built**: an old master
+> keeps accepting writes while cut off and they are silently discarded on reconciliation. Epochs
+> are wall-clock HLC stamps, not coordinated consensus numbers. So P4's failover is an
+> orchestration hook for a **trusted network**, and every user-facing document now says exactly
+> that. HA-3 is therefore **partially shipped**, and the P4 exit gate below ("no split-brain
+> accepted writes; a fenced old master rejects writes") is **not met**. Closing it is a phase-6
+> decision in [EXECUTION-PLAN-2026-08.md](EXECUTION-PLAN-2026-08.md), not a claim we get to make
+> in the meantime.
 
 | Item | E | What |
 |---|---|---|
 | HA-1 | M | Failover primitives: fencing epoch, read-only toggle, guarded promote |
 | HA-2 | XL | **Sentinel-lite** monitor (quorum detect+promote) *and/or* documented k8s-operator hooks |
-| HA-3 | L | Split-brain / fencing: epoch-stamped writes; demoted master rejects on higher epoch |
+| HA-3 | L | Split-brain / fencing: epoch-stamped writes; demoted master rejects on higher epoch — **epoch stamping shipped; fencing a *partitioned* master did not** |
 | HA-4 | M | Client failover UX: role-change notification + reconnect/redirection doc |
 | HA-5 | S | `WAIT`-based bounded-loss contract (documented + tested) |
 | TLS-2 | M | `Conn` transport abstraction (removes the `try_clone` duplex assumption) |
@@ -245,6 +259,7 @@ the wire can be encrypted.
 *bounded* data-loss window and no split-brain accepted writes; a fenced old master rejects
 writes; `cargo build --features tls` serves a real `redis-cli --tls`; the linearizability
 checker passes across seeds incl. a failover scenario. *Est: 6–10 wk.*
+**⚠️ Not met** on the fencing and split-brain halves — see the correction above.
 
 ### P5 — Depth & single-node scale-up — ✅ ESSENTIALLY COMPLETE (on `main`)
 **Goal:** make the geo flagship *deep* and every single node sharper before distributing anything. All

@@ -66,7 +66,7 @@ feel why the single-owner model is cleaner.
 | `geohash` | 52-bit interleaved geohash: point encode, box→cell ranges (spatial index), and the cluster cell id (cell-in-key sharding). |
 | `hlc` | Hybrid logical clock: the monotonic stamp for changefeed records and slot-ownership epochs (cross-shard ordering). |
 | `acl` | Users, classes, and key-prefix rules (vendored SHA-256) layered over `requirepass`. |
-| `sentinel` | Failover monitor mode: health checks, quorum/inter-sentinel agreement, promotion, and cluster slot reassignment. |
+| `sentinel` | Failover monitor mode: health checks, quorum/inter-sentinel agreement (over an authenticated, loopback-by-default peer plane), promotion, and cluster slot reassignment. Trusted-network orchestration, **not partition-safe** — see [DEPLOYMENT](DEPLOYMENT.md#what-failover-guarantees--and-what-it-does-not). |
 | `tls` | Optional (`tls` feature) in-process TLS via rustls; the default build never compiles it. |
 | `log` | The std-only timestamped leveled logger. |
 | `main` | The hub, the connection threads, replication, the changefeed, secondary indexes, and the cluster layer (routing, scatter-gather, gossip). |
@@ -219,7 +219,8 @@ HLC `epoch`.
 - **Convergence.** Each ownership change bumps the slot's HLC epoch; a background gossip thread pulls
   peers' `CLUSTER GOSSIP` maps and adopts higher-epoch entries (last-writer-wins), so changes propagate
   without touching every node. The sentinel's `REASSIGN` broadcast gives fast failover; gossip is the
-  backstop.
+  backstop. Epochs are wall-clock HLC stamps rather than coordinated consensus numbers, so this
+  converges on a healthy network — it does not survive an arbitrary partition.
 - **Cross-shard changefeed.** Every change gets an HLC stamp (the hub's one ordered point makes it
   monotonic). `CLUSTER CDCMERGE` merges all shards' feeds in HLC order up to a watermark — the min HLC
   floor across reachable shards — which bounds staleness; a previously-seen shard that goes down holds the

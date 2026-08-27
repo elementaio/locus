@@ -94,8 +94,10 @@ $ redis-cli -p 6379 GEOSEARCH fleet FROMLONLAT 55.27 25.2 BYRADIUS 5 km ASC   # 
   snapshot when it only missed a little.
 - **Automatic failover:** the same binary runs as a built-in **sentinel** (`LOCUS_SENTINEL`) that
   promotes the most up-to-date replica when the master dies and repoints the rest — no external
-  orchestrator; run several sentinels for quorum-based agreement. See
-  [High availability](#high-availability--automatic-failover).
+  orchestrator; run several sentinels for quorum-based agreement. It is built for a **trusted
+  network** and is **not partition-safe** — see
+  [High availability](#high-availability--automatic-failover) for exactly what it does and does not
+  guarantee.
 
 **Reactive + geo differentiators**
 
@@ -258,7 +260,11 @@ redis-cli -p 6379 wait 1 1000        # -> (integer) 1
 The same `locus` binary runs as a lightweight **sentinel** (set `LOCUS_SENTINEL`) that monitors a
 master and, if it dies, automatically promotes the most up-to-date replica and repoints the others —
 no external orchestrator required. While the master is healthy it also reconciles stray nodes (e.g. a
-returned old master) back to replicas, reducing split-brain risk.
+returned old master) back to replicas, narrowing the split-brain window.
+
+> **What this is, and what it is not.** Failover here is an *orchestration hook* for a trusted
+> network, not a consensus protocol. Read
+> [the guarantees](#what-failover-guarantees--and-what-it-does-not) before you depend on it.
 
 ```console
 # monitor a master + its replicas; promote on failure
@@ -278,6 +284,8 @@ LOCUS_SENTINEL_DOWN_AFTER_MS=5000 \
 | `LOCUS_SENTINEL_QUORUM` | `1` | Replicas that must *also* report the master link down before failover (corroboration; keep ≤ replica count) |
 | `LOCUS_SENTINEL_PORT` | _(off)_ | Listen port for peer-sentinel agreement (enables multi-sentinel mode) |
 | `LOCUS_SENTINEL_PEERS` | _(empty)_ | Comma-separated peer sentinel `host:port` list |
+| `LOCUS_SENTINEL_PEER_SECRET` | _(off)_ | Shared secret required on **every** peer verb. **Mandatory** whenever `LOCUS_SENTINEL_PORT` or `LOCUS_SENTINEL_PEERS` is set — the sentinel refuses to start without it |
+| `LOCUS_SENTINEL_PEER_BIND` | `127.0.0.1` | Address the peer listener binds. Loopback by default; widen it deliberately |
 | `LOCUS_SENTINEL_ID` | `127.0.0.1:PORT` | This sentinel's id for leader election |
 | `LOCUS_SENTINEL_STATE` | _(off)_ | File to persist the current `(master, epoch)` decision so a restart doesn't revert to the env master |
 
@@ -287,15 +295,50 @@ master link down — so a sentinel merely partitioned from the master won't trig
 **Run several sentinels for HA** (so failover survives a sentinel dying): give each a `LOCUS_SENTINEL_PORT`
 and list the others in `LOCUS_SENTINEL_PEERS`. A failover then also needs a **majority of sentinels** to
 agree the master is down, and only the **leader** (lowest id among the down-seeing sentinels) performs
-the promotion — the majority gate stops a partitioned minority, the leader rule stops two sentinels
-promoting different replicas. (Bully-style election over a tiny line protocol — not full Raft.)
+the promotion — the majority gate stops a partitioned *minority*, the leader rule stops two sentinels
+promoting different replicas in the same round. (Bully-style election over a tiny line protocol — not
+Raft, and not an equivalent of it.)
+
+The sentinels talk over a small **authenticated** control plane: give every sentinel the same
+`LOCUS_SENTINEL_PEER_SECRET`, which is required on every verb. It listens on **loopback only** unless
+you set `LOCUS_SENTINEL_PEER_BIND`, and a sentinel configured with peers but no secret **refuses to
+start**. The secret is a shared bearer token over a cleartext line protocol: it stops a stranger from
+driving the control plane, but it is not channel-bound, so put the peer plane on a trusted network or
+inside a tunnel (WireGuard, stunnel, a service mesh) — never on the open internet.
 
 ```console
 # sentinel A (run B symmetrically with PORT/PEERS swapped)
 LOCUS_SENTINEL=master:6379 LOCUS_SENTINEL_REPLICAS=r1:6379,r2:6379 \
 LOCUS_SENTINEL_PORT=26379 LOCUS_SENTINEL_PEERS=sentinelB:26379 \
+LOCUS_SENTINEL_PEER_SECRET=$PEER_SECRET \
   cargo run --release
 ```
+
+#### What failover guarantees — and what it does not
+
+Stated plainly, because the difference matters when you are choosing what to run this on.
+
+**It does:** detect a dead master and promote the most up-to-date *reachable* replica automatically;
+require replica corroboration and a sentinel majority first, so a single partitioned sentinel does not
+act alone; stamp every promotion with a config epoch that data nodes use to reject a stale sentinel's
+`REPLICAOF`; and reconcile a returned old master back to being a replica.
+
+**It does not:**
+
+- **It is not partition-safe.** The two gates narrow the window; they do not close it. An
+  *asymmetric* partition — sentinels that can reach each other but not the master, while the master is
+  still reachable by clients — can still produce a **double promotion**.
+- **A partitioned old master is never fenced.** It keeps accepting writes while cut off, and those
+  writes are **silently discarded** when it is reconciled back to a replica. Fence it at the network
+  or orchestrator layer if that loss is unacceptable.
+- **Replication is asynchronous**, so an unacknowledged write can be lost on promotion. Use `WAIT` to
+  bound that window.
+- **Epochs are wall-clock HLC stamps**, not coordinated consensus numbers; large clock skew across
+  nodes can invert an ordering.
+
+If you need partition-safety, run failover from an orchestrator that provides it (a Kubernetes
+operator, Consul, etcd) and use the sentinel's building blocks — `REPLICAOF`, config epochs, `WAIT`,
+`CLUSTER REASSIGN` — rather than its automatic mode.
 
 See [docs/DEPLOYMENT.md](docs/DEPLOYMENT.md) for the full HA topology.
 
@@ -368,8 +411,10 @@ across nodes (P6), each shard its own single-threaded hub — rather than thread
 (async snapshots, AOF + crash-recovery, persisted/replicated reactive state), observable
 (`INFO`/`SLOWLOG`/`redis_exporter`), driver-compatible (`SCAN`/`COMMAND`/`CONFIG`/RESP3 incl. pub/sub
 push), with correct replication (real offsets, `WAIT`, partial-resync, no expiry divergence) and
-**automatic failover** (built-in sentinel) — plus the reactive/geo differentiator set, now with a
-**geohash-indexed `GEOSEARCH` + `WHERE` filters**, ordered-index sorted sets, and a CRC16 routing seam.
+**automatic failover** (built-in sentinel — for a trusted network; not partition-safe, see
+[the guarantees](#what-failover-guarantees--and-what-it-does-not)) — plus the reactive/geo
+differentiator set, now with a **geohash-indexed `GEOSEARCH` + `WHERE` filters**, ordered-index sorted
+sets, and a CRC16 routing seam.
 
 **Shipped — the flagship milestone:** horizontal **spatial clustering** (P6), Locus's flagship lane.
 It includes: **static hash-slot routing** (`MOVED`/`CROSSSLOT`, `CLUSTER SLOTS/NODES/KEYSLOT`), the

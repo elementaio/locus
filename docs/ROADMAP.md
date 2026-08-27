@@ -42,7 +42,7 @@ See [CHANGEFEED.md](CHANGEFEED.md), [GEO.md](GEO.md), [SKETCHES.md](SKETCHES.md)
 - **Security:** AUTH + protected mode + a simple multi-user **ACL**; conn limits, idle timeout.
 - **Durability:** async `BGSAVE`/`BGREWRITEAOF`, `appendfsync`, persisted+replicated reactive state, crash tests.
 - **Replication:** real replid/offset, **`WAIT`**, **PSYNC partial-resync** over a backlog ring, no expiry divergence.
-- **HA + TLS:** built-in **sentinel** auto-failover (quorum + inter-sentinel agreement); TLS via sidecar or the optional `tls` feature.
+- **HA + TLS:** built-in **sentinel** auto-failover (quorum + inter-sentinel agreement over an authenticated peer plane) — for a **trusted network**, and **not partition-safe** ([what it guarantees](DEPLOYMENT.md#what-failover-guarantees--and-what-it-does-not)); TLS via sidecar or the optional `tls` feature.
 - **Compat/observability:** `SCAN`/`COMMAND`/`CONFIG`/`SLOWLOG`/`INFO` (works with `redis_exporter`), RESP3 typed replies.
 - **Geo depth:** geohash **spatial index** (sub-linear `GEOSEARCH`) + combined `WHERE` attribute filters.
 - **Sorted sets:** ordered index (std `BTreeSet`) for range/rank without re-sorting on read.
@@ -54,6 +54,7 @@ See [CHANGEFEED.md](CHANGEFEED.md), [GEO.md](GEO.md), [SKETCHES.md](SKETCHES.md)
 - **Full RESP3 typing** of every reply (typed maps/sets/doubles + pub/sub push frames done; a few niche replies remain).
 - **Native in-process TLS by default** (it's an opt-in feature; the default build stays zero-dependency).
 - Clustering hardening (optional, post-flagship): off-thread cross-shard scatter, persisted HLC stamps, `ASK`-redirect *online* migration, gossip-based topology propagation (today it's operator/sentinel-driven). Full Raft/gossip consensus stays deferred by the zero-dep stance.
+- **Partition-safe failover:** fencing the partitioned old master, and coordinated (rather than wall-clock) epochs. Today's failover is an orchestration hook for a trusted network and says so plainly; closing the gap is a project of its own, not a patch.
 
 ## Dismissed (won't do — with the reasoning)
 

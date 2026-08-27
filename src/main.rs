@@ -56,6 +56,20 @@ const SENSITIVE_CONFIG: &[&str] = &["requirepass", "masterauth"];
 
 /// Returned to a non-loopback client when protected mode is active (no password
 /// set). Mirrors Redis's protected-mode guidance.
+/// The one wrong-credentials reply, shared by `AUTH` and `HELLO … AUTH`: it must
+/// not distinguish a wrong password from an unknown or disabled user.
+const WRONGPASS_MSG: &str = "WRONGPASS invalid username-password pair or user is disabled.";
+const NO_PASSWORD_MSG: &str =
+    "ERR Client sent AUTH, but no password is set. Did you mean AUTH <username> <password>?";
+
+/// The outcome of one authentication attempt (see `Hub::try_auth`). Separating
+/// the decision from the reply is what lets `AUTH` and `HELLO … AUTH` share it.
+enum AuthResult {
+    Ok,
+    WrongPass,
+    NoPasswordSet,
+}
+
 const PROTECTED_MODE_MSG: &str = "DENIED Locus is running in protected mode because protected mode is enabled and no password is set. To use Locus from a non-loopback address, set a password (LOCUS_REQUIREPASS / requirepass), or disable protected mode with LOCUS_PROTECTED_MODE=no — only on a trusted network or behind TLS.";
 
 /// Bytes queued for a client's writer: either owned by this client or shared
@@ -2584,6 +2598,15 @@ impl Hub {
             "rdb_bgsave_in_progress:{}\r\n",
             self.bgsave_in_progress.load(Ordering::Relaxed) as u8
         ));
+        // A rewrite owns `aof_rewrite_buf` from BGREWRITEAOF until the hub folds
+        // the buffered tail in and swaps the new file into place. Both ends of
+        // that window are hub-side, so a client that reads 0 here is reading it
+        // after the swap: the completion is observable instead of guessed at
+        // with a sleep.
+        s.push_str(&format!(
+            "aof_rewrite_in_progress:{}\r\n",
+            self.aof_rewrite_buf.is_some() as u8
+        ));
         s.push_str(&format!(
             "aof_last_write_status:{}\r\n",
             if self.aof_unhealthy() { "err" } else { "ok" }
@@ -3986,13 +4009,10 @@ impl Hub {
     /// identical across RESP2/RESP3, so we track the version but keep the
     /// existing encoders (full RESP3 typing of every reply is a later extension).
     fn handle_auth(&mut self, id: u64, tokens: &[Vec<u8>]) {
-        // AUTH <password>  or  AUTH <username> <password>. Only the implicit
-        // "default" user exists today, so any other username is rejected.
-        let pass = match tokens.len() {
-            2 => &tokens[1],
-            3 if tokens[1].eq_ignore_ascii_case(b"default") => &tokens[2],
-            // A named (non-default) user authenticates against the ACL table.
-            3 => return self.auth_named_user(id, &tokens[1], &tokens[2]),
+        // AUTH <password>  or  AUTH <username> <password>.
+        let (user, pass) = match tokens.len() {
+            2 => (None, &tokens[1]),
+            3 => (Some(&tokens[1]), &tokens[2]),
             _ => {
                 return self.send(
                     id,
@@ -4000,25 +4020,58 @@ impl Hub {
                 );
             }
         };
+        match self.try_auth(id, user.map(|u| u.as_slice()), pass) {
+            AuthResult::Ok => self.send(id, resp::simple_string("OK")),
+            AuthResult::WrongPass => self.send(id, resp::error(WRONGPASS_MSG)),
+            AuthResult::NoPasswordSet => self.send(id, resp::error(NO_PASSWORD_MSG)),
+        }
+    }
+
+    /// Decide one authentication attempt and bind the connection's identity on
+    /// success. `user` is `None` for the one-argument `AUTH <pw>` form, which
+    /// Redis defines as `AUTH default <pw>`.
+    ///
+    /// This is the *single* path both `AUTH` and `HELLO … AUTH` take. They used
+    /// to have separate implementations, and the HELLO copy only ever accepted
+    /// `default` — so a named ACL user got `-WRONGPASS` for a perfectly valid
+    /// pair and could not authenticate through the handshake at all.
+    fn try_auth(&mut self, id: u64, user: Option<&[u8]>, pass: &[u8]) -> AuthResult {
+        // A named (non-default) user authenticates against the ACL table.
+        if let Some(name) = user
+            && !name.eq_ignore_ascii_case(b"default")
+        {
+            let ok = match self.users.get(name) {
+                // check_password first: it hashes unconditionally, so a disabled
+                // user costs the same as a wrong password.
+                Some(u) => u.check_password(pass) && u.enabled,
+                None => {
+                    // Constant work for unknown users: hash the password anyway
+                    // so response timing doesn't reveal which usernames exist.
+                    let _ = acl::sha256(pass);
+                    false
+                }
+            };
+            if !ok {
+                return AuthResult::WrongPass;
+            }
+            self.authed.insert(id);
+            self.current_user.insert(id, name.to_vec());
+            return AuthResult::Ok;
+        }
         // The cluster secret is accepted alongside requirepass, so a node can
         // require a client password and still let peer nodes authenticate their
         // internal RPCs (and so a cluster-secret-only node authenticates peers
         // even with no client password set).
-        let cluster_ok = self
+        if self
             .cluster_auth_secret
             .as_ref()
-            .is_some_and(|cs| ct_eq(cs, pass));
+            .is_some_and(|cs| ct_eq(cs, pass))
+        {
+            self.authed.insert(id);
+            return AuthResult::Ok;
+        }
         match &self.requirepass {
-            _ if cluster_ok => {
-                self.authed.insert(id);
-                self.send(id, resp::simple_string("OK"));
-            }
-            None => self.send(
-                id,
-                resp::error(
-                    "ERR Client sent AUTH, but no password is set. Did you mean AUTH <username> <password>?",
-                ),
-            ),
+            None => AuthResult::NoPasswordSet,
             Some(secret) if ct_eq(secret, pass) => {
                 // `AUTH <pw>` IS `AUTH default <pw>` (Redis semantics), so it
                 // must actually switch identity. It used to reply +OK and leave
@@ -4027,37 +4080,9 @@ impl Hub {
                 // did.
                 self.authed.insert(id);
                 self.current_user.remove(&id);
-                self.send(id, resp::simple_string("OK"));
+                AuthResult::Ok
             }
-            Some(_) => self.send(
-                id,
-                resp::error("WRONGPASS invalid username-password pair or user is disabled."),
-            ),
-        }
-    }
-
-    /// Authenticate as a named ACL user and bind the connection to it.
-    fn auth_named_user(&mut self, id: u64, name: &[u8], pass: &[u8]) {
-        let ok = match self.users.get(name) {
-            // check_password first: it hashes unconditionally, so a disabled
-            // user costs the same as a wrong password.
-            Some(u) => u.check_password(pass) && u.enabled,
-            None => {
-                // Constant work for unknown users: hash the password anyway so
-                // response timing doesn't reveal which usernames exist.
-                let _ = acl::sha256(pass);
-                false
-            }
-        };
-        if ok {
-            self.authed.insert(id);
-            self.current_user.insert(id, name.to_vec());
-            self.send(id, resp::simple_string("OK"));
-        } else {
-            self.send(
-                id,
-                resp::error("WRONGPASS invalid username-password pair or user is disabled."),
-            );
+            Some(_) => AuthResult::WrongPass,
         }
     }
 
@@ -4079,32 +4104,14 @@ impl Hub {
         let mut i = 2;
         while i < tokens.len() {
             if tokens[i].eq_ignore_ascii_case(b"AUTH") && i + 2 < tokens.len() {
-                let ok = match &self.requirepass {
-                    None => {
-                        return self.send(
-                            id,
-                            resp::error(
-                                "ERR Client sent AUTH, but no password is set. Did you mean AUTH <username> <password>?",
-                            ),
-                        );
+                // Exactly what AUTH does — including binding a *named* ACL user,
+                // which this clause used to refuse.
+                match self.try_auth(id, Some(&tokens[i + 1]), &tokens[i + 2]) {
+                    AuthResult::Ok => {}
+                    AuthResult::WrongPass => return self.send(id, resp::error(WRONGPASS_MSG)),
+                    AuthResult::NoPasswordSet => {
+                        return self.send(id, resp::error(NO_PASSWORD_MSG));
                     }
-                    Some(secret) => {
-                        tokens[i + 1].eq_ignore_ascii_case(b"default")
-                            && ct_eq(secret, &tokens[i + 2])
-                    }
-                };
-                if ok {
-                    // Same rule as AUTH: this clause only accepts `default`, so
-                    // succeeding here means the connection IS `default` now.
-                    self.authed.insert(id);
-                    self.current_user.remove(&id);
-                } else {
-                    return self.send(
-                        id,
-                        resp::error(
-                            "WRONGPASS invalid username-password pair or user is disabled.",
-                        ),
-                    );
                 }
                 i += 3;
             } else if tokens[i].eq_ignore_ascii_case(b"SETNAME") && i + 1 < tokens.len() {

@@ -15,8 +15,39 @@
 //!     sentinels must see the master down, and only the *leader* (the lowest id
 //!     among the down-seeing sentinels) performs the promotion. The majority gate
 //!     stops a partitioned minority; the leader rule stops two sentinels promoting
-//!     different replicas. This is the orchestration-hook tier — a bully-style
+//!     different replicas in the same round. This is the orchestration-hook tier — a bully-style
 //!     election over a tiny line protocol, not full Raft epochs.
+//!
+//! **This is not partition-safe, and does not claim to be.** The two gates above
+//! narrow the window; they do not close it. An *asymmetric* partition (sentinels
+//! that can reach each other but not the master, while a client still can) can
+//! still produce a double promotion, and a partitioned old master is **never
+//! fenced** — writes it accepts while cut off are silently discarded when it is
+//! reconciled back to a replica. Failover here is for a trusted network with an
+//! accepted, bounded data-loss window, not a consensus protocol.
+//!
+//! # Peer control plane
+//!
+//! The peer listener speaks a tiny line protocol (`ISDOWN` / `PING` / `GETMASTER`
+//! / `SWITCH`) that decides which node the cluster replicates from — so it is a
+//! control plane, and it is locked as one:
+//!
+//!   * it binds `LOCUS_SENTINEL_PEER_BIND` (**default `127.0.0.1`**, not the
+//!     world), and
+//!   * **every** verb must be preceded by `AUTH <secret>` on the same connection,
+//!     compared in constant time. Not just `SWITCH`: `GETMASTER` leaks the
+//!     topology and `ISDOWN` feeds the failover decision.
+//!
+//! Enabling the peer plane (`LOCUS_SENTINEL_PORT` or `LOCUS_SENTINEL_PEERS`)
+//! without `LOCUS_SENTINEL_PEER_SECRET` is a startup error — fail closed rather
+//! than run open.
+//!
+//! **What the secret does and does not defend against.** It is a shared bearer
+//! token: it stops an unauthenticated stranger from driving the control plane,
+//! which is the hole it exists to close. It is *not* a channel binding — the
+//! token crosses the wire in cleartext, so a passive on-path attacker can read it
+//! and replay any verb. Put the peer plane on a trusted network or inside a
+//! tunnel (WireGuard, stunnel, a service mesh); do not expose it to the internet.
 //!
 //! Config (env):
 //!   LOCUS_SENTINEL            master host:port to monitor (enables sentinel mode)
@@ -27,6 +58,8 @@
 //!   LOCUS_SENTINEL_QUORUM     replicas that must confirm down before failover (default 1)
 //!   LOCUS_SENTINEL_PORT       listen port for peer-sentinel "is the master down?" queries
 //!   LOCUS_SENTINEL_PEERS      comma-separated peer sentinel host:port list
+//!   LOCUS_SENTINEL_PEER_BIND  address the peer listener binds (default 127.0.0.1)
+//!   LOCUS_SENTINEL_PEER_SECRET  shared secret required on every peer verb (mandatory with peers)
 //!   LOCUS_SENTINEL_ID         this sentinel's id for leader election (default 127.0.0.1:PORT)
 
 use std::io::{self, Read, Write};
@@ -79,6 +112,26 @@ pub fn run() -> io::Result<()> {
     let sentinel_port = std::env::var("LOCUS_SENTINEL_PORT")
         .ok()
         .filter(|s| !s.is_empty());
+    // The peer control plane decides who the cluster replicates from, so it is
+    // locked before it is opened: loopback by default, and a shared secret on
+    // every verb. Enabling it without one is a startup error — the same
+    // fail-closed stance the ACL takes, and the shape LOCUS_CLUSTER_SECRET
+    // already set for internal cluster RPCs.
+    let peer_secret = std::env::var("LOCUS_SENTINEL_PEER_SECRET")
+        .ok()
+        .filter(|s| !s.is_empty());
+    let peer_secret = match peer_secret {
+        Some(sec) => sec,
+        None if peers.is_empty() && sentinel_port.is_none() => String::new(), // plane disabled
+        None => {
+            let msg = "sentinel: LOCUS_SENTINEL_PEERS/LOCUS_SENTINEL_PORT are set but \
+                       LOCUS_SENTINEL_PEER_SECRET is not — the peer control plane accepts \
+                       SWITCH, which repoints replication, so it will not run unauthenticated. \
+                       Set the same LOCUS_SENTINEL_PEER_SECRET on every sentinel.";
+            log::error(msg);
+            return Err(io::Error::new(io::ErrorKind::InvalidInput, msg));
+        }
+    };
     let my_id = std::env::var("LOCUS_SENTINEL_ID").ok().unwrap_or_else(|| {
         sentinel_port
             .as_deref()
@@ -133,7 +186,9 @@ pub fn run() -> io::Result<()> {
     if let Some(port) = sentinel_port.clone() {
         let flag = master_down.clone();
         let shared = view.clone();
-        thread::spawn(move || serve_peers(&port, flag, shared));
+        let bind = peer_bind();
+        let secret = peer_secret.clone();
+        thread::spawn(move || serve_peers(&bind, &port, &secret, flag, shared));
     }
 
     let mut down_since: Option<Instant> = None;
@@ -141,7 +196,7 @@ pub fn run() -> io::Result<()> {
         std::thread::sleep(Duration::from_millis(interval));
         let auth = auth.as_deref();
         // Adopt any higher-epoch decision a peer sentinel pushed us via SWITCH.
-        adopt_peer_switch(&view, &peers);
+        adopt_peer_switch(&view, &peers, &peer_secret);
         let (master, epoch) = {
             let v = view.lock().unwrap();
             (v.master.clone(), v.epoch)
@@ -160,7 +215,7 @@ pub fn run() -> io::Result<()> {
                     log::warn(
                         "sentinel: holding failover — replicas still reach the master (likely a local partition)",
                     );
-                } else if !sentinel_leader(&my_id, &peers) {
+                } else if !sentinel_leader(&my_id, &peers, &peer_secret) {
                     log::warn(
                         "sentinel: holding failover — no sentinel majority, or another sentinel leads",
                     );
@@ -169,7 +224,7 @@ pub fn run() -> io::Result<()> {
                     // reachable node + peer sentinel), so the promotion this
                     // failover issues supersedes any concurrent one, and data
                     // nodes reject stale REPLICAOFs against it.
-                    let new_epoch = next_epoch(epoch, &nodes, &peers, auth) + 1;
+                    let new_epoch = next_epoch(epoch, &nodes, &peers, &peer_secret, auth) + 1;
                     if let Some(new_master) = failover(&nodes, &master, new_epoch, auth) {
                         log::info(&format!(
                             "sentinel: +switch-master {master} -> {new_master} (epoch {new_epoch})"
@@ -183,7 +238,7 @@ pub fn run() -> io::Result<()> {
                         };
                         *view.lock().unwrap() = updated.clone();
                         persist_view(state_path.as_deref(), &updated);
-                        broadcast_switch(&peers, &updated);
+                        broadcast_switch(&peers, &peer_secret, &updated);
                         down_since = None;
                         master_down.store(false, Ordering::Relaxed);
                     }
@@ -218,7 +273,13 @@ fn derive_view(nodes: &[String], auth: Option<&str>, mut best: View) -> View {
 
 /// The epoch a new failover must exceed: the max across our view, every node's
 /// config epoch, and every peer sentinel's current epoch.
-fn next_epoch(mine: u64, nodes: &[String], peers: &[String], auth: Option<&str>) -> u64 {
+fn next_epoch(
+    mine: u64,
+    nodes: &[String],
+    peers: &[String],
+    secret: &str,
+    auth: Option<&str>,
+) -> u64 {
     let mut hi = mine;
     for n in nodes {
         if let Some(inf) = info(n, auth) {
@@ -230,7 +291,7 @@ fn next_epoch(mine: u64, nodes: &[String], peers: &[String], auth: Option<&str>)
         }
     }
     for p in peers {
-        if let Some((_, ep)) = peer_getmaster(p) {
+        if let Some((_, ep)) = peer_getmaster(p, secret) {
             hi = hi.max(ep);
         }
     }
@@ -239,9 +300,9 @@ fn next_epoch(mine: u64, nodes: &[String], peers: &[String], auth: Option<&str>)
 
 /// Pull any higher-epoch switch-master decision our peers hold into our view
 /// (so a sentinel that wasn't the failover leader still converges).
-fn adopt_peer_switch(view: &Arc<Mutex<View>>, peers: &[String]) {
+fn adopt_peer_switch(view: &Arc<Mutex<View>>, peers: &[String], secret: &str) {
     for p in peers {
-        if let Some((m, ep)) = peer_getmaster(p) {
+        if let Some((m, ep)) = peer_getmaster(p, secret) {
             let mut v = view.lock().unwrap();
             if ep > v.epoch {
                 log::info(&format!(
@@ -349,7 +410,7 @@ fn confirmed_down(nodes: &[String], master: &str, auth: Option<&str>, quorum: us
 /// see the master down AND this sentinel is the leader (lowest id among the
 /// down-seeing sentinels). Single-sentinel (no peers) → always true (replica
 /// corroboration alone governs).
-fn sentinel_leader(my_id: &str, peers: &[String]) -> bool {
+fn sentinel_leader(my_id: &str, peers: &[String], secret: &str) -> bool {
     if peers.is_empty() {
         return true;
     }
@@ -357,7 +418,7 @@ fn sentinel_leader(my_id: &str, peers: &[String]) -> bool {
     // peers answering "1".
     let mut down_seeing = vec![my_id.to_string()];
     for p in peers {
-        if peer_isdown(p) == Some(true) {
+        if peer_isdown(p, secret) == Some(true) {
             down_seeing.push(p.clone());
         }
     }
@@ -370,67 +431,99 @@ fn sentinel_leader(my_id: &str, peers: &[String]) -> bool {
     down_seeing.iter().min().map(|s| s.as_str()) == Some(my_id)
 }
 
+/// One peer request: `AUTH <secret>` then the verb, on the same connection, and
+/// read the single-line reply. Authentication is not a separate round-trip — both
+/// lines go out in one write and the peer answers once (or refuses with -NOAUTH).
+fn peer_call(peer: &str, secret: &str, verb: &str) -> io::Result<Vec<u8>> {
+    let mut s = connect(peer, None)?;
+    s.write_all(format!("AUTH {secret}\n{verb}\n").as_bytes())?;
+    read_line(&mut s)
+}
+
 /// Ask a peer sentinel whether it currently sees the master down. None = peer
-/// unreachable (so it can't count toward the majority).
-fn peer_isdown(peer: &str) -> Option<bool> {
-    let go = || -> io::Result<bool> {
-        let mut s = connect(peer, None)?;
-        s.write_all(b"ISDOWN\n")?;
-        Ok(read_line(&mut s)? == b"1")
-    };
-    go().ok()
+/// unreachable, or it refused us (so it can't count toward the majority).
+fn peer_isdown(peer: &str, secret: &str) -> Option<bool> {
+    Some(peer_call(peer, secret, "ISDOWN").ok()? == b"1")
 }
 
 /// Ask a peer sentinel for its current switch-master view: `(master, epoch)`.
-/// None = unreachable or no answer.
-fn peer_getmaster(peer: &str) -> Option<(String, u64)> {
-    let go = || -> io::Result<Option<(String, u64)>> {
-        let mut s = connect(peer, None)?;
-        s.write_all(b"GETMASTER\n")?;
-        let line = read_line(&mut s)?;
-        let text = String::from_utf8_lossy(&line);
-        Ok(text.rsplit_once(' ').and_then(|(m, e)| {
-            let ep = e.trim().parse::<u64>().ok()?;
-            (!m.is_empty()).then(|| (m.to_string(), ep))
-        }))
-    };
-    go().ok().flatten()
+/// None = unreachable, refused, or no answer.
+fn peer_getmaster(peer: &str, secret: &str) -> Option<(String, u64)> {
+    let line = peer_call(peer, secret, "GETMASTER").ok()?;
+    let text = String::from_utf8_lossy(&line);
+    text.rsplit_once(' ').and_then(|(m, e)| {
+        let ep = e.trim().parse::<u64>().ok()?;
+        (!m.is_empty()).then(|| (m.to_string(), ep))
+    })
 }
 
 /// Push our switch-master decision to every peer so they converge even if they
 /// weren't the failover leader (best-effort; adopt_peer_switch is the pull side
 /// that closes any gap on the next tick).
-fn broadcast_switch(peers: &[String], view: &View) {
+fn broadcast_switch(peers: &[String], secret: &str, view: &View) {
     for p in peers {
-        let go = || -> io::Result<()> {
-            let mut s = connect(p, None)?;
-            s.write_all(format!("SWITCH {} {}\n", view.master, view.epoch).as_bytes())?;
-            let _ = read_line(&mut s);
-            Ok(())
-        };
-        if go().is_err() {
+        let verb = format!("SWITCH {} {}", view.master, view.epoch);
+        if peer_call(p, secret, &verb).is_err() {
             log::warn(&format!(
-                "sentinel: SWITCH to peer {p} failed (unreachable)"
+                "sentinel: SWITCH to peer {p} failed (unreachable or refused)"
             ));
         }
     }
 }
 
+/// The address the peer listener binds. Loopback by default: a control plane that
+/// listens to the world is wrong even once it is authenticated, and a sentinel
+/// pair on one host (or inside one pod/tunnel) is the common case. Set
+/// `LOCUS_SENTINEL_PEER_BIND=0.0.0.0` deliberately to widen it.
+fn peer_bind() -> String {
+    peer_bind_from(std::env::var("LOCUS_SENTINEL_PEER_BIND").ok())
+}
+
+/// The env-free half of `peer_bind`, so the default is testable without
+/// mutating the process environment out from under the rest of the suite.
+fn peer_bind_from(configured: Option<String>) -> String {
+    configured
+        .map(|v| v.trim().to_string())
+        .filter(|v| !v.is_empty())
+        .unwrap_or_else(|| "127.0.0.1".to_string())
+}
+
 /// Serve peer queries on a line protocol: ISDOWN / PING (down-corroboration),
 /// GETMASTER (our current switch-master view), SWITCH (adopt a higher-epoch
 /// decision from the failover leader).
-fn serve_peers(port: &str, master_down: Arc<AtomicBool>, view: Arc<Mutex<View>>) {
-    let listener = match TcpListener::bind(format!("0.0.0.0:{port}")) {
+///
+/// **Every** verb is gated on a leading `AUTH <secret>` line, compared in
+/// constant time — not just SWITCH. GETMASTER hands out the topology and ISDOWN
+/// feeds another sentinel's failover decision, so all three are control plane.
+/// An unauthenticated connection gets `-NOAUTH` and is closed without the verb
+/// ever being read, so a stranger cannot even probe which verbs exist.
+fn serve_peers(
+    bind: &str,
+    port: &str,
+    secret: &str,
+    master_down: Arc<AtomicBool>,
+    view: Arc<Mutex<View>>,
+) {
+    let listener = match TcpListener::bind(format!("{bind}:{port}")) {
         Ok(l) => l,
         Err(e) => return log::error(&format!("sentinel: peer listener bind failed: {e}")),
     };
-    log::info(&format!("sentinel: peer agreement listening on :{port}"));
+    log::info(&format!(
+        "sentinel: peer agreement listening on {bind}:{port} (authenticated)"
+    ));
     for stream in listener.incoming().flatten() {
         let flag = master_down.clone();
         let view = view.clone();
+        let secret = secret.to_string();
         thread::spawn(move || {
             let mut s = stream;
             let _ = s.set_read_timeout(Some(IO_TIMEOUT));
+            let Ok(auth) = read_line(&mut s) else { return };
+            let offered = auth.strip_prefix(b"AUTH ".as_slice()).unwrap_or(b"");
+            if !crate::ct_eq(offered, secret.as_bytes()) {
+                let _ = s.write_all(b"-NOAUTH\n");
+                return;
+            }
             let Ok(line) = read_line(&mut s) else { return };
             let reply: Vec<u8> = if line == b"ISDOWN" {
                 if flag.load(Ordering::Relaxed) {
@@ -630,6 +723,16 @@ mod tests {
         assert_eq!(field(body, "master_port").as_deref(), Some("6379"));
         assert_eq!(field(body, "master_repl_offset").as_deref(), Some("42"));
         assert_eq!(field(body, "absent"), None);
+    }
+
+    #[test]
+    fn peer_listener_binds_loopback_unless_told_otherwise() {
+        // The control plane accepts SWITCH, which repoints replication — so the
+        // default must not be reachable from off-host.
+        assert_eq!(peer_bind_from(None), "127.0.0.1");
+        assert_eq!(peer_bind_from(Some("  ".to_string())), "127.0.0.1");
+        assert_eq!(peer_bind_from(Some(" 0.0.0.0 ".to_string())), "0.0.0.0");
+        assert_eq!(peer_bind_from(Some("10.0.0.4".to_string())), "10.0.0.4");
     }
 
     #[test]

@@ -1241,8 +1241,22 @@ fn disk_tier_survives_kill9_with_aof_and_rewrite() {
     c.cmd(&["SET", "cold", &big]);
     assert_eq!(c.cmd(&["TIER", "cold"]), "1");
     // Rewrite folds the stub as a TIERREF (a local value-log reference).
-    c.cmd(&["BGREWRITEAOF"]);
-    sleep(Duration::from_millis(300));
+    assert_eq!(
+        c.cmd(&["BGREWRITEAOF"]),
+        "Background append only file rewriting started"
+    );
+    // Poll the actual condition instead of sleeping a fixed 300 ms: the old
+    // sleep held on an idle machine and lost the race under load (measured 8 red
+    // in 24 with eight suites running at once), because the rewrite thread was
+    // still serializing when the SET below — and then the kill — arrived.
+    // `aof_rewrite_in_progress` drops to 0 only after the hub has folded the
+    // buffered tail in and swapped the new file into place.
+    wait_info(
+        &mut c,
+        "aof_rewrite_in_progress",
+        "0",
+        "AOF rewrite never finished",
+    );
     c.cmd(&["SET", "after", "rewrite"]);
 
     s.child.kill().unwrap(); // ungraceful — AOF replay must rebuild everything
@@ -1929,6 +1943,77 @@ fn acl_never_gates_the_handshake_verbs() {
     // QUIT closes the connection rather than being refused (`try_cmd` keeps
     // the RESP tag and tolerates the hang-up that follows).
     assert_eq!(e.try_cmd(&["QUIT"]).as_deref(), Some("+OK"));
+}
+
+/// S2b-2.3 — `HELLO <proto> AUTH <user> <pass>` authenticates *named* users.
+/// The HELLO clause was a second, narrower copy of AUTH that only ever accepted
+/// `default`, so a valid named pair came back `-WRONGPASS`: a least-privilege
+/// user could complete a handshake (S1b-1.2) but could not authenticate through
+/// one, which is how every modern driver connects. Both verbs now share one path.
+#[test]
+fn hello_authenticates_a_named_user() {
+    let s = Server::start_inner(&[("LOCUS_REQUIREPASS", "masterpw")]);
+    let mut admin = s.connect();
+    assert_eq!(admin.cmd(&["AUTH", "masterpw"]), "OK");
+    assert_eq!(
+        admin.cmd(&["ACL", "SETUSER", "eve", "on", ">evepw", "+@read", "~app:"]),
+        "OK"
+    );
+    admin.cmd(&["SET", "app:k", "v"]);
+    admin.cmd(&["SET", "other", "v"]);
+
+    // The handshake authenticates AND binds the identity — one round-trip.
+    let mut e = s.connect();
+    let reply = e.cmd(&["HELLO", "3", "AUTH", "eve", "evepw"]);
+    assert!(reply.contains("proto"), "expected HELLO map, got {reply}");
+    // It is `eve` that got bound, not `default`: eve's scope still bites.
+    assert_eq!(e.cmd(&["GET", "app:k"]), "v");
+    assert!(e.cmd(&["GET", "other"]).starts_with("-NOPERM"));
+    assert!(e.cmd(&["SET", "app:k", "x"]).starts_with("-NOPERM"));
+
+    // A wrong password for a real user, and any password for a user that does
+    // not exist, are the same indistinguishable refusal — and do not upgrade.
+    let mut w = s.connect();
+    assert!(
+        w.cmd(&["HELLO", "3", "AUTH", "eve", "nope"])
+            .starts_with("-WRONGPASS"),
+        "a wrong password must not authenticate"
+    );
+    assert!(w.cmd(&["HELLO", "3"]).starts_with("-NOAUTH"));
+    let mut g = s.connect();
+    assert!(
+        g.cmd(&["HELLO", "3", "AUTH", "ghost", "evepw"])
+            .starts_with("-WRONGPASS")
+    );
+
+    // `HELLO … AUTH default <requirepass>` still works, unchanged.
+    let mut d = s.connect();
+    assert!(
+        d.cmd(&["HELLO", "3", "AUTH", "default", "masterpw"])
+            .contains("proto")
+    );
+    assert_eq!(d.cmd(&["GET", "other"]), "v");
+}
+
+/// The same, with no `requirepass` at all: a named ACL user must still be able
+/// to authenticate through the handshake (the old code hard-failed here with
+/// "no password is set" before it ever looked at the ACL table).
+#[test]
+fn hello_authenticates_a_named_user_without_requirepass() {
+    let s = Server::start();
+    let mut admin = s.connect();
+    assert_eq!(
+        admin.cmd(&["ACL", "SETUSER", "eve", "on", ">evepw", "+@read", "~app:"]),
+        "OK"
+    );
+    admin.cmd(&["SET", "app:k", "v"]);
+    let mut e = s.connect();
+    assert!(
+        e.cmd(&["HELLO", "3", "AUTH", "eve", "evepw"])
+            .contains("proto")
+    );
+    assert_eq!(e.cmd(&["GET", "app:k"]), "v");
+    assert!(e.cmd(&["GET", "nope:k"]).starts_with("-NOPERM"));
 }
 
 #[test]
@@ -2773,6 +2858,159 @@ fn free_port() -> u16 {
     panic!("no free port in {}..{}", BASE, BASE + SPAN);
 }
 
+/// Send one authenticated (or deliberately unauthenticated) peer-plane request
+/// and return the single-line reply. `secret = None` sends the bare verb, which
+/// is exactly what the pre-fix exploit did.
+fn peer_request(port: u16, secret: Option<&str>, verb: &str) -> String {
+    let addr = format!("127.0.0.1:{port}");
+    let mut s = TcpStream::connect(&addr).expect("connect to peer plane");
+    s.set_read_timeout(Some(Duration::from_secs(2))).unwrap();
+    let mut out = String::new();
+    if let Some(sec) = secret {
+        out.push_str(&format!("AUTH {sec}\n"));
+    }
+    out.push_str(verb);
+    out.push('\n');
+    s.write_all(out.as_bytes()).unwrap();
+    let mut reply = String::new();
+    let _ = BufReader::new(s).read_line(&mut reply);
+    reply.trim_end().to_string()
+}
+
+/// Wait for the sentinel's peer listener to come up on loopback.
+fn await_peer_plane(port: u16, secret: &str) {
+    let deadline = Instant::now() + Duration::from_secs(10);
+    loop {
+        if let Ok(mut s) = TcpStream::connect(("127.0.0.1", port)) {
+            let _ = s.set_read_timeout(Some(Duration::from_secs(2)));
+            let _ = s.write_all(format!("AUTH {secret}\nPING\n").as_bytes());
+            let mut reply = String::new();
+            let _ = BufReader::new(s).read_line(&mut reply);
+            if reply.trim_end() == "PONG" {
+                return;
+            }
+        }
+        assert!(Instant::now() < deadline, "peer plane never came up");
+        sleep(Duration::from_millis(100));
+    }
+}
+
+/// This machine's first non-loopback IPv4 address, if it has one. Found without
+/// sending a packet: a connected UDP socket only picks a route.
+fn lan_ip() -> Option<std::net::IpAddr> {
+    let s = std::net::UdpSocket::bind("0.0.0.0:0").ok()?;
+    s.connect("8.8.8.8:80").ok()?;
+    let ip = s.local_addr().ok()?.ip();
+    (!ip.is_loopback()).then_some(ip)
+}
+
+/// S2b-1 — the peer control plane is authenticated, and it is not the world's.
+///
+/// Before this fix `serve_peers` bound `0.0.0.0` and took every verb from any
+/// client with no credential at all, so one TCP line —
+/// `SWITCH attacker:6379 999999999` — repointed the whole cluster's replication
+/// at a machine the attacker owned. Every verb is gated now, not just SWITCH:
+/// GETMASTER hands out the topology and ISDOWN feeds a peer's failover decision.
+#[test]
+fn sentinel_peer_plane_refuses_unauthenticated_control() {
+    let master = Server::start();
+    let mport = master.port;
+    let sport = free_port();
+    const SECRET: &str = "peer-s3cr3t";
+    let mut sentinel = Command::new(env!("CARGO_BIN_EXE_locus"))
+        .env("LOCUS_SENTINEL", format!("127.0.0.1:{mport}"))
+        .env("LOCUS_SENTINEL_PORT", sport.to_string())
+        .env("LOCUS_SENTINEL_PEER_SECRET", SECRET)
+        // Long enough that nothing fails over underneath the assertions.
+        .env("LOCUS_SENTINEL_DOWN_AFTER_MS", "600000")
+        .env("LOCUS_SENTINEL_INTERVAL_MS", "200")
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .expect("spawn sentinel");
+    await_peer_plane(sport, SECRET);
+
+    let real_master = format!("127.0.0.1:{mport}");
+    let view_before = peer_request(sport, Some(SECRET), "GETMASTER");
+    assert!(
+        view_before.starts_with(&real_master),
+        "sentinel should be monitoring {real_master}, view is {view_before}"
+    );
+
+    // The exploit, verbatim: a bare SWITCH from an unauthenticated stranger.
+    assert_eq!(
+        peer_request(sport, None, "SWITCH 127.0.0.1:1 999999999"),
+        "-NOAUTH"
+    );
+    // A wrong secret is refused the same way.
+    assert_eq!(
+        peer_request(sport, Some("wrong"), "SWITCH 127.0.0.1:1 999999999"),
+        "-NOAUTH"
+    );
+    // Every other verb is gated too, not just the dangerous one.
+    for verb in ["GETMASTER", "ISDOWN", "PING"] {
+        assert_eq!(peer_request(sport, None, verb), "-NOAUTH", "{verb} ungated");
+    }
+    // ...and the view is exactly what it was: nothing was adopted.
+    assert_eq!(peer_request(sport, Some(SECRET), "GETMASTER"), view_before);
+
+    // The legitimate path still works: an authenticated SWITCH at a higher epoch
+    // is adopted (127.0.0.1:1 is a dead address, so nothing is repointed).
+    assert_eq!(
+        peer_request(sport, Some(SECRET), "SWITCH 127.0.0.1:1 999999999"),
+        "OK"
+    );
+    assert_eq!(
+        peer_request(sport, Some(SECRET), "GETMASTER"),
+        "127.0.0.1:1 999999999"
+    );
+
+    // The listener is loopback-only by default, so the plane is not exposed to
+    // the network at all unless an operator opts in. (Skipped on a host with no
+    // routable address.)
+    if let Some(ip) = lan_ip() {
+        let off_host = TcpStream::connect_timeout(
+            &std::net::SocketAddr::new(ip, sport),
+            Duration::from_secs(2),
+        );
+        assert!(
+            off_host.is_err(),
+            "peer plane answered on {ip}:{sport} — the default bind is not loopback"
+        );
+    }
+
+    let _ = sentinel.kill();
+    let _ = sentinel.wait();
+}
+
+/// S2b-1 — the peer plane fails *closed*: configured but unsecured is a startup
+/// error, not a quietly-open port. Same stance the ACL took in phase 1.
+#[test]
+fn sentinel_refuses_to_start_without_a_peer_secret() {
+    for (var, val) in [
+        ("LOCUS_SENTINEL_PEERS", format!("127.0.0.1:{}", free_port())),
+        ("LOCUS_SENTINEL_PORT", free_port().to_string()),
+    ] {
+        let out = Command::new(env!("CARGO_BIN_EXE_locus"))
+            .env("LOCUS_SENTINEL", "127.0.0.1:1")
+            .env(var, &val)
+            .env_remove("LOCUS_SENTINEL_PEER_SECRET")
+            .stdout(Stdio::null())
+            .stderr(Stdio::piped())
+            .output()
+            .expect("spawn sentinel");
+        assert!(
+            !out.status.success(),
+            "{var} without a secret must refuse to start"
+        );
+        let err = String::from_utf8_lossy(&out.stderr);
+        assert!(
+            err.contains("LOCUS_SENTINEL_PEER_SECRET"),
+            "the error must name the missing variable; stderr was:\n{err}"
+        );
+    }
+}
+
 #[test]
 fn two_sentinels_agree_and_promote_exactly_once() {
     let master = Server::start();
@@ -2798,6 +3036,7 @@ fn two_sentinels_agree_and_promote_exactly_once() {
             )
             .env("LOCUS_SENTINEL_PORT", my.to_string())
             .env("LOCUS_SENTINEL_PEERS", format!("127.0.0.1:{peer}"))
+            .env("LOCUS_SENTINEL_PEER_SECRET", "peer-secret")
             .env("LOCUS_SENTINEL_DOWN_AFTER_MS", "700")
             .env("LOCUS_SENTINEL_INTERVAL_MS", "200")
             .stdout(Stdio::null())
@@ -2810,8 +3049,10 @@ fn two_sentinels_agree_and_promote_exactly_once() {
 
     drop(master); // kill the master
 
-    // Exactly one replica is promoted — never both (no split-brain), even though
-    // two sentinels race. The follower is repointed and resyncs.
+    // Exactly one replica is promoted — never both — even though two sentinels
+    // race. The follower is repointed and resyncs. (This proves the leader rule on
+    // a *healthy* network; it is not a partition-safety claim — see the failover
+    // guarantees in docs/DEPLOYMENT.md.)
     let deadline = Instant::now() + Duration::from_secs(14);
     let (newm, follower) = loop {
         let m1 = role(&mut r1.connect()) == "master";
