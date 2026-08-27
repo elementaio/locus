@@ -8,6 +8,7 @@
 *.aof
 
 # Backups / editor / OS cruft
+erl_crash.dump
 **/*.rs.bk
 *.swp
 .DS_Store

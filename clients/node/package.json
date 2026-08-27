@@ -6,7 +6,7 @@
   "license": "MIT",
   "repository": {
     "type": "git",
-    "url": "https://github.com/intenttext/locus",
+    "url": "https://github.com/elementaio/locus",
     "directory": "clients/node"
   },
   "main": "dist/index.js",
