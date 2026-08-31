@@ -147,6 +147,14 @@ enum Msg {
     /// A peer's gossiped slot topology, as (start, end, owner, epoch) runs — the
     /// gossip thread fetched it off-hub; the hub adopts higher-epoch entries.
     ClusterGossip(Vec<(u16, u16, String, u64)>),
+    /// An async BGSAVE finished its off-thread write+fsync. `dirty` is the
+    /// change count the save was supposed to cover: on failure the hub adds it
+    /// back, so a save point that could not be honoured stays owed instead of
+    /// being silently forgotten.
+    BgSaveDone {
+        ok: bool,
+        dirty: u64,
+    },
 }
 
 /// Set by the SIGTERM/SIGINT handler so the hub can persist and exit cleanly.
@@ -408,6 +416,64 @@ fn boot_master() -> Option<(String, String)> {
 /// A data file that failed to load is EVIDENCE — move it aside (timestamped)
 /// instead of starting empty over it, where the next SAVE/append would destroy
 /// a possibly-recoverable original.
+/// Redis's own default cadence, and ours: a snapshot after 1 change in an hour,
+/// 100 in five minutes, or 10,000 in a minute. Before 0.8.0 there was no
+/// automatic cadence at all — with the AOF off, a crash lost everything written
+/// since the operator last typed `SAVE`. Set `LOCUS_SAVE=""` (or `no`) to turn
+/// it off and go back to manual-only snapshots.
+const DEFAULT_SAVE: &str = "3600 1 300 100 60 10000";
+
+/// Parse a `LOCUS_SAVE` spec — whitespace-separated `<seconds> <changes>` pairs,
+/// exactly Redis's `save` config — into save points.
+///
+/// Anything unparseable is dropped with a warning rather than silently ignored
+/// or fatal: a typo in a cadence should be loud, but it must not stop a database
+/// from starting. An empty spec (or `no`/`off`/`""`) disables automatic saves.
+fn parse_save_points(spec: &str) -> Vec<(u64, u64)> {
+    let spec = spec.trim();
+    if spec.is_empty()
+        || matches!(
+            spec.to_ascii_lowercase().as_str(),
+            "no" | "off" | "0" | "\"\""
+        )
+    {
+        return Vec::new();
+    }
+    let fields: Vec<&str> = spec.split_whitespace().collect();
+    if !fields.len().is_multiple_of(2) {
+        log::warn(&format!(
+            "LOCUS_SAVE=\"{spec}\" has an odd number of fields (want `<seconds> <changes>` pairs) — ignoring the last one"
+        ));
+    }
+    let mut points = Vec::new();
+    for pair in fields.chunks_exact(2) {
+        match (pair[0].parse::<u64>(), pair[1].parse::<u64>()) {
+            (Ok(secs), Ok(changes)) if changes > 0 => points.push((secs, changes)),
+            _ => log::warn(&format!(
+                "LOCUS_SAVE: ignoring unparseable save point \"{} {}\"",
+                pair[0], pair[1]
+            )),
+        }
+    }
+    points
+}
+
+/// A snapshot whose checksum does not match is refused, and the process stops.
+///
+/// The alternative — quarantine it and start empty, which is what every other
+/// RDB load failure does — is wrong for *this* failure: the file was complete
+/// when we wrote it, so a mismatch is proven damage to real data. Starting empty
+/// would serve an empty keyspace to clients that would then write into it, and
+/// the next save point would put a snapshot of that emptiness where the damaged
+/// one had been. The AOF path already refuses to start on mid-file corruption
+/// for the same reason; this makes the two consistent.
+fn refuse_corrupt_rdb(path: &str, e: &std::io::Error) -> ! {
+    log::error(&format!(
+        "refusing to start: {e}. {path} was written whole and has been damaged since — restore a backup, or move the file aside to start from an empty keyspace."
+    ));
+    std::process::exit(1);
+}
+
 fn quarantine_corrupt_file(path: &str, why: &str) {
     let aside = format!("{path}.corrupt.{}", now_ms());
     match std::fs::rename(path, &aside) {
@@ -804,6 +870,22 @@ struct Hub {
     cluster_auth_secret: Option<Vec<u8>>,
     // true while a background save's write+fsync is running off the hub thread.
     bgsave_in_progress: Arc<AtomicBool>,
+    // Automatic snapshot cadence: (seconds, changes) pairs, Redis's `save`.
+    // A BGSAVE fires as soon as ANY pair is satisfied — at least `changes`
+    // modifications AND at least `seconds` since the last save. Empty = off.
+    save_points: Vec<(u64, u64)>,
+    // Modifications since the last save started (Redis's `server.dirty`): one
+    // per write command that actually changed the dataset, plus one per
+    // expiry/eviction DEL. What the save points count.
+    dirty_since_save: u64,
+    last_save_ms: u64,
+    // Did the last background save succeed? INFO `rdb_last_bgsave_status`,
+    // which used to be the string "ok" no matter what had happened.
+    last_bgsave_ok: bool,
+    // How long the last BGSAVE held the hub to serialize (see the note on
+    // `start_bgsave`). Exposed as INFO `rdb_last_bgsave_hub_stall_us` so the
+    // stall is a number an operator can alert on, not a surprise.
+    last_bgsave_stall_us: u64,
     // observability: process start (uptime) + a cheap command counter for INFO.
     start: Instant,
     commands_processed: u64,
@@ -949,17 +1031,38 @@ impl Hub {
                     .ok();
                 // CDC/index state lives in the RDB trailer even in AOF mode
                 // (SAVE/BGSAVE write it); the keyspace itself comes from the AOF.
-                let extras = rdb::load_with_extras(&rdb::configured_path())
-                    .map(|(_, x)| x)
-                    .unwrap_or_default();
+                // The keyspace comes from the AOF, but the changefeed log,
+                // consumer cursors and index definitions live in the RDB
+                // trailer. Silently defaulting those away on a DAMAGED file
+                // would lose the feed's history without a word.
+                let rdb_path = rdb::configured_path();
+                let extras = match rdb::load_with_extras(&rdb_path) {
+                    Ok((_, x)) => x,
+                    Err(e) if rdb::is_checksum_error(&e) => refuse_corrupt_rdb(&rdb_path, &e),
+                    Err(e) => {
+                        log::warn(&format!(
+                            "RDB trailer unreadable ({e}) — starting with empty changefeed/index state"
+                        ));
+                        rdb::Extras::default()
+                    }
+                };
                 (db, aof, extras)
             }
             None => {
                 let p = rdb::configured_path();
-                let (db, extras) = rdb::load_with_extras(&p).unwrap_or_else(|e| {
-                    quarantine_corrupt_file(&p, &format!("RDB load failed: {e}"));
-                    (Db::new(), rdb::Extras::default())
-                });
+                let (db, extras) = match rdb::load_with_extras(&p) {
+                    Ok(loaded) => loaded,
+                    // A checksum mismatch is not ambiguous: snapshots are
+                    // written temp -> fsync -> rename, so one is never torn.
+                    // The file was whole when we wrote it and is damaged now.
+                    Err(e) if rdb::is_checksum_error(&e) => refuse_corrupt_rdb(&p, &e),
+                    // Anything else could be a foreign or pre-Locus file:
+                    // quarantine it and start empty, as before.
+                    Err(e) => {
+                        quarantine_corrupt_file(&p, &format!("RDB load failed: {e}"));
+                        (Db::new(), rdb::Extras::default())
+                    }
+                };
                 (db, None, extras)
             }
         };
@@ -1042,6 +1145,13 @@ impl Hub {
                 .map(String::into_bytes)
                 .filter(|p| !p.is_empty()),
             bgsave_in_progress: Arc::new(AtomicBool::new(false)),
+            save_points: parse_save_points(
+                &std::env::var("LOCUS_SAVE").unwrap_or_else(|_| DEFAULT_SAVE.into()),
+            ),
+            dirty_since_save: 0,
+            last_save_ms: now_ms(),
+            last_bgsave_ok: true,
+            last_bgsave_stall_us: 0,
             start: Instant::now(),
             commands_processed: 0,
             panics_recovered: 0,
@@ -1259,6 +1369,94 @@ impl Hub {
         Ok(())
     }
 
+    /// Start an asynchronous snapshot. Shared by the `BGSAVE` command and the
+    /// automatic save points.
+    ///
+    /// **The serialization runs on the hub** — deliberately, and it is the one
+    /// stall this design has not removed. It buys a consistent point-in-time
+    /// image without `fork()`: Locus runs 2N+ threads, and a forked child that
+    /// allocates can deadlock on an allocator lock held by a thread that did not
+    /// come across the fork. That hazard does not exist for single-threaded
+    /// Redis and it is not one to accept here. Only the write+fsync is
+    /// off-thread, which is what makes the "started" reply truthful.
+    ///
+    /// So the stall is measured and published (`rdb_last_bgsave_hub_stall_us`),
+    /// and the documented answer for a dataset large enough to care is to take
+    /// snapshots on a replica — see `docs/DEPLOYMENT.md`.
+    fn start_bgsave(&mut self) -> Result<(), &'static str> {
+        if self.bgsave_in_progress.load(Ordering::Relaxed) {
+            return Err("ERR Background save already in progress");
+        }
+        let t0 = Instant::now();
+        let mut bytes = rdb::serialize(&self.db);
+        rdb::append_extras(&mut bytes, &self.build_extras());
+        self.last_bgsave_stall_us = t0.elapsed().as_micros() as u64;
+        let path = rdb::configured_path();
+        let flag = self.bgsave_in_progress.clone();
+        let tx = self.tx.clone();
+        let dirty = self.dirty_since_save;
+        flag.store(true, Ordering::Relaxed);
+        let spawned = thread::Builder::new().spawn(move || {
+            let ok = match rdb::write_snapshot(&bytes, &path) {
+                Ok(()) => {
+                    log::info("background save complete");
+                    true
+                }
+                Err(e) => {
+                    log::error(&format!("background save failed: {e}"));
+                    false
+                }
+            };
+            flag.store(false, Ordering::Relaxed);
+            let _ = tx.send(Msg::BgSaveDone { ok, dirty });
+        });
+        if spawned.is_err() {
+            self.bgsave_in_progress.store(false, Ordering::Relaxed);
+            self.last_bgsave_ok = false;
+            return Err("ERR background save thread spawn failed");
+        }
+        // Cleared at START, and added back by `Msg::BgSaveDone` if the save
+        // fails — so a failed snapshot leaves the changes still owed.
+        self.dirty_since_save = 0;
+        self.last_save_ms = now_ms();
+        Ok(())
+    }
+
+    /// Fire a save point if one is due. Called from the maintenance tick.
+    ///
+    /// A point is due when BOTH its thresholds are met: at least `changes`
+    /// modifications, and at least `seconds` since the last save started. The
+    /// pairs are alternatives — "3600 1 300 100 60 10000" means an idle database
+    /// still gets an hourly snapshot, while a busy one gets a minutely one.
+    fn maybe_autosave(&mut self) {
+        if self.save_points.is_empty()
+            || self.dirty_since_save == 0
+            || self.bgsave_in_progress.load(Ordering::Relaxed)
+        {
+            return;
+        }
+        let elapsed_ms = now_ms().saturating_sub(self.last_save_ms);
+        let changes = self.dirty_since_save;
+        let due = self
+            .save_points
+            .iter()
+            .find(|&&(secs, threshold)| changes >= threshold && elapsed_ms >= secs * 1000);
+        if let Some(&(secs, threshold)) = due {
+            log::info(&format!(
+                "save point reached ({changes} changes in {}s >= {threshold} in {secs}s) — starting a background save",
+                elapsed_ms / 1000
+            ));
+            if let Err(e) = self.start_bgsave() {
+                log::warn(&format!("automatic save skipped: {e}"));
+            }
+        }
+    }
+
+    /// Count one dataset modification toward the save points.
+    fn note_change(&mut self) {
+        self.dirty_since_save = self.dirty_since_save.saturating_add(1);
+    }
+
     /// True when the AOF is enabled but has a hole (a failed append/fsync) —
     /// its on-disk history is incomplete until a rewrite replaces it.
     fn aof_unhealthy(&self) -> bool {
@@ -1420,7 +1618,14 @@ impl Hub {
                 if self.aof.is_some() { "yes" } else { "no" }.to_string(),
             ),
             ("appendfsync", appendfsync),
-            ("save", String::new()),
+            (
+                "save",
+                self.save_points
+                    .iter()
+                    .map(|(secs, changes)| format!("{secs} {changes}"))
+                    .collect::<Vec<_>>()
+                    .join(" "),
+            ),
             (
                 "maxclients",
                 std::env::var("LOCUS_MAXCLIENTS").unwrap_or_else(|_| "10000".into()),
@@ -2238,6 +2443,12 @@ impl Hub {
                             Some(tokens[3].clone())
                         };
                     }
+                    b"save" => {
+                        // Retune the snapshot cadence without a restart, Redis's
+                        // `CONFIG SET save "900 1"`. An empty value turns
+                        // automatic snapshots off.
+                        self.save_points = parse_save_points(&String::from_utf8_lossy(&tokens[3]));
+                    }
                     // Accept (and no-op) other known params so clients don't error.
                     _ => {}
                 }
@@ -2439,9 +2650,24 @@ impl Hub {
                 id,
                 resp::error("ERR DEBUG PANIC is only available in a debug build"),
             ),
+            // Fault injection for the AOF durability contract: the next fsync
+            // (and every one after, until turned off) fails as a full disk
+            // would. Debug builds only, exactly like DEBUG PANIC — this must
+            // not be reachable on a production binary.
+            Some(b"AOFFSYNCFAIL") if cfg!(debug_assertions) && tokens.len() == 3 => {
+                let on = !matches!(tokens[2].as_slice(), b"0" | b"no" | b"off");
+                aof::set_fsync_fault(on);
+                self.send(id, resp::simple_string("OK"));
+            }
+            Some(b"AOFFSYNCFAIL") if !cfg!(debug_assertions) => self.send(
+                id,
+                resp::error("ERR DEBUG AOFFSYNCFAIL is only available in a debug build"),
+            ),
             Some(b"HELP") => self.send(
                 id,
-                resp::simple_string("DEBUG PANIC (debug builds only) | DEBUG HELP"),
+                resp::simple_string(
+                    "DEBUG PANIC (debug builds only) | DEBUG AOFFSYNCFAIL <0|1> (debug builds only) | DEBUG HELP",
+                ),
             ),
             _ => self.send(
                 id,
@@ -2611,7 +2837,34 @@ impl Hub {
             "aof_last_write_status:{}\r\n",
             if self.aof_unhealthy() { "err" } else { "ok" }
         ));
-        s.push_str("rdb_last_bgsave_status:ok\r\n");
+        s.push_str(&format!(
+            "rdb_last_bgsave_status:{}\r\n",
+            if self.last_bgsave_ok { "ok" } else { "err" }
+        ));
+        s.push_str(&format!(
+            "rdb_changes_since_last_save:{}\r\n",
+            self.dirty_since_save
+        ));
+        s.push_str(&format!(
+            "rdb_last_save_time:{}\r\n",
+            self.last_save_ms / 1000
+        ));
+        // How long the last BGSAVE held the hub to serialize a consistent image
+        // (the write+fsync is off-thread; this is not). Linear in dataset size,
+        // and while it runs NO client is served. If this number matters to you,
+        // snapshot on a replica — docs/DEPLOYMENT.md "Backing up from a replica".
+        s.push_str(&format!(
+            "rdb_last_bgsave_hub_stall_us:{}\r\n",
+            self.last_bgsave_stall_us
+        ));
+        s.push_str(&format!(
+            "rdb_save_points:{}\r\n",
+            self.save_points
+                .iter()
+                .map(|(secs, changes)| format!("{secs} {changes}"))
+                .collect::<Vec<_>>()
+                .join(" ")
+        ));
         let (tier_on, tier_segs, tier_bytes, tier_keys, tier_lost) = self.db.tier_stats();
         s.push_str(&format!(
             "tier_enabled:{}\r\ntier_segments:{tier_segs}\r\ntier_log_bytes:{tier_bytes}\r\ntier_keys:{tier_keys}\r\ntier_lost:{tier_lost}\r\n",
@@ -3093,33 +3346,27 @@ impl Hub {
                 } else {
                     let extras = self.build_extras();
                     match rdb::save_with_extras(&self.db, &extras, &rdb::configured_path()) {
-                        Ok(()) => resp::simple_string("OK"),
+                        Ok(()) => {
+                            // The dataset is on disk: the save points start
+                            // counting again from here, exactly as after a
+                            // BGSAVE. Without this a manual SAVE left the
+                            // counter high and the next save point fired
+                            // immediately for nothing.
+                            self.dirty_since_save = 0;
+                            self.last_save_ms = now_ms();
+                            resp::simple_string("OK")
+                        }
                         Err(e) => resp::error(&format!("ERR {e}")),
                     }
                 };
                 self.send(id, reply);
             }
             b"BGSAVE" => {
-                if self.bgsave_in_progress.load(Ordering::Relaxed) {
-                    self.send(id, resp::error("ERR Background save already in progress"));
-                } else {
-                    // Serialize on the hub (a consistent point-in-time snapshot),
-                    // then write + fsync off-thread so the disk I/O doesn't stall
-                    // the command loop. This makes the "started" reply truthful.
-                    let mut bytes = rdb::serialize(&self.db);
-                    rdb::append_extras(&mut bytes, &self.build_extras());
-                    let path = rdb::configured_path();
-                    let flag = self.bgsave_in_progress.clone();
-                    flag.store(true, Ordering::Relaxed);
-                    thread::spawn(move || {
-                        match rdb::write_snapshot(&bytes, &path) {
-                            Ok(()) => log::info("background save complete"),
-                            Err(e) => log::error(&format!("background save failed: {e}")),
-                        }
-                        flag.store(false, Ordering::Relaxed);
-                    });
-                    self.send(id, resp::simple_string("Background saving started"));
-                }
+                let reply = match self.start_bgsave() {
+                    Ok(()) => resp::simple_string("Background saving started"),
+                    Err(e) => resp::error(e),
+                };
+                self.send(id, reply);
             }
             b"SHUTDOWN" => {
                 let nosave = tokens
@@ -4199,8 +4446,10 @@ impl Hub {
             return resp::error("OOM command not allowed when used memory > 'maxmemory'.");
         }
         let proto = self.protos.get(&id).copied().unwrap_or(2);
-        let reply = execute_proto(&tokens, &mut self.db, proto);
+        let mut reply = execute_proto(&tokens, &mut self.db, proto);
         let errored = reply.first() == Some(&b'-');
+        // Set below if this write could not be logged; it replaces the reply.
+        let mut aof_err: Option<String> = None;
         // FLUSHDB/FLUSHALL clears every key: dirty the watchers and feed the
         // changefeed as `del`s HERE, so the generic expired-key drain below
         // doesn't misreport the wipe as per-key `expire`s — and don't stream
@@ -4241,12 +4490,25 @@ impl Hub {
             // dataset. A no-op write (e.g. DEL of a missing key) is not logged,
             // not replicated, and does not dirty a WATCHer.
             if write_modified(&cmd, &reply) {
+                self.note_change(); // toward the save points (3.1)
                 for key in write_keys(&tokens) {
                     self.dirty_watchers(key);
                 }
                 let entries = aof::entries_for(&tokens, &reply, &mut self.db);
-                if let Some(a) = self.aof.as_mut() {
-                    let _ = a.append(&entries);
+                if let Some(a) = self.aof.as_mut()
+                    && let Err(e) = a.append(&entries)
+                {
+                    // The write is applied in memory but is NOT in the log — and
+                    // until 0.8.0 the client was told `+OK` anyway, with only the
+                    // NEXT write refused by the health gate. Tell the client that
+                    // issued it. Under `appendfsync=always` this is the whole
+                    // point of the policy (the ack is supposed to mean "synced");
+                    // under the others it is the same honesty as the gate that
+                    // rejects everything after it. The master's replicated stream
+                    // is exempt: a replica must apply it or diverge.
+                    if id != MASTER_ID && (a.acks_after_fsync() || self.aof_stop_on_error) {
+                        aof_err = Some(e.to_string());
+                    }
                 }
                 // Mirror into the rewrite buffer so an in-flight BGREWRITEAOF
                 // doesn't lose writes made while its base image is being written.
@@ -4269,6 +4531,11 @@ impl Hub {
         // A watched key removed by passive expiry during this command must also
         // abort its transaction.
         self.dirty_expired_watchers();
+        if let Some(e) = aof_err {
+            reply = resp::error(&format!(
+                "MISCONF Errors writing to the append-only file: {e}. The write was applied in memory but is NOT durable"
+            ));
+        }
         reply
     }
 
@@ -4339,7 +4606,12 @@ impl Hub {
     }
 
     /// Append one command to the AOF and stream it to every replica.
+    ///
+    /// This is the *other* way the dataset changes — an expiry DEL, an eviction,
+    /// a migrated key — so it counts toward the save points too. A database
+    /// whose only activity is keys expiring still owes a snapshot.
     fn propagate(&mut self, tokens: &[Vec<u8>]) {
+        self.note_change();
         let batch = vec![tokens.to_vec()];
         if let Some(a) = self.aof.as_mut() {
             let _ = a.append(&batch);
@@ -5002,6 +5274,16 @@ fn run_hub(rx: mpsc::Receiver<Msg>, tx: mpsc::SyncSender<Msg>) {
                 }
             }
             Ok(Msg::ClusterGossip(ranges)) => hub.merge_gossip(ranges),
+            Ok(Msg::BgSaveDone { ok, dirty }) => {
+                hub.last_bgsave_ok = ok;
+                if !ok {
+                    // The changes that save was meant to cover are still
+                    // unsaved: put them back so the next save point still
+                    // fires. (`last_save_ms` stays advanced — that is the
+                    // backoff, one window before we retry a failing disk.)
+                    hub.dirty_since_save = hub.dirty_since_save.saturating_add(dirty);
+                }
+            }
             Ok(Msg::AofRewriteDone(rewrite_gen, res)) => {
                 if rewrite_gen != hub.aof_rewrite_gen {
                     // Started before a full resync replaced the dataset: its
@@ -5088,6 +5370,9 @@ fn run_hub(rx: mpsc::Receiver<Msg>, tx: mpsc::SyncSender<Msg>) {
             hub.expire_blocked();
             hub.expire_blocked_pops();
             hub.check_waits();
+            // Automatic snapshot cadence (LOCUS_SAVE). Last in the tick: it can
+            // hold the hub to serialize, and everything above is time-sensitive.
+            hub.maybe_autosave();
         }
     }
     // The channel closed: every sender is gone, so there is nothing left to

@@ -4,6 +4,80 @@ All notable changes to Locus are documented here. The format is based on
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and the project follows
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.8.0] — 2026-09-01
+
+Durability. Four holes between "we have persistence" and "your data is still there afterwards", plus
+one honest measurement of the cost we are not paying `fork()` to avoid. Nothing here changes the wire
+protocol or the data format in a way that needs a migration — snapshots written by 0.7.0 and earlier
+load unchanged.
+
+### Added
+
+- **Automatic snapshot cadence — `LOCUS_SAVE`.** There was none: RDB was manual-only, so with the AOF
+  off a crash lost everything written since somebody last typed `SAVE`. Save points are Redis's
+  semantics exactly — whitespace-separated `<seconds> <changes>` pairs, and a `BGSAVE` fires as soon as
+  **any** pair is satisfied (that many modifications *and* that long since the last save).
+
+  **This is on by default**, at Redis's own default cadence, `3600 1 300 100 60 10000`: hourly if one
+  thing changed, every five minutes if a hundred did, every minute if ten thousand did. A database that
+  persisted nothing without being asked was the wrong default. Turn it off with `LOCUS_SAVE=""` (or
+  `no`) for manual-only snapshots; retune live with `CONFIG SET save "900 1"`; read it back with
+  `CONFIG GET save`. New in `INFO`: `rdb_changes_since_last_save`, `rdb_last_save_time`,
+  `rdb_save_points`.
+- **Snapshot integrity — a CRC-32 footer on every RDB.** A snapshot carried no checksum at all, so
+  bit-rot loaded as valid data and a single corrupted length prefix could take the dataset with it.
+  Every snapshot now ends in a 10-byte footer (magic + format version + CRC-32 of the whole file),
+  written with the same `std`-only code the project's zero-dependency rule requires.
+
+  A snapshot is never torn — it is written temp → `fsync` → atomic rename — so a checksum mismatch is
+  not a partial write, it is *damage to a file that was once whole*. Locus therefore **refuses to
+  start** on one, naming the file and telling you to restore a backup or move it aside, rather than
+  quarantining it and serving an empty keyspace that clients would write into. Every other RDB load
+  failure keeps the previous quarantine-and-start-empty behaviour: those could be a foreign file, this
+  one cannot.
+- **`INFO rdb_last_bgsave_hub_stall_us`** — how long the last `BGSAVE` held the hub. See *Known
+  limits* below.
+- **`DEBUG AOFFSYNCFAIL <0|1>`** (debug builds only, like `DEBUG PANIC`): makes every AOF `fsync` fail
+  as a full disk would, so the durability contract below is tested rather than asserted.
+- **`docs/DEPLOYMENT.md` — "Backing up from a replica"**: the measured cost of an on-master snapshot,
+  why `fork()` is not the answer here, and a copy-pasteable replica backup + restore-drill procedure.
+
+### Fixed
+
+- **`appendfsync=always` acked writes whose `fsync` had failed.** `Aof::append` called the fsync,
+  latched the log unhealthy when it failed — and returned `Ok(())` anyway. The health gate then
+  rejected the *next* write, so the one write that actually lost its durability was the one write
+  reported as durable, and the client that issued it was never told. That is the exact promise
+  `always` exists to make. A failed append or fsync is now returned, and the client gets
+  `-MISCONF … The write was applied in memory but is NOT durable`. (The master's replicated stream is
+  exempt — a replica must apply its master's stream or diverge.)
+- **The `everysec` fsync ran on the hub.** One thread owns the whole keyspace, so `sync_data()` there
+  stalled *every client on the server* for as long as the device took — on a busy or degraded disk,
+  once a second, for as long as it took. It now runs on a dedicated fsync thread holding its own `dup`
+  of the log's descriptor; the hub only posts a request and returns. Requests coalesce, so a device
+  slower than a second cannot queue work up, and the once-per-second guarantee and the health tracking
+  are unchanged. The shutdown fsync (`SIGTERM`/`SHUTDOWN`) stays synchronous on purpose — the process
+  is about to exit, so "asked for" is not good enough.
+- **`INFO rdb_last_bgsave_status` was the literal string `ok`**, whatever had happened. It now reports
+  the real outcome of the last background save, and a failed save puts its change count back so the
+  next save point still fires instead of the changes being silently forgotten.
+- **A manual `SAVE` did not reset the change counter**, so the first save point after one fired
+  immediately for nothing. (New in this release, but fixed before it shipped.)
+
+### Known limits (stated, not fixed)
+
+- **`BGSAVE` serializes on the hub.** Only the write and `fsync` are off-thread; building the
+  point-in-time image is not, and while it runs no client is served — measured at **53 ms** for 400k
+  keys / 46 MB and **740 ms** for 1.2M keys / 144 MB (release build, M-series laptop). The number is
+  now published as `INFO rdb_last_bgsave_hub_stall_us` so it is an alert, not a surprise.
+
+  **Locus will not `fork()` to fix this.** Redis can because it is single-threaded — its child inherits
+  a consistent allocator. Locus runs 2N+ threads, and a forked child that allocates can deadlock on an
+  allocator lock held by a thread that did not cross the fork: a rare, unreproducible hang traded for a
+  bounded, measurable stall. The supported answer at scale is to snapshot on a replica, which is now
+  documented with a procedure. A chunked, copy-on-write-style serializer spread across maintenance
+  ticks remains the eventual fix.
+
 ## [0.7.0] — 2026-08-27
 
 Safety and performance recovery. Two halves. **Safety:** five defects, every one reproduced against a
@@ -588,7 +662,8 @@ milestone. Zero third-party dependencies (pure `std`).
   a skiplist for O(log n) sorted-set ops; full RESP3 typing of every reply; thread-per-core execution.
 - No authentication or TLS yet — bind to a trusted network only.
 
-[Unreleased]: https://github.com/elementaio/locus/compare/v0.7.0...HEAD
+[Unreleased]: https://github.com/elementaio/locus/compare/v0.8.0...HEAD
+[0.8.0]: https://github.com/elementaio/locus/compare/v0.7.0...v0.8.0
 [0.7.0]: https://github.com/elementaio/locus/compare/v0.6.1...v0.7.0
 [0.6.1]: https://github.com/elementaio/locus/compare/v0.6.0...v0.6.1
 [0.6.0]: https://github.com/elementaio/locus/compare/v0.5.1...v0.6.0

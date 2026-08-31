@@ -91,8 +91,20 @@ Expiry deadlines live in a separate map (`key -> expire-at-ms`):
 Two independent, optional mechanisms, both off the hot path:
 
 - **RDB (snapshot):** `SAVE`/`BGSAVE` serialize the whole dataset to a compact length-prefixed binary
-  file. The write is crash-safe by construction — temp file → `fsync` → atomic rename — so a
-  half-written snapshot can never replace a good one. Loaded on startup.
+  file. The write is crash-safe by construction — temp file → `fsync` → atomic rename → directory
+  `fsync` — so a half-written snapshot can never replace a good one. Loaded on startup.
+  - **Save points (`LOCUS_SAVE`, on by default):** a `BGSAVE` fires automatically once a
+    `<seconds> <changes>` pair is satisfied, so a crash costs at most one save-point window rather
+    than everything written since someone last typed `SAVE`.
+  - **Integrity:** every snapshot ends in a 10-byte footer — magic, format version, CRC-32 of the whole
+    file. A snapshot is never torn (temp → fsync → rename), so a checksum mismatch is proof of damage
+    to a file that was once whole: the server refuses to start on it instead of importing garbage or
+    serving an empty keyspace. Snapshots written before 0.8.0 have no footer and still load.
+  - **The stall:** serialization runs **on the hub**; only the write+`fsync` is off-thread. `fork()`
+    (Redis's answer) is not safe here — Locus runs 2N+ threads and a forked child that allocates can
+    deadlock on an allocator lock held by a thread that did not cross the fork. The cost is measured
+    and published as `rdb_last_bgsave_hub_stall_us`; for datasets where it matters, snapshot on a
+    replica (see [DEPLOYMENT.md](DEPLOYMENT.md)).
 - **AOF (append-only file):** every write command is appended in RESP and replayed on startup. Three
   things make it correct:
   - **Torn-tail tolerance:** a crash can truncate the final command; replay stops at the last *complete*
@@ -100,7 +112,11 @@ Two independent, optional mechanisms, both off the hot path:
   - **Determinism:** non-deterministic commands are rewritten at log time so replay can't diverge —
     relative TTLs become absolute `PEXPIREAT`, `SPOP`'s random removal becomes the exact `SREM` it
     produced, and `XADD *` is logged with the concrete generated id.
-  - **fsync policy:** the log is fsynced about once per second (the "everysec" trade-off).
+  - **fsync policy:** under `everysec` (the default) the log is fsynced about once per second, **on a
+    dedicated fsync thread** — never on the hub, where a slow device would stall every client on the
+    server for the length of the `fsync`. Under `always` the fsync stays inline and *its failure is
+    returned to the client that issued the write*: that policy's whole promise is that an ack means
+    the bytes are down, so a write whose fsync failed is answered `-MISCONF`, not `+OK`.
   - `BGREWRITEAOF` compacts the log to the minimal set of commands that rebuilds the current dataset.
 
 When AOF is enabled it is the source of truth on startup; otherwise the RDB snapshot is loaded.

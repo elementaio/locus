@@ -1654,6 +1654,261 @@ fn hlc_stamps_survive_restart() {
     let _ = std::fs::remove_file(&rdb);
 }
 
+/// Phase 3, item 3.1 — before this there was NO automatic snapshot cadence at
+/// all: with the AOF off, a crash lost everything written since someone last
+/// typed `SAVE`. A save point must now fire a BGSAVE on its own, and the data
+/// must survive a `kill -9` (which skips the graceful shutdown save entirely).
+#[test]
+fn a_save_point_snapshots_without_being_asked_and_survives_kill9() {
+    let rdb = format!(
+        "{}/locus-savepoint-{}.rdb",
+        std::env::temp_dir().display(),
+        std::process::id()
+    );
+    let _ = std::fs::remove_file(&rdb);
+    // "0 3" = snapshot as soon as 3 changes have accumulated. No AOF: the
+    // snapshot is the only durability there is.
+    let env: &[(&str, &str)] = &[("LOCUS_SAVE", "0 3")];
+    {
+        let mut s = Server::spawn_at(rdb.clone(), env);
+        let mut c = s.connect();
+        assert!(
+            c.cmd(&["INFO"]).contains("rdb_save_points:0 3"),
+            "the save point should be reported in INFO"
+        );
+        for i in 0..5 {
+            assert_eq!(c.cmd(&["SET", &format!("k{i}"), &format!("v{i}")]), "OK");
+        }
+        // The maintenance tick is 100ms; give it a few, then the counter must
+        // have been consumed by a save that nobody asked for.
+        let deadline = Instant::now() + Duration::from_secs(5);
+        loop {
+            let info = c.cmd(&["INFO"]);
+            let saved = info.contains("rdb_changes_since_last_save:0")
+                && info.contains("rdb_last_bgsave_status:ok")
+                && std::fs::metadata(&rdb).is_ok();
+            if saved {
+                break;
+            }
+            assert!(Instant::now() < deadline, "no automatic save fired: {info}");
+            sleep(Duration::from_millis(50));
+        }
+        s.child.kill().unwrap(); // SIGKILL: no graceful shutdown, no final save
+        let _ = s.child.wait();
+        std::mem::forget(s); // keep the snapshot on disk for the restart
+    }
+    // Restart on the same file: the automatic snapshot is all that stands
+    // between the dataset and the crash, and it holds.
+    {
+        let mut s = Server::spawn_at(rdb.clone(), env);
+        let mut c = s.connect();
+        for i in 0..5 {
+            assert_eq!(c.cmd(&["GET", &format!("k{i}")]), format!("v{i}"));
+        }
+        let _ = s.child.kill();
+        let _ = s.child.wait();
+        std::mem::forget(s);
+    }
+    let _ = std::fs::remove_file(&rdb);
+}
+
+/// Phase 3, item 3.1 — the cadence is a knob, not a policy: `LOCUS_SAVE=""`
+/// turns it off, and then nothing snapshots on its own.
+#[test]
+fn save_points_can_be_turned_off_and_retuned_at_runtime() {
+    let s = Server::start_inner(&[("LOCUS_SAVE", "")]);
+    let mut c = s.connect();
+    assert_eq!(c.cmd(&["CONFIG", "GET", "save"]), "[save, ]");
+    for i in 0..50 {
+        c.cmd(&["SET", &format!("off{i}"), "v"]);
+    }
+    sleep(Duration::from_millis(400)); // several maintenance ticks
+    assert!(
+        c.cmd(&["INFO"]).contains("rdb_changes_since_last_save:50"),
+        "nothing should have saved with the cadence disabled"
+    );
+    // ...and CONFIG SET puts it back without a restart.
+    assert_eq!(c.cmd(&["CONFIG", "SET", "save", "0 10"]), "OK");
+    assert_eq!(c.cmd(&["CONFIG", "GET", "save"]), "[save, 0 10]");
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while !c.cmd(&["INFO"]).contains("rdb_changes_since_last_save:0") {
+        assert!(Instant::now() < deadline, "retuned save point never fired");
+        sleep(Duration::from_millis(50));
+    }
+}
+
+/// Phase 3, item 3.2 — an RDB carried no integrity check at all, so bit-rot
+/// loaded as data. A snapshot now carries a CRC-32 footer: a damaged one is
+/// refused (and the server refuses to start on it rather than quietly serving
+/// an empty keyspace), while a pre-0.8.0 snapshot without a footer still opens.
+#[test]
+fn a_damaged_snapshot_is_refused_and_a_pre_checksum_one_still_loads() {
+    let rdb = format!(
+        "{}/locus-crc-{}.rdb",
+        std::env::temp_dir().display(),
+        std::process::id()
+    );
+    let _ = std::fs::remove_file(&rdb);
+    // Write a snapshot the normal way, then shut down cleanly.
+    {
+        let mut s = Server::spawn_at(rdb.clone(), &[]);
+        let mut c = s.connect();
+        assert_eq!(c.cmd(&["SET", "kept", "value"]), "OK");
+        assert_eq!(c.cmd(&["SAVE"]), "OK");
+        c.send(&["SHUTDOWN", "NOSAVE"]);
+        s.wait_exit();
+        std::mem::forget(s); // keep the snapshot for the rounds below
+    }
+    let good = std::fs::read(&rdb).expect("snapshot written");
+    assert_eq!(
+        &good[good.len() - 10..good.len() - 5],
+        b"LXCRC",
+        "every snapshot must carry the checksum footer"
+    );
+
+    // Flip one bit in the middle of the keyspace: the server must refuse to
+    // start, and must NOT move the evidence aside.
+    let mut rot = good.clone();
+    let victim = rot.len() / 2;
+    rot[victim] ^= 0x01;
+    std::fs::write(&rdb, &rot).unwrap();
+    let out = spawn_expecting_failure(&rdb);
+    assert!(
+        !out.status.success(),
+        "a damaged snapshot must not start the server"
+    );
+    let err = String::from_utf8_lossy(&out.stderr);
+    assert!(err.contains("checksum mismatch"), "{err}");
+    assert!(err.contains("refusing to start"), "{err}");
+    assert_eq!(
+        std::fs::read(&rdb).unwrap(),
+        rot,
+        "the damaged file must be left exactly where it is, for the operator"
+    );
+
+    // A file that lost bytes but kept its footer is refused too — the CRC
+    // covers the length prefixes, which is exactly what a bad length could
+    // otherwise turn into a catastrophic allocation or a silent half-load.
+    let mut short = good[..good.len() - 30].to_vec();
+    short.extend_from_slice(&good[good.len() - 10..]);
+    std::fs::write(&rdb, &short).unwrap();
+    assert!(
+        !spawn_expecting_failure(&rdb).status.success(),
+        "a shortened snapshot that still claims a checksum must be refused"
+    );
+
+    // Strip the footer: that is byte-for-byte what v0.7.0 wrote. It must load.
+    std::fs::write(&rdb, &good[..good.len() - 10]).unwrap();
+    {
+        let mut s = Server::spawn_at(rdb.clone(), &[]);
+        let mut c = s.connect();
+        assert_eq!(c.cmd(&["GET", "kept"]), "value");
+        let _ = s.child.kill();
+        let _ = s.child.wait();
+        std::mem::forget(s);
+    }
+    // And the good file still loads, unchanged.
+    std::fs::write(&rdb, &good).unwrap();
+    {
+        let mut s = Server::spawn_at(rdb.clone(), &[]);
+        let mut c = s.connect();
+        assert_eq!(c.cmd(&["GET", "kept"]), "value");
+        let _ = s.child.kill();
+        let _ = s.child.wait();
+        std::mem::forget(s);
+    }
+    let _ = std::fs::remove_file(&rdb);
+}
+
+/// Run the server against `rdb` and collect its exit — for the cases where it
+/// is SUPPOSED to die at startup, which `Server::spawn_at` would panic on.
+fn spawn_expecting_failure(rdb: &str) -> std::process::Output {
+    Command::new(env!("CARGO_BIN_EXE_locus"))
+        .env("LOCUS_PORT", "0")
+        .env("LOCUS_RDB", rdb)
+        .env_remove("LOCUS_AOF")
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .output()
+        .expect("spawn locus")
+}
+
+/// Phase 3, item 3.3 — `appendfsync=always` promises a client is not told `+OK`
+/// until the bytes are synced. It used to latch the log unhealthy on a failed
+/// fsync and ack the write anyway, refusing only the NEXT one: the write that
+/// actually lost its durability was the one write reported as durable.
+#[test]
+fn appendfsync_always_reports_the_failed_fsync_to_the_client_that_caused_it() {
+    let aof = format!(
+        "{}/locus-fsyncfail-{}.aof",
+        std::env::temp_dir().display(),
+        std::process::id()
+    );
+    let _ = std::fs::remove_file(&aof);
+    let s = Server::start_inner(&[("LOCUS_AOF", aof.as_str()), ("LOCUS_APPENDFSYNC", "always")]);
+    let mut c = s.connect();
+    assert_eq!(c.cmd(&["SET", "before", "1"]), "OK");
+
+    // The disk stops honouring fsync (a full filesystem, a failing device).
+    assert_eq!(c.cmd(&["DEBUG", "AOFFSYNCFAIL", "1"]), "OK");
+    let reply = c.cmd(&["SET", "during", "2"]);
+    assert!(
+        reply.starts_with("-MISCONF"),
+        "an unsynced write must not be acked: got {reply}"
+    );
+    assert!(reply.contains("NOT durable"), "{reply}");
+    // Honest about both halves: it IS applied in memory, it is NOT on the disk.
+    assert_eq!(c.cmd(&["GET", "during"]), "2");
+
+    // Recovery: with the disk healthy again, the hub's recovery rewrite
+    // replaces the holed log and writes are accepted once more.
+    assert_eq!(c.cmd(&["DEBUG", "AOFFSYNCFAIL", "0"]), "OK");
+    let deadline = Instant::now() + Duration::from_secs(10);
+    loop {
+        if c.cmd(&["SET", "after", "3"]) == "OK" {
+            break;
+        }
+        assert!(Instant::now() < deadline, "the AOF never recovered");
+        sleep(Duration::from_millis(50));
+    }
+    assert!(c.cmd(&["INFO"]).contains("aof_last_write_status:ok"));
+    let _ = std::fs::remove_file(&aof);
+}
+
+/// Phase 3, item 3.5 — `BGSAVE` serializes on the hub, and `fork()` is not a
+/// safe fix here (2N+ threads). So the stall is measured and published instead
+/// of being a surprise: an operator can alert on it, and the documented answer
+/// is to snapshot on a replica.
+#[test]
+fn bgsave_publishes_the_hub_stall_it_costs() {
+    let s = Server::start();
+    let mut c = s.connect();
+    for i in 0..2000 {
+        c.cmd(&["SET", &format!("s{i}"), "0123456789abcdef"]);
+    }
+    assert_eq!(c.cmd(&["BGSAVE"]), "Background saving started");
+    let deadline = Instant::now() + Duration::from_secs(10);
+    let stall = loop {
+        let info = c.cmd(&["INFO"]);
+        let stall: u64 = info
+            .lines()
+            .find_map(|l| l.strip_prefix("rdb_last_bgsave_hub_stall_us:"))
+            .and_then(|v| v.trim().parse().ok())
+            .expect("rdb_last_bgsave_hub_stall_us must be in INFO");
+        if info.contains("rdb_bgsave_in_progress:0") {
+            assert!(info.contains("rdb_last_bgsave_status:ok"), "{info}");
+            break stall;
+        }
+        assert!(Instant::now() < deadline, "BGSAVE never finished");
+        sleep(Duration::from_millis(20));
+    };
+    assert!(
+        stall > 0,
+        "the serialize stall must be measured, not assumed"
+    );
+    assert_eq!(c.cmd(&["PING"]), "PONG");
+}
+
 #[test]
 fn aof_recovers_all_acked_writes_after_kill9() {
     let rdb = format!(

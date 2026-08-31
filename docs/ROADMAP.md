@@ -40,7 +40,12 @@ See [CHANGEFEED.md](CHANGEFEED.md), [GEO.md](GEO.md), [SKETCHES.md](SKETCHES.md)
 ## Shipped since (P0–P5 hardening)
 
 - **Security:** AUTH + protected mode + a simple multi-user **ACL**; conn limits, idle timeout.
-- **Durability:** async `BGSAVE`/`BGREWRITEAOF`, `appendfsync`, persisted+replicated reactive state, crash tests.
+- **Durability:** `BGSAVE`/`BGREWRITEAOF`, `appendfsync`, persisted+replicated reactive state, crash tests
+  — and since 0.8.0: automatic **save points** (`LOCUS_SAVE`), **CRC-32-checksummed snapshots** that
+  refuse to load damaged, an `always` fsync whose failure reaches the client that caused it, and the
+  `everysec` fsync moved off the hub onto its own thread. `BGSAVE` still serializes on the hub (no
+  `fork()` — see [DEPLOYMENT.md](DEPLOYMENT.md#backing-up-from-a-replica-recommended-at-scale)); the
+  stall is published as `rdb_last_bgsave_hub_stall_us`.
 - **Replication:** real replid/offset, **`WAIT`**, **PSYNC partial-resync** over a backlog ring, no expiry divergence.
 - **HA + TLS:** built-in **sentinel** auto-failover (quorum + inter-sentinel agreement over an authenticated peer plane) — for a **trusted network**, and **not partition-safe** ([what it guarantees](DEPLOYMENT.md#what-failover-guarantees--and-what-it-does-not)); TLS via sidecar or the optional `tls` feature.
 - **Compat/observability:** `SCAN`/`COMMAND`/`CONFIG`/`SLOWLOG`/`INFO` (works with `redis_exporter`), RESP3 typed replies.
@@ -57,12 +62,14 @@ See [CHANGEFEED.md](CHANGEFEED.md), [GEO.md](GEO.md), [SKETCHES.md](SKETCHES.md)
 - **Native in-process TLS by default** (it's an opt-in feature; the default build stays zero-dependency).
 - Clustering hardening (optional, post-flagship): off-thread cross-shard scatter, persisted HLC stamps, `ASK`-redirect *online* migration, gossip-based topology propagation (today it's operator/sentinel-driven). Full Raft/gossip consensus stays deferred by the zero-dep stance.
 - **Partition-safe failover:** fencing the partitioned old master, and coordinated (rather than wall-clock) epochs. Today's failover is an orchestration hook for a trusted network and says so plainly; closing the gap is a project of its own, not a patch.
+- **A non-blocking `BGSAVE`.** Serialization holds the hub for the length of the dataset (measured: 53 ms at 400k keys, 740 ms at 1.2M). `fork()` is dismissed below, so the fix is chunked serialization across maintenance ticks with pre-image capture on mutation — manual copy-on-write. Until then: snapshot on a replica, and watch `rdb_last_bgsave_hub_stall_us`.
 
 ## Dismissed (won't do — with the reasoning)
 
 - **Thread-per-core / shared-nothing hubs** — fights the single-thread identity (one ordered point powers the changefeed + geo) and overlaps clustering's cross-shard ordering. Scale is **horizontal** (P6), not vertical.
 - **Replica chaining (sub-replicas)** — niche read-fan-out; risk to the working replication offset path; P6 sharding is the scale lane.
 - **Numbered multiple DBs (`SELECT n`)** — Redis discourages it and Cluster bans DB>0, so it wouldn't compose with P6; use **key-prefix namespacing** (cluster-safe). `SELECT 0` stays for connect-compat.
+- **`fork()`-based snapshots** — Redis's answer, and unsafe here: Locus runs 2N+ threads, so a child that allocates can deadlock on an allocator lock held by a thread that did not cross the fork. A rare unreproducible hang is a worse trade than a bounded, measured stall.
 - **Scripting/`EVAL`**, an embedded HTTP `/metrics` endpoint, active-active replication.
 
 ## Distribution (shipped in v0.2.0)

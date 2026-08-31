@@ -77,9 +77,20 @@ $ redis-cli -p 6379 GEOSEARCH fleet FROMLONLAT 55.27 25.2 BYRADIUS 5 km ASC   # 
 
 **Durability**
 
-- **Snapshots + AOF:** RDB-style binary snapshots (truly-async `BGSAVE`) and an append-only file with
-  crash-safe, torn-tail-tolerant replay, configurable `appendfsync`, and `BGREWRITEAOF` compaction.
+- **Snapshots + AOF:** RDB-style binary snapshots and an append-only file with crash-safe,
+  torn-tail-tolerant replay, configurable `appendfsync`, and `BGREWRITEAOF` compaction.
   Directory-fsync'd renames; **fuzz- and `kill -9` crash-recovery-tested.**
+- **Automatic snapshot cadence:** Redis-style save points (`LOCUS_SAVE`, on by default) fire a
+  `BGSAVE` on their own, so a crash without the AOF costs one window — not everything since the last
+  manual `SAVE`.
+- **Checksummed snapshots:** every snapshot carries a CRC-32 footer. Bit-rot is *refused* at startup
+  with a clear error instead of loading as data; pre-0.8.0 snapshots still open.
+- **`appendfsync` that tells the truth:** `everysec` fsyncs on a dedicated thread, never stalling the
+  hub; `always` returns `-MISCONF` for a write whose fsync failed rather than acking it `+OK`.
+- **`BGSAVE` is honest about its cost:** the write+fsync is off-thread, but serialization holds the hub
+  (`fork()` is unsafe with 2N+ threads). The stall is measured and published as
+  `rdb_last_bgsave_hub_stall_us` — and the answer at scale is
+  [snapshotting on a replica](docs/DEPLOYMENT.md#backing-up-from-a-replica-recommended-at-scale).
 - **Disk tier — "RAM for live data, NVMe for archives":** `TIER key` moves a value to an on-disk
   value-log, leaving a ~100-byte stub; any read **thaws it back transparently** (API unchanged). TTL,
   RDB/AOF, and replication all keep working. Turns "keep 30 days of history" from a RAM bill into a
@@ -196,6 +207,7 @@ Configured entirely through environment variables (minimal config by design):
 | `LOCUS_MAXCLIENTS` | `10000` | Max concurrent connections |
 | `LOCUS_TIMEOUT` | `0` | Idle-connection timeout in seconds (`0` = off) |
 | `LOCUS_RDB` | `locus.rdb` | RDB snapshot path |
+| `LOCUS_SAVE` | `3600 1 300 100 60 10000` | Automatic snapshot cadence — `<seconds> <changes>` pairs, Redis's `save`. A `BGSAVE` fires when any pair is met. `""` (or `no`) disables it; `CONFIG SET save "…"` retunes it live |
 | `LOCUS_AOF` | _(off)_ | Path (or `1`) to enable append-only persistence |
 | `LOCUS_APPENDFSYNC` | `everysec` | AOF fsync policy: `always` / `everysec` / `no` |
 | `LOCUS_AOF_ON_WRITE_ERROR` | `stop` | On a failed AOF append/fsync, reject writes until a recovery rewrite succeeds; `continue` to keep serving (durability at risk) |

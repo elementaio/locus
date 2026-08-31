@@ -154,17 +154,91 @@ Enable both an append-only log (point-in-time durability) and snapshots
 LOCUS_AOF=/data/locus.aof        # append-only persistence
 LOCUS_APPENDFSYNC=everysec       # always | everysec (default) | no
 LOCUS_RDB=/data/locus.rdb        # snapshot path
+LOCUS_SAVE="3600 1 300 100 60 10000"   # automatic snapshot cadence (default)
 ```
 
-- **`appendfsync`:** `everysec` bounds data loss to ~1s on power loss (good default);
-  `always` is safest (fsync per write) but slowest; `no` leaves flushing to the OS.
+- **`appendfsync`:** `everysec` bounds data loss to ~1s on power loss (good default)
+  and runs the periodic `fsync` on a dedicated thread, so a slow disk never stalls
+  the hub. `always` is safest (fsync per write) and slowest — and it tells the truth:
+  a write whose `fsync` fails is answered `-MISCONF … NOT durable`, never `+OK`.
+  `no` leaves flushing to the OS.
+- **Save points (`LOCUS_SAVE`).** Redis's `save` semantics: whitespace-separated
+  `<seconds> <changes>` pairs. A `BGSAVE` fires as soon as **any** pair is satisfied —
+  at least that many modifications *and* at least that long since the last save. The
+  default (`3600 1 300 100 60 10000`) means an idle database still gets an hourly
+  snapshot and a busy one gets a minutely one. Set `LOCUS_SAVE=""` for manual-only
+  snapshots, or retune at runtime with `CONFIG SET save "900 1"`. Watch
+  `rdb_changes_since_last_save`, `rdb_last_save_time` and `rdb_last_bgsave_status`
+  in `INFO`.
 - **`BGREWRITEAOF`** compacts the AOF off the hot path (it no longer blocks the
   server) and is safe to run on a cron; writes during the rewrite are preserved.
+- **Snapshot integrity.** Every snapshot ends in a CRC-32 footer. A mismatch means
+  the file was damaged *after* it was written whole (snapshots are temp→fsync→rename,
+  so they are never torn), and Locus **refuses to start** rather than serve a
+  keyspace it cannot vouch for: restore a backup, or move the file aside to start
+  empty. Snapshots from 0.7.0 and earlier have no footer and still load.
 - **Backups:** `BGSAVE` (async) writes a consistent snapshot via temp→fsync→rename;
-  copy `locus.rdb` after it completes. The AOF replay is torn-tail-tolerant, so a
-  crash mid-write loses only the truncated final command.
+  copy `locus.rdb` after `rdb_bgsave_in_progress` returns to 0. The AOF replay is
+  torn-tail-tolerant, so a crash mid-write loses only the truncated final command.
 - Put `/data` on durable storage; the snapshot/AOF renames are directory-fsync'd so
   they survive a crash, but the underlying disk still has to be real.
+
+### Backing up from a replica (recommended at scale)
+
+**`BGSAVE` is only half-asynchronous.** The disk write and its `fsync` run on a
+background thread, but *serializing* the dataset runs on the hub — the single thread
+that owns the keyspace — so for its duration **no client is served**. Measured on an
+M-series laptop, release build:
+
+| Dataset | Snapshot size | Hub stall (`rdb_last_bgsave_hub_stall_us`) |
+|---|---:|---:|
+| 400k keys × 100 B | 46 MB | **53 ms** |
+| 1.2M keys × 100 B | 144 MB | **740 ms** |
+
+It grows at least linearly with the dataset, so a multi-GB keyspace means seconds of
+full unavailability per snapshot.
+
+**Locus does not `fork()` to avoid this, and will not.** Redis can because it is
+single-threaded: its child inherits a consistent allocator. Locus runs 2N+ threads
+(two per connection, plus replication and fsync threads), and a forked child that
+allocates can deadlock on an allocator lock held by a thread that did not exist in the
+child. Trading a bounded stall for a rare, unreproducible hang is not a good trade.
+
+**So take snapshots on a replica.** Replicas are already fully supported, and moving
+the backup off the serving node removes the stall from the write path entirely:
+
+```bash
+# 1. A replica of the master, with its own snapshot path and NO save points
+#    (you drive the cadence from cron instead of leaving it to a save point).
+LOCUS_BIND=127.0.0.1 LOCUS_PORT=6380 \
+LOCUS_RDB=/backup/locus.rdb LOCUS_SAVE="" LOCUS_MASTERAUTH=$PW locus &
+redis-cli -p 6380 -a $PW REPLICAOF master.host 6379
+
+# 2. Back up on a schedule (cron / systemd timer), from the REPLICA:
+redis-cli -p 6380 -a $PW BGSAVE
+#    Wait for it to land, then copy the file away:
+until redis-cli -p 6380 -a $PW INFO | grep -q 'rdb_bgsave_in_progress:0'; do sleep 1; done
+cp /backup/locus.rdb /offsite/locus-$(date +%F-%H%M).rdb
+```
+
+Check the copy before you trust it — a snapshot with a broken CRC will refuse to load
+when you need it, so find out now:
+
+```bash
+# Restore drill: start a throwaway Locus on the copy. It exits non-zero if the
+# file is damaged, and prints "refusing to start: RDB checksum mismatch".
+LOCUS_PORT=0 LOCUS_RDB=/offsite/locus-2026-09-01-0300.rdb LOCUS_SAVE="" locus
+```
+
+Notes:
+
+- The replica's stall during its own `BGSAVE` delays *its* replication apply, not the
+  master's clients. Its offset catches up when the save completes; `WAIT` on the
+  master will briefly see it lag.
+- Snapshotting a replica captures the replica's dataset, which may be a fraction of a
+  second behind the master. For a backup that is exactly what you want.
+- If you must snapshot on the master, do it when `rdb_last_bgsave_hub_stall_us` is
+  within your latency budget, and set `LOCUS_SAVE=""` so it happens when *you* choose.
 
 ---
 
@@ -192,9 +266,14 @@ connections gracefully and keeps serving (it never crashes on thread exhaustion)
   [`redis_exporter`](https://github.com/oliver006/redis_exporter) — point it at
   Locus (with auth) and you get the standard Redis dashboards. Watch
   `connected_clients`, `used_memory`, `master_link_status` (on replicas),
-  `master_repl_offset`, `rdb_last_bgsave_status`, and `panics_recovered` — a non-zero
+  `master_repl_offset`, `rdb_last_bgsave_status`, `rdb_changes_since_last_save`,
+  `aof_last_write_status`, and `panics_recovered` — a non-zero
   `panics_recovered` means the hub caught and survived a command panic; the log line names the
   command, and the value it was writing may be partially mutated. Alert on it.
+  `rdb_last_bgsave_hub_stall_us` is how long the last snapshot froze the hub — alert
+  on it if it approaches your latency budget, and move backups to a replica (§3).
+  `aof_last_write_status:err` means the log has a hole and writes are being rejected
+  until the automatic recovery rewrite succeeds.
 - **Slow queries:** `SLOWLOG GET` (threshold via `LOCUS_SLOWLOG_US`, default 10ms).
 - **Logs:** structured, leveled to stderr; set `LOCUS_LOGLEVEL=info` (or `debug`).
 - **Health check:** `redis-cli -a $PW PING` → `PONG`.

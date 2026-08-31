@@ -17,7 +17,7 @@ works. This is a curated subset of Redis — the common, useful commands per typ
 | `QUIT` | |
 | `COMMAND` / `CONFIG GET` | minimal stubs so clients connect cleanly. `CONFIG GET` masks credential values (`requirepass`, `masterauth`) for every user but `default` — the name is still listed, the value comes back empty |
 | `AUTH [user] pw` | `AUTH pw` is shorthand for `AUTH default pw` and **switches the connection to `default`** |
-| `DEBUG PANIC` \| `DEBUG HELP` | debug-build only: `PANIC` makes the command panic on purpose, to exercise the hub's panic boundary. A release binary refuses it |
+| `DEBUG PANIC` \| `DEBUG AOFFSYNCFAIL <0\|1>` \| `DEBUG HELP` | debug-build only fault injection: `PANIC` makes the command panic on purpose (exercises the hub's panic boundary); `AOFFSYNCFAIL 1` makes every AOF `fsync` fail as a full disk would, so the durability contract can be tested. A release binary refuses both |
 | `CLUSTER INFO\|MYID\|SLOTS\|SHARDS\|NODES\|LINKS\|KEYSLOT key\|COUNTKEYSINSLOT slot\|CELL lon lat\|SETSLOT slot NODE addr\|MIGRATESLOT slot dst\|REASSIGN old new\|CDCMERGE since [COUNT n]` | introspection + topology. With `LOCUS_CLUSTER_ENABLED` it reports real slot ownership and routes keys (`MOVED`/`CROSSSLOT`, `CLUSTERDOWN` for an unowned slot); off, `cluster_enabled:0`. `KEYSLOT` = CRC16 + `{hashtag}`; `CELL` = the cell tag for a point (`{cell}id` geo keys); `SETSLOT … NODE` reassigns a slot's owner; `MIGRATESLOT` moves a slot's keys to `dst` (zero-loss, two-phase) then hands it ownership (gossip propagates the change to the other nodes); `REASSIGN old new` repoints **all** of `old`'s slots to `new` (the sentinel broadcasts it on per-shard failover); `CDCMERGE since-hlc [COUNT n]` returns the **global** changefeed — this node's changes merged with every shard's in HLC order up to the cross-shard watermark (pass `0` to start, then advance `since` to the last `hlc`). Ownership changes (`SETSLOT`/`REASSIGN`/`MIGRATESLOT`) are HLC-epoch-stamped and converge across nodes via background gossip, so they need not be pushed to every node manually |
 
 ## Generic / keyspace
@@ -278,6 +278,12 @@ Redis).
 ## Persistence
 
 `SAVE` `BGSAVE` `BGREWRITEAOF`
+
+`SAVE` blocks; `BGSAVE` serializes on the hub and then writes+fsyncs off-thread (the stall it costs is
+reported as `rdb_last_bgsave_hub_stall_us` in `INFO`). Snapshots also happen on their own, per the
+`LOCUS_SAVE` save points — read them with `CONFIG GET save`, retune with `CONFIG SET save "900 1"`, and
+watch `rdb_changes_since_last_save` / `rdb_last_save_time` / `rdb_last_bgsave_status`. See
+[DEPLOYMENT.md §3](DEPLOYMENT.md#3-persistence--backups).
 
 ## Replication
 

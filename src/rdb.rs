@@ -21,6 +21,113 @@ const MAGIC: &[u8; 9] = b"LOCUSRDB1";
 /// collection still grows as elements are actually read.
 const READ_ALLOC_CAP: usize = 1024;
 
+/// Snapshot integrity footer: a 5-byte magic, a 1-byte format version, and a
+/// CRC-32 of every byte before it, appended by [`write_snapshot`].
+///
+/// Why a footer and not a header: the checksum covers the whole file, so it can
+/// only be computed once the file is complete — and putting it last means the
+/// keyspace/trailer readers below are untouched by it.
+///
+/// Snapshots written by v0.7.0 and earlier carry no footer. Those still load
+/// (see [`split_checksum`]): absent = "unverifiable", which is what it was
+/// before. Present-and-wrong is the case that gets refused.
+const CKSUM_MAGIC: &[u8; 5] = b"LXCRC";
+const CKSUM_VERSION: u8 = 1;
+const CKSUM_LEN: usize = CKSUM_MAGIC.len() + 1 + 4;
+
+/// The marker every checksum-mismatch error carries, so the startup path can
+/// tell *proven bit-rot in a complete file* apart from a parse failure that
+/// might just be a foreign file. See `is_checksum_error`.
+const CKSUM_ERR: &str = "RDB checksum mismatch";
+
+/// True when this error is a snapshot checksum mismatch (as opposed to any other
+/// load failure). A mismatch is proof that a file we ourselves wrote whole has
+/// since been damaged, so the startup path refuses to start rather than
+/// quietly serving an empty keyspace.
+pub fn is_checksum_error(e: &io::Error) -> bool {
+    e.kind() == io::ErrorKind::InvalidData && e.to_string().contains(CKSUM_ERR)
+}
+
+/// CRC-32 (IEEE 802.3, the reflected 0xEDB88320 polynomial — the one zlib, PNG
+/// and gzip use). Sixteen lines of `std`, because a dependency for this would
+/// cost more than it is worth.
+const fn crc32_table() -> [u32; 256] {
+    let mut table = [0u32; 256];
+    let mut i = 0;
+    while i < 256 {
+        let mut c = i as u32;
+        let mut bit = 0;
+        while bit < 8 {
+            c = if c & 1 != 0 {
+                0xEDB8_8320 ^ (c >> 1)
+            } else {
+                c >> 1
+            };
+            bit += 1;
+        }
+        table[i] = c;
+        i += 1;
+    }
+    table
+}
+static CRC32_TABLE: [u32; 256] = crc32_table();
+
+pub(crate) fn crc32(bytes: &[u8]) -> u32 {
+    let mut c = 0xFFFF_FFFFu32;
+    for &b in bytes {
+        c = CRC32_TABLE[((c ^ b as u32) & 0xFF) as usize] ^ (c >> 8);
+    }
+    c ^ 0xFFFF_FFFF
+}
+
+/// Build the 10-byte footer for an already-complete snapshot body.
+fn checksum_footer(body: &[u8]) -> [u8; CKSUM_LEN] {
+    let mut f = [0u8; CKSUM_LEN];
+    f[..5].copy_from_slice(CKSUM_MAGIC);
+    f[5] = CKSUM_VERSION;
+    f[6..].copy_from_slice(&crc32(body).to_le_bytes());
+    f
+}
+
+/// Verify and strip a checksum footer if one is present.
+///
+/// Three outcomes, and the difference between them matters:
+///  * no footer  -> a pre-0.8.0 snapshot; returned unchanged, unverified.
+///  * good CRC   -> the body, footer removed.
+///  * bad CRC (or an unknown footer version) -> `Err`. A snapshot is written
+///    temp -> fsync -> rename, so it is never torn: a mismatch is not a partial
+///    write, it is damage to a file that was once whole.
+fn split_checksum(bytes: &[u8]) -> io::Result<&[u8]> {
+    if bytes.len() < CKSUM_LEN {
+        return Ok(bytes);
+    }
+    let (body, footer) = bytes.split_at(bytes.len() - CKSUM_LEN);
+    if &footer[..5] != CKSUM_MAGIC {
+        return Ok(bytes); // no footer: an older snapshot
+    }
+    if footer[5] != CKSUM_VERSION {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!(
+                "{CKSUM_ERR}: unsupported checksum format version {} (this build understands {CKSUM_VERSION})",
+                footer[5]
+            ),
+        ));
+    }
+    let stored = u32::from_le_bytes([footer[6], footer[7], footer[8], footer[9]]);
+    let actual = crc32(body);
+    if stored != actual {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!(
+                "{CKSUM_ERR}: stored {stored:#010x}, computed {actual:#010x} over {} bytes — the snapshot is damaged",
+                body.len()
+            ),
+        ));
+    }
+    Ok(body)
+}
+
 /// Where to persist — overridable with the LOCUS_RDB env var (handy for tests).
 pub fn configured_path() -> String {
     std::env::var("LOCUS_RDB").unwrap_or_else(|_| DEFAULT_PATH.to_string())
@@ -36,6 +143,11 @@ pub fn configured_path() -> String {
 /// racing an in-flight BGSAVE must never truncate the file the background
 /// thread is still writing — each writer owns its temp, and the atomic rename
 /// keeps the destination a complete snapshot no matter who finishes last.
+///
+/// Every file written here gets a CRC-32 footer (see `checksum_footer`). It is
+/// appended as a second `write_all` rather than by copying `bytes`: the caller
+/// is already holding the whole dataset in memory and a copy would double the
+/// peak.
 pub fn write_snapshot(bytes: &[u8], path: &str) -> io::Result<()> {
     static SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
     let tmp = format!(
@@ -43,10 +155,12 @@ pub fn write_snapshot(bytes: &[u8], path: &str) -> io::Result<()> {
         std::process::id(),
         SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
     );
+    let footer = checksum_footer(bytes);
     let write = || -> io::Result<()> {
         let file = File::create(&tmp)?;
         let mut w = BufWriter::new(file);
         w.write_all(bytes)?;
+        w.write_all(&footer)?;
         w.flush()?;
         w.get_ref().sync_all() // fsync the data before we rename
     };
@@ -246,8 +360,13 @@ fn read_db<R: Read>(r: &mut R) -> io::Result<Db> {
 }
 
 /// Parse a snapshot's keyspace and any optional trailing extras from a buffer.
+///
+/// The integrity footer is verified (and stripped) first, so a damaged file is
+/// refused before a single byte of it reaches the keyspace. Buffers without one
+/// — a pre-0.8.0 snapshot on disk, or the replication full-sync payload, which
+/// is length-framed on the wire and carries no footer — parse exactly as before.
 pub fn deserialize_with_extras(bytes: &[u8]) -> io::Result<(Db, Extras)> {
-    let mut r: &[u8] = bytes;
+    let mut r: &[u8] = split_checksum(bytes)?;
     let db = read_db(&mut r)?;
     let extras = read_extras(&mut r)?;
     Ok((db, extras))
@@ -864,6 +983,99 @@ mod tests {
         put_bytes(&mut b, b"l");
         b.extend_from_slice(&u32::MAX.to_le_bytes()); // element count
         assert!(deserialize_with_extras(&b).is_err());
+    }
+
+    #[test]
+    fn snapshot_carries_a_checksum_and_a_flipped_byte_is_refused() {
+        let path = "/tmp/locus_rdb_crc.rdb";
+        let _ = fs::remove_file(path);
+        let mut db = Db::new();
+        execute(&to(&[b"SET", b"k", b"v"]), &mut db);
+        save_with_extras(&db, &Extras::default(), path).unwrap();
+
+        // The file ends with the footer, and it verifies.
+        let bytes = fs::read(path).unwrap();
+        assert_eq!(
+            &bytes[bytes.len() - CKSUM_LEN..bytes.len() - 5],
+            CKSUM_MAGIC
+        );
+        assert!(load_with_extras(path).is_ok());
+
+        // Flip one bit in the KEYSPACE (not the footer): the load must refuse
+        // rather than import whatever the damaged bytes decode to.
+        let mut rot = bytes.clone();
+        let victim = rot.len() - CKSUM_LEN - 3;
+        rot[victim] ^= 0x01;
+        fs::write(path, &rot).unwrap();
+        let err = match load_with_extras(path) {
+            Err(e) => e,
+            Ok(_) => panic!("bit-rot must not load"),
+        };
+        assert!(is_checksum_error(&err), "{err}");
+        assert!(err.to_string().contains("damaged"), "{err}");
+
+        // ...and a flipped byte in the CHECKSUM itself is refused too.
+        let mut rot = bytes.clone();
+        let n = rot.len();
+        rot[n - 1] ^= 0xFF;
+        fs::write(path, &rot).unwrap();
+        match load_with_extras(path) {
+            Err(e) => assert!(is_checksum_error(&e), "{e}"),
+            Ok(_) => panic!("a damaged footer must not load"),
+        }
+        let _ = fs::remove_file(path);
+    }
+
+    #[test]
+    fn pre_checksum_snapshots_still_load() {
+        // Exactly what v0.7.0 wrote: keyspace + trailer, no footer.
+        let path = "/tmp/locus_rdb_precrc.rdb";
+        let _ = fs::remove_file(path);
+        let mut db = Db::new();
+        execute(&to(&[b"SET", b"old", b"value"]), &mut db);
+        execute(&to(&[b"RPUSH", b"l", b"a", b"b"]), &mut db);
+        let mut bytes = serialize(&db);
+        append_extras(
+            &mut bytes,
+            &Extras {
+                cdc_next_offset: 12,
+                ..Default::default()
+            },
+        );
+        fs::write(path, &bytes).unwrap(); // raw write: no footer, as before
+        let (mut loaded, extras) = load_with_extras(path).unwrap();
+        assert_eq!(
+            execute(&to(&[b"GET", b"old"]), &mut loaded),
+            b"$5\r\nvalue\r\n".to_vec()
+        );
+        assert_eq!(
+            execute(&to(&[b"LLEN", b"l"]), &mut loaded),
+            b":2\r\n".to_vec()
+        );
+        assert_eq!(extras.cdc_next_offset, 12);
+        let _ = fs::remove_file(path);
+    }
+
+    #[test]
+    fn crc32_matches_the_known_ieee_vector() {
+        // The canonical check value for CRC-32/ISO-HDLC.
+        assert_eq!(crc32(b"123456789"), 0xCBF4_3926);
+        assert_eq!(crc32(b""), 0);
+    }
+
+    #[test]
+    fn a_wire_payload_without_a_footer_still_parses() {
+        // Replication full-sync ships serialize_wire + extras and no footer;
+        // the reader must not start demanding one.
+        let mut db = Db::new();
+        execute(&to(&[b"SET", b"k", b"v"]), &mut db);
+        let mut wire = serialize_wire(&db);
+        append_extras(&mut wire, &Extras::default());
+        let (mut loaded, _) = deserialize_with_extras(&wire).unwrap();
+        assert_eq!(
+            execute(&to(&[b"GET", b"k"]), &mut loaded),
+            b"$1\r\nv\r\n".to_vec()
+        );
     }
 
     #[test]

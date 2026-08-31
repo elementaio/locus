@@ -8,13 +8,20 @@
 //!  * NON-DETERMINISM IS REWRITTEN AT LOG TIME: relative TTLs become absolute
 //!    PEXPIREAT, and SPOP (which removes random members) is logged as the exact
 //!    SREM it produced — so replaying never diverges from the original run.
-//!  * FSYNC: we fsync ~once per second. (Real Redis does this on a background
-//!    thread to avoid stalling the loop; we fsync inline here for simplicity.)
+//!  * FSYNC: under `everysec` (the default) we fsync ~once per second, and — as
+//!    Redis does — on a DEDICATED THREAD, never on the hub. One hub thread owns
+//!    the whole keyspace, so a `sync_data()` there stalls every client on the
+//!    machine for as long as the disk takes. Under `always` the fsync stays
+//!    inline and its failure is RETURNED, because that policy's whole promise is
+//!    that the client is not told `+OK` until the bytes are down.
 //!
 //! Enabled by setting LOCUS_AOF (a path, or "1" for the default file).
 
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, Read, Write};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Condvar, Mutex};
+use std::thread::{self, JoinHandle};
 
 use crate::commands::execute;
 use crate::db::{Db, Value, now_ms};
@@ -64,6 +71,161 @@ fn policy_from_env() -> FsyncPolicy {
     }
 }
 
+/// Debug-only fsync fault injection (`DEBUG AOFFSYNCFAIL 1`), so the durability
+/// contract can be tested without a real full disk. Process-global because the
+/// off-hub fsync thread has to see it too, and because it is set exactly once,
+/// from the hub, in a debug build. Off in a release build: `DEBUG` refuses it,
+/// the same way it refuses `DEBUG PANIC`.
+static FSYNC_FAULT: AtomicBool = AtomicBool::new(false);
+
+pub fn set_fsync_fault(on: bool) {
+    FSYNC_FAULT.store(on, Ordering::Relaxed);
+}
+
+/// The one place an fsync actually happens — and the one place the injected
+/// fault is honoured, so the real and the simulated failure take the same path.
+fn sync_now(file: &File) -> io::Result<()> {
+    if FSYNC_FAULT.load(Ordering::Relaxed) {
+        return Err(io::Error::other(
+            "injected fsync failure (DEBUG AOFFSYNCFAIL)",
+        ));
+    }
+    file.sync_data()
+}
+
+/// What the fsync thread and its owner share.
+struct SyncState {
+    /// A sync has been asked for and not yet started. Coalescing: two requests
+    /// arriving before the thread wakes are one fsync, which is exactly right —
+    /// an fsync flushes everything written so far, so a queue of them would be
+    /// wasted work, and an unbounded queue would be a leak.
+    pending: bool,
+    stop: bool,
+    /// Completed fsyncs, and which thread ran the last one. Test observability:
+    /// this is how `everysec_fsync_runs_off_the_calling_thread` proves the work
+    /// left the hub instead of timing it and hoping.
+    done: u64,
+    #[cfg(test)]
+    thread: Option<thread::ThreadId>,
+}
+
+/// The dedicated fsync thread for the `everysec` policy.
+///
+/// It holds its own `dup()` of the AOF fd (`try_clone`), so it can `sync_data()`
+/// the same file description the hub is appending to without sharing the `File`
+/// through a lock. fsync and append may run concurrently — an fsync flushes
+/// whatever has been written *so far*, which is the everysec contract.
+struct Syncer {
+    state: Arc<(Mutex<SyncState>, Condvar)>,
+    handle: Option<JoinHandle<()>>,
+}
+
+impl Syncer {
+    /// Returns None if the fd could not be duplicated or the thread could not be
+    /// spawned; the caller then falls back to syncing inline — a stall is bad,
+    /// silently stopping fsyncs would be a durability lie.
+    fn spawn(file: &File, healthy: Arc<AtomicBool>) -> Option<Syncer> {
+        let dup = file
+            .try_clone()
+            .map_err(|e| crate::log::warn(&format!("AOF fsync thread: fd clone failed: {e}")))
+            .ok()?;
+        let state = Arc::new((
+            Mutex::new(SyncState {
+                pending: false,
+                stop: false,
+                done: 0,
+                #[cfg(test)]
+                thread: None,
+            }),
+            Condvar::new(),
+        ));
+        let shared = state.clone();
+        let handle = thread::Builder::new()
+            .name("locus-aof-fsync".into())
+            .spawn(move || {
+                let (lock, cv) = &*shared;
+                loop {
+                    let mut st = lock.lock().unwrap_or_else(|e| e.into_inner());
+                    while !st.pending && !st.stop {
+                        st = cv.wait(st).unwrap_or_else(|e| e.into_inner());
+                    }
+                    if st.stop && !st.pending {
+                        break;
+                    }
+                    st.pending = false;
+                    drop(st);
+                    let res = sync_now(&dup);
+                    let mut st = lock.lock().unwrap_or_else(|e| e.into_inner());
+                    st.done += 1;
+                    #[cfg(test)]
+                    {
+                        st.thread = Some(thread::current().id());
+                    }
+                    drop(st);
+                    if let Err(e) = res {
+                        // Latches the AOF unhealthy exactly as an inline failure
+                        // does: the hub's write gate then rejects writes until a
+                        // recovery rewrite replaces the file.
+                        healthy.store(false, Ordering::Relaxed);
+                        crate::log::error(&format!("AOF fsync failed: {e}"));
+                    }
+                    cv.notify_all();
+                }
+            })
+            .map_err(|e| crate::log::warn(&format!("AOF fsync thread: spawn failed: {e}")))
+            .ok()?;
+        Some(Syncer {
+            state,
+            handle: Some(handle),
+        })
+    }
+
+    /// Ask for an fsync and return immediately. This is the call that used to be
+    /// a `sync_data()` on the hub.
+    fn request(&self) {
+        let (lock, cv) = &*self.state;
+        let mut st = lock.lock().unwrap_or_else(|e| e.into_inner());
+        st.pending = true;
+        drop(st);
+        cv.notify_all();
+    }
+
+    #[cfg(test)]
+    fn done(&self) -> u64 {
+        let (lock, _) = &*self.state;
+        let st = lock.lock().unwrap_or_else(|e| e.into_inner());
+        st.done
+    }
+
+    #[cfg(test)]
+    fn last_thread(&self) -> Option<thread::ThreadId> {
+        let (lock, _) = &*self.state;
+        let st = lock.lock().unwrap_or_else(|e| e.into_inner());
+        st.thread
+    }
+}
+
+impl Drop for Syncer {
+    fn drop(&mut self) {
+        {
+            let (lock, cv) = &*self.state;
+            let mut st = lock.lock().unwrap_or_else(|e| e.into_inner());
+            st.stop = true;
+            drop(st);
+            cv.notify_all();
+        }
+        // Join: an AOF is replaced on every rewrite, and a leaked thread per
+        // rewrite would be a slow leak of both threads and fds. The cost is that
+        // a rewrite completing while an fsync is in flight blocks the hub for
+        // the rest of that one fsync — a bounded wait, once per rewrite, versus
+        // an unbounded thread leak. (Detaching instead would also risk the fd
+        // outliving the file the rewrite just replaced.)
+        if let Some(h) = self.handle.take() {
+            let _ = h.join();
+        }
+    }
+}
+
 pub struct Aof {
     file: File,
     last_fsync: u64,
@@ -72,63 +234,121 @@ pub struct Aof {
     /// file now has a hole (an applied-but-unlogged write), so it can't be
     /// trusted again until a full rewrite replaces it. Read by INFO
     /// (`aof_last_write_status`) and the hub's write gate + recovery loop.
-    healthy: bool,
+    /// Shared with the fsync thread, which is the other thing that can fail.
+    healthy: Arc<AtomicBool>,
+    /// The off-hub fsync thread — `Some` only under `everysec`, and only if it
+    /// started. `always` syncs inline (it must return the error), `no` never
+    /// syncs here at all.
+    syncer: Option<Syncer>,
 }
 
 impl Aof {
     pub fn open(path: &str) -> io::Result<Aof> {
+        Aof::open_with_policy(path, policy_from_env())
+    }
+
+    /// `open` with the policy passed in rather than read from the environment —
+    /// the tests need both policies in one process, and mutating a process-wide
+    /// env var from parallel tests is a race, not a fixture.
+    fn open_with_policy(path: &str, policy: FsyncPolicy) -> io::Result<Aof> {
         let file = OpenOptions::new().create(true).append(true).open(path)?;
+        let healthy = Arc::new(AtomicBool::new(true));
+        let syncer = if policy == FsyncPolicy::Everysec {
+            Syncer::spawn(&file, healthy.clone())
+        } else {
+            None
+        };
         Ok(Aof {
             file,
             last_fsync: now_ms(),
-            policy: policy_from_env(),
-            healthy: true,
+            policy,
+            healthy,
+            syncer,
         })
     }
 
     /// False after any failed append/fsync — the log has a hole until rewritten.
     pub fn healthy(&self) -> bool {
-        self.healthy
+        self.healthy.load(Ordering::Relaxed)
     }
 
+    /// Append commands to the log.
+    ///
+    /// Under `always` this includes the fsync, and **its failure is returned**.
+    /// It used to be swallowed: `do_fsync` latched the AOF unhealthy but
+    /// `append` still returned `Ok(())`, so the very write whose fsync had just
+    /// failed was acked `+OK` and only the *next* one was refused by the health
+    /// gate. `always` exists to promise that a client is never told a write is
+    /// durable before it is; that promise was being broken on the one write that
+    /// mattered. The caller turns an `Err` here into an error reply.
     pub fn append(&mut self, commands: &[Vec<Vec<u8>>]) -> io::Result<()> {
         let mut buf = Vec::new();
         for c in commands {
             encode_command(&mut buf, c);
         }
         if let Err(e) = self.file.write_all(&buf) {
-            self.healthy = false;
+            self.healthy.store(false, Ordering::Relaxed);
             crate::log::error(&format!("AOF append failed: {e}"));
             return Err(e);
         }
         if self.policy == FsyncPolicy::Always {
-            self.do_fsync();
+            self.sync_inline()?;
         }
         Ok(())
     }
 
-    /// Under the `everysec` policy, fsync at most once per second. (`always` syncs
-    /// inline in append; `no` never syncs here.)
+    /// Under the `everysec` policy, ask the fsync thread to sync, at most once
+    /// per second. Returns immediately: the disk work happens off the hub, which
+    /// is the whole point — a `sync_data()` here blocked every client on the
+    /// server for as long as the device took. (`always` syncs inline in
+    /// `append`; `no` never syncs here.)
+    ///
+    /// The once-per-second bound is on the REQUEST, so a device slower than a
+    /// second cannot queue up work: requests coalesce into one pending fsync.
     pub fn maybe_fsync(&mut self) {
-        if self.policy == FsyncPolicy::Everysec && now_ms().saturating_sub(self.last_fsync) >= 1000
-        {
-            self.do_fsync();
-        }
-    }
-
-    /// Force an fsync now, regardless of the everysec timer (graceful shutdown).
-    pub fn fsync(&mut self) {
-        self.do_fsync();
-    }
-
-    /// fsync the AOF, surfacing (not swallowing) a failure — a silently-dropped
-    /// fsync error means "everysec" durability is quietly broken.
-    fn do_fsync(&mut self) {
-        if let Err(e) = self.file.sync_data() {
-            self.healthy = false;
-            crate::log::error(&format!("AOF fsync failed: {e}"));
+        if self.policy != FsyncPolicy::Everysec || now_ms().saturating_sub(self.last_fsync) < 1000 {
+            return;
         }
         self.last_fsync = now_ms();
+        match &self.syncer {
+            Some(s) => s.request(),
+            // No thread (clone/spawn failed): keep the guarantee and pay the
+            // stall. Dropping the fsync instead would silently downgrade
+            // `everysec` to `no`.
+            None => {
+                let _ = self.sync_inline();
+            }
+        }
+    }
+
+    /// Force an fsync now, on THIS thread, and wait for it — graceful shutdown
+    /// and the slot-migration commit points. Deliberately synchronous: the
+    /// process is about to exit (or must not proceed), so "asked for" is not
+    /// good enough, "on the disk" is. Syncing our own fd covers everything
+    /// written so far, whatever the fsync thread is doing.
+    pub fn fsync(&mut self) {
+        let _ = self.sync_inline();
+    }
+
+    /// fsync on the calling thread, surfacing (not swallowing) a failure — a
+    /// silently-dropped fsync error means durability is quietly broken.
+    fn sync_inline(&mut self) -> io::Result<()> {
+        self.last_fsync = now_ms();
+        match sync_now(&self.file) {
+            Ok(()) => Ok(()),
+            Err(e) => {
+                self.healthy.store(false, Ordering::Relaxed);
+                crate::log::error(&format!("AOF fsync failed: {e}"));
+                Err(e)
+            }
+        }
+    }
+
+    /// True when this policy acks a write only after the bytes are synced — the
+    /// hub uses it to decide whether a failed append must become an error reply
+    /// to the client that issued it.
+    pub fn acks_after_fsync(&self) -> bool {
+        self.policy == FsyncPolicy::Always
     }
 }
 
@@ -495,6 +715,13 @@ fn fmt_score(s: f64) -> Vec<u8> {
 mod tests {
     use super::*;
 
+    /// `FSYNC_FAULT` is process-global (the fsync thread has to see it), so the
+    /// two tests that touch it must not run at the same time.
+    fn fsync_test_lock() -> std::sync::MutexGuard<'static, ()> {
+        static LOCK: Mutex<()> = Mutex::new(());
+        LOCK.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
     fn run(db: &mut Db, parts: &[&[u8]]) -> Vec<u8> {
         let t: Vec<Vec<u8>> = parts.iter().map(|p| p.to_vec()).collect();
         execute(&t, db)
@@ -637,6 +864,64 @@ mod tests {
         let mut loaded = load(path).unwrap();
         assert_eq!(run(&mut loaded, &[b"GET", b"k"]), b"$1\r\nv\r\n".to_vec());
         assert_eq!(run(&mut loaded, &[b"GET", b"k2"]), b"$2\r\nv2\r\n".to_vec());
+        let _ = fs::remove_file(path);
+    }
+
+    /// 3.4 — the `everysec` fsync must not run on the thread that asks for it.
+    /// Timing this would be a race on a fast SSD; instead the worker records the
+    /// thread that ran the sync, which is a fact, not a measurement.
+    #[test]
+    fn everysec_fsync_runs_off_the_calling_thread() {
+        let path = "/tmp/locus_aof_offthread.aof";
+        let _guard = fsync_test_lock();
+        let _ = fs::remove_file(path);
+        let mut a = Aof::open_with_policy(path, FsyncPolicy::Everysec).unwrap();
+        a.append(&[vec![b"SET".to_vec(), b"k".to_vec(), b"v".to_vec()]])
+            .unwrap();
+        assert!(a.syncer.is_some(), "everysec must own an fsync thread");
+        // Pretend a second has passed, then ask. The call must return without
+        // having done the sync itself.
+        a.last_fsync = now_ms().saturating_sub(2000);
+        a.maybe_fsync();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while a.syncer.as_ref().unwrap().done() == 0 {
+            assert!(std::time::Instant::now() < deadline, "fsync never happened");
+            thread::sleep(std::time::Duration::from_millis(5));
+        }
+        assert_ne!(
+            a.syncer.as_ref().unwrap().last_thread(),
+            Some(thread::current().id()),
+            "the fsync ran on the caller's thread — that is the hub stall"
+        );
+        assert!(a.healthy());
+        // A second request inside the same second is not made at all.
+        a.maybe_fsync();
+        assert_eq!(a.syncer.as_ref().unwrap().done(), 1);
+        drop(a); // joins the thread; a leak here would leak one per AOF rewrite
+        let _ = fs::remove_file(path);
+    }
+
+    /// 3.3 — under `always`, a failed fsync must be RETURNED by the append that
+    /// incurred it. Before this it latched the AOF unhealthy and returned Ok, so
+    /// the write whose fsync had just failed was still acked.
+    #[test]
+    fn always_returns_the_fsync_error_on_the_write_that_failed() {
+        let path = "/tmp/locus_aof_alwaysfail.aof";
+        let _guard = fsync_test_lock();
+        let _ = fs::remove_file(path);
+        let mut a = Aof::open_with_policy(path, FsyncPolicy::Always).unwrap();
+        assert!(a.acks_after_fsync());
+        assert!(a.syncer.is_none(), "always syncs inline, not on a thread");
+        a.append(&[vec![b"SET".to_vec(), b"a".to_vec(), b"1".to_vec()]])
+            .expect("a healthy append is Ok");
+
+        set_fsync_fault(true);
+        let err = a
+            .append(&[vec![b"SET".to_vec(), b"b".to_vec(), b"2".to_vec()]])
+            .expect_err("a failed fsync under `always` must not report success");
+        assert!(err.to_string().contains("injected fsync failure"), "{err}");
+        assert!(!a.healthy(), "the log is latched unhealthy too");
+        set_fsync_fault(false);
         let _ = fs::remove_file(path);
     }
 

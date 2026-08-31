@@ -115,6 +115,11 @@ impl Locus {
             .env("LOCUS_RDB", &rdb)
             .env_remove("LOCUS_AOF")
             .env_remove("LOCUS_MAXMEMORY")
+            // No automatic snapshots while we are timing the hub: a save point
+            // firing mid-benchmark would serialize the whole dataset on the very
+            // thread under measurement. (redis-server is launched with `--save
+            // ""` below for the same reason — the comparison stays fair.)
+            .env("LOCUS_SAVE", "")
             .stdout(Stdio::piped())
             .stderr(Stdio::null())
             .spawn()
