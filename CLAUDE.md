@@ -133,7 +133,7 @@ sliced by pid, so neither another test nor another `cargo test` process can take
 a spawning node. If a cluster node ever does die at startup again, the panic now carries the child's
 exit status and stderr instead of just "node exited early".
 
-**Still flaky, and not yet owned by any session:** `disk_tier_survives_kill9_with_aof_and_rewrite`
-waits a fixed 300 ms for `BGREWRITEAOF` to land. That holds in a normal run but not on a heavily loaded
-machine — measured 8 red in 24 with eight suites running at once, and 0 in 20 running normally. It is a
-test-timing bug, not a product bug. Re-run before diagnosing, and say so in your report.
+**Both test flakes are fixed.** `free_port()` above (session 1b), and
+`disk_tier_survives_kill9_with_aof_and_rewrite` (session 2b, item 2b.4) — it no longer sleeps a fixed
+300 ms for `BGREWRITEAOF`; it polls `aof_rewrite_in_progress` down to 0. The suite is green on both
+feature sets with no known timing races.
