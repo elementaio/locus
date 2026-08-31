@@ -106,26 +106,36 @@ or issue.
 | `plans/IMPROVEMENTS-AUDIT-2026-07.md` | The July multi-agent audit — 84 findings, mostly still open |
 | `docs/` | The published documentation (README's targets) |
 
-## Current state — updated 2026-08-27 after session 3
+## Current state — updated 2026-09-01 after session 4
 
-v0.7.0, ~18,000 lines of Rust (`std`-only except `src/tls.rs`, which is behind the optional feature),
-110 unit + 111 integration tests green. Phases 0 and 1 of the plan are done: the hub now has a panic
-boundary, and the three live-verified ACL defects are closed. Session 1b then cleared the debt those
-left behind — the port flake, the ACL handshake gate, the release tags, and the publication gate.
-Session 2b pulled the sentinel peer-plane authentication forward out of phase 6 and corrected every
-document that claimed partition-safety.
+v0.8.0, ~18,500 lines of Rust (`std`-only except `src/tls.rs`, which is behind the optional feature),
+116 unit + 116 integration tests green on both feature sets. **Phases 0–3 of the plan are done**,
+tagged `v0.7.0` (phases 0–2 + the pulled-forward sentinel security fix) and `v0.8.0` (phase 3). Nothing
+is pushed to `origin` yet — that is the owner's call.
 
-**Phase 2 is done.** Session 2 landed the perf harness (`tests/perf.rs`) and item 2.1: the memory-size
-estimate is now refreshed lazily instead of after every write, which took large-collection writes from
-60–268× Redis to **3.4–5.2×** (28–99× faster). Writing into a 200k-element collection now costs the
-same as writing a fresh key. Session 3 then landed item 2.2: the zset range reads walk the ordered
-index in place instead of cloning the whole set, taking `ZRANGE key 0 9` on a 200k-member zset from
-38.7 ms to **0.087 ms** (446×, 565× Redis → **1.6×**). Replies were proved byte-identical against the
-pre-fix binary over an 11,658-command corpus.
+- **Phase 1** — the hub has a panic boundary (`catch_unwind`; a command bug becomes one `-ERR`, not an
+  outage), and the three live-verified ACL defects are closed. Session 1b cleared the debt behind it
+  (the port flake, the ACL handshake gate, the release tags, the publication gate).
+- **Phase 2 (perf)** — memory accounting is lazy now, so large-collection writes went from 60–268×
+  Redis to low single digits (writing into a 200k-element collection costs the same as a fresh key);
+  and zset range reads walk the ordered index in place, taking `ZRANGE key 0 9` on a 200k zset from
+  ~34 ms to ~0.05 ms (446×). The perf harness is `tests/perf.rs`.
+- **Session 2b (security)** — the sentinel peer plane is authenticated (loopback by default, shared
+  secret on every verb, refuse-to-start without one), closing an unauthenticated `SWITCH`
+  replication-takeover; and every doc that claimed partition-safety was corrected.
+- **Phase 3 (durability)** — automatic save points (`LOCUS_SAVE`, on by default at Redis's cadence);
+  a CRC-32 footer on every RDB (bad checksum refuses to start; pre-0.8.0 snapshots still load);
+  `appendfsync=always` now returns `-MISCONF` instead of acking a failed fsync; `everysec` fsync moved
+  off the hub; and `BGSAVE` stays on the hub (no `fork()` — unsafe with 2N threads) with the stall
+  measured (`rdb_last_bgsave_hub_stall_us`) and a backup-from-a-replica procedure in `docs/DEPLOYMENT.md`.
 
-`ZRANK` remains O(rank) — deliberately. `std` has no order-statistic tree, and the bookkeeping needed
-to make it O(log n) would put the map-and-index-in-lock-step invariant at risk for a gain on a cold
-path. Next is phase 3 (durability holes); see `plans/EXECUTION-PLAN-2026-08.md`.
+`ZRANK` remains O(rank) — deliberately (no order-statistic tree in `std`; the bookkeeping would risk
+the map-and-index lock-step invariant for a cold-path gain).
+
+**Next: phase 4 — "make the flagship honest"** (session 5: changefeed consumer-group redelivery; session
+6: spatial-index precision — `GEOSEARCH` at a large radius still stalls the hub). One small follow-up is
+open: **session 3b**, converting `ZRANGEBYSCORE`'s low-bound `skip_while` to a `range` seek. See
+`plans/EXECUTION-PLAN-2026-08.md` and `plans/SESSIONS.md`.
 
 **The `node exited early` flake is fixed** (session 1b). `free_port()` no longer bind-races: it hands
 out ports from a fixed window below every OS ephemeral range, walked by a process-wide counter and
