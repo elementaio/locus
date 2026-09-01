@@ -42,6 +42,30 @@ installed. Its assertions are deliberately *ratios* (writing into a 200k-element
 within 5× of writing into an empty one), so they catch per-write work that grows with the data instead
 of flaking on a busy machine. `LOCUS_PERF_N` and `LOCUS_PERF_LIST` shrink it for a quick check.
 
+## The differential and fault harnesses
+
+Changing a command's *behaviour*? `tests/differential.rs` runs randomized command sequences against the
+`locusdb` engine in-process and against a real `redis-server` over a socket, and diffs the replies. The
+default `cargo test` runs a small smoke subset; the long randomized run is opt-in:
+
+```console
+cargo test --test differential -- --ignored --nocapture   # the long run + a coverage report
+LOCUS_DIFF_ALL=1 cargo test --test differential -- --ignored   # report every distinct divergence, not just the first
+```
+
+A failure prints the seed, the whole sequence and both replies, and the command line that reproduces it.
+The normalizations it applies — unordered replies, error codes rather than error prose, TTL slack — are
+listed in `norm_for`, and each one is *counted*, so the run tells you how often it actually had to relax
+a comparison. It needs a `redis-server` on `PATH` and skips cleanly without one.
+
+`tests/fault.rs` is the other half: a real server over a socket, with a fault injected mid-path — the
+master SIGKILLed under load, a replication link dropped, a failover raced by two sentinels, a slot
+migrated while it is being written to. Touching replication, failover or resharding? Run it.
+
+Known-unsafe paths are *asserted*, not failed: `docs/DEPLOYMENT.md` says a partitioned old master is
+never fenced and its writes are discarded on reconciliation, and `fault.rs` pins exactly that, so a
+change in either direction is caught.
+
 ## Adding a command
 
 Most commands are small:

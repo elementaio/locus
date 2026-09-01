@@ -3734,46 +3734,52 @@ fn sentinel_holds_failover_without_quorum() {
     );
 }
 
-/// Hand out a TCP port for a child that has to be *told* its port before it
-/// starts — cluster and sentinel nodes, whose peers are named on the command
-/// line, so `LOCUS_PORT=0` and read-it-back (what `Server::spawn_at` does) is
-/// not available to them.
+/// This harness's id in `free_port`'s slice map: the end-to-end suite.
+const HARNESS: u32 = 0;
+
+/// Hand out a TCP port from a fixed window *below* every platform's ephemeral
+/// range, so the kernel never allocates from it on its own.
+///
+/// The window is sliced two ways, and both matter. The **low two bits of the
+/// slice index are the harness's own id** (`HARNESS` below), so the four test
+/// binaries `cargo test` runs *concurrently* — integration, fault, differential,
+/// perf — can never draw the same number as each other however their pids fall.
+/// That is a guarantee, not a probability, and it is what session 8 needed: it
+/// added a third and fourth server-spawning binary to a suite that previously
+/// leaned on consecutive pids landing in different slices. The **rest of the
+/// index is the pid** (mod 64), which separates two concurrent `cargo test`
+/// processes.
+///
+/// Within a slice a process-wide counter walks the numbers, so no two callers
+/// here are given the same one. Each candidate is still bind-checked, in case
+/// something unrelated on the machine holds it.
 ///
 /// The old shape — bind `:0`, keep the number, drop the listener — left a race
-/// the suite lost about one run in four. Between the drop and the child's own
-/// bind, the kernel is free to hand that same ephemeral port to anything else
-/// asking for `:0`: another test's `Server::start()`, or a second `cargo test`
-/// process. The child then dies at startup on `EADDRINUSE` and the test fails
-/// with "node exited early", far from the actual cause.
-///
-/// So allocate out of a fixed window that sits *below* every platform's
-/// ephemeral range (Linux assigns from 32768, macOS from 49152), which the
-/// kernel therefore never hands out on its own, and walk it with a
-/// process-wide counter so no two callers here can be given the same number.
-/// The window is sliced by pid so concurrent test processes — whose pids are
-/// consecutive — start in different slices and cannot overlap either. Each
-/// candidate is still bind-checked, in case something unrelated on the machine
-/// is holding it.
+/// the suite lost about one run in four: between the drop and the child's own
+/// bind the kernel could hand that ephemeral port to anything else asking for
+/// `:0`, and the child then died at startup on `EADDRINUSE`.
 fn free_port() -> u16 {
-    const BASE: u32 = 20_000;
-    const SLICE: u32 = 96; // ports per process; the suite draws ~35
-    const SLICES: u32 = 128;
-    const SPAN: u32 = SLICE * SLICES; // 20_000..32_288
+    // 16_384..32_768: above the crowded low ports, below Linux's ephemeral
+    // range (32_768) and macOS's (49_152), so the kernel never draws from it.
+    const BASE: u32 = 16_384;
+    const SLICE: u32 = 64; // ports per slice; the busiest harness draws ~35
+    const HARNESSES: u32 = 4; // integration, perf, differential, fault
+    const GROUPS: u32 = 64; // pid groups
+    const SLICES: u32 = GROUPS * HARNESSES; // 256
+    const SPAN: u32 = SLICE * SLICES; // 16_384
     static NEXT: AtomicU64 = AtomicU64::new(0);
 
-    let start = (std::process::id() % SLICES) * SLICE;
+    let slice = (std::process::id() % GROUPS) * HARNESSES + HARNESS;
+    let start = slice * SLICE;
     for _ in 0..SPAN {
         let n = (NEXT.fetch_add(1, Ordering::Relaxed) % u64::from(SPAN)) as u32;
         let port = (BASE + (start + n) % SPAN) as u16;
-        match TcpListener::bind(("127.0.0.1", port)) {
-            // Dropped at once — the child re-binds it. Safe now: this process
-            // will not hand the number out again, and the kernel does not
-            // allocate from this window.
-            Ok(listener) => {
-                drop(listener);
-                return port;
-            }
-            Err(_) => continue,
+        // Dropped at once — the child re-binds it. Safe: this process will not
+        // hand the number out again, no sibling harness draws from this slice,
+        // and the kernel does not allocate from this window.
+        if let Ok(listener) = TcpListener::bind(("127.0.0.1", port)) {
+            drop(listener);
+            return port;
         }
     }
     panic!("no free port in {}..{}", BASE, BASE + SPAN);

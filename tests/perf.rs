@@ -68,23 +68,49 @@ const CONN_OPS: usize = 100_000;
 
 // === the servers ============================================================
 
+/// This harness's id in `free_port`'s slice map: the performance harness.
+const HARNESS: u32 = 1;
+
 /// Hand out a TCP port from a fixed window *below* every platform's ephemeral
-/// range, walked by a process-wide counter and sliced by pid — the same shape
-/// `tests/integration.rs::free_port` uses, and for the same reason: bind-`:0`-
-/// then-drop loses a race against anything else asking the kernel for a port.
-/// Only `redis-server` needs this; the Locus child is told `LOCUS_PORT=0` and
-/// reports back the port it actually got.
+/// range, so the kernel never allocates from it on its own.
+///
+/// The window is sliced two ways, and both matter. The **low two bits of the
+/// slice index are the harness's own id** (`HARNESS` below), so the four test
+/// binaries `cargo test` runs *concurrently* — integration, fault, differential,
+/// perf — can never draw the same number as each other however their pids fall.
+/// That is a guarantee, not a probability, and it is what session 8 needed: it
+/// added a third and fourth server-spawning binary to a suite that previously
+/// leaned on consecutive pids landing in different slices. The **rest of the
+/// index is the pid** (mod 64), which separates two concurrent `cargo test`
+/// processes.
+///
+/// Within a slice a process-wide counter walks the numbers, so no two callers
+/// here are given the same one. Each candidate is still bind-checked, in case
+/// something unrelated on the machine holds it.
+///
+/// The old shape — bind `:0`, keep the number, drop the listener — left a race
+/// the suite lost about one run in four: between the drop and the child's own
+/// bind the kernel could hand that ephemeral port to anything else asking for
+/// `:0`, and the child then died at startup on `EADDRINUSE`.
 fn free_port() -> u16 {
-    const BASE: u32 = 20_000;
-    const SLICE: u32 = 96;
-    const SLICES: u32 = 128;
-    const SPAN: u32 = SLICE * SLICES;
+    // 16_384..32_768: above the crowded low ports, below Linux's ephemeral
+    // range (32_768) and macOS's (49_152), so the kernel never draws from it.
+    const BASE: u32 = 16_384;
+    const SLICE: u32 = 64; // ports per slice; the busiest harness draws ~35
+    const HARNESSES: u32 = 4; // integration, perf, differential, fault
+    const GROUPS: u32 = 64; // pid groups
+    const SLICES: u32 = GROUPS * HARNESSES; // 256
+    const SPAN: u32 = SLICE * SLICES; // 16_384
     static NEXT: AtomicU64 = AtomicU64::new(0);
 
-    let start = (std::process::id() % SLICES) * SLICE;
+    let slice = (std::process::id() % GROUPS) * HARNESSES + HARNESS;
+    let start = slice * SLICE;
     for _ in 0..SPAN {
         let n = (NEXT.fetch_add(1, Ordering::Relaxed) % u64::from(SPAN)) as u32;
         let port = (BASE + (start + n) % SPAN) as u16;
+        // Dropped at once — the child re-binds it. Safe: this process will not
+        // hand the number out again, no sibling harness draws from this slice,
+        // and the kernel does not allocate from this window.
         if let Ok(listener) = TcpListener::bind(("127.0.0.1", port)) {
             drop(listener);
             return port;

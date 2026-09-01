@@ -102,19 +102,22 @@ or issue.
 | `src/lib.rs` | The `locusdb` **library** — the engine (keyspace, commands, codec, persistence, geo, sketches), no server; `main.rs` is the thin `locus` binary over it |
 | `src/util.rs` | Tiny shared helpers (`ct_eq`) used by both the library and the binary |
 | `tests/perf.rs` · `tests/embedding.rs` | The perf harness (`#[ignore]`d, spawns a server) · the out-of-crate embedding test (proves the public API) |
+| `tests/differential.rs` | The command differential — randomized sequences run against the engine in-process **and** a real `redis-server`, replies diffed (smoke subset by default, long run `#[ignore]`d) |
+| `tests/fault.rs` | Fault injection over a spawned server — master SIGKILLed mid-stream, replication link dropped, failover raced, slot migrated under load |
 | `plans/EXECUTION-PLAN-2026-08.md` | **The current plan.** What we are fixing and why |
 | `plans/SESSIONS.md` | **The session ledger.** Briefs, delivery reports, manager reviews |
 | `plans/DESIGN-PRINCIPLES.md` | The identity above, argued in full |
 | `plans/IMPROVEMENTS-AUDIT-2026-07.md` | The July multi-agent audit — 84 findings, mostly still open |
 | `docs/` | The published documentation (README's targets) |
 
-## Current state — updated 2026-09-01 after session 7 (phase 5.1: library)
+## Current state — updated 2026-09-01 after session 8 (phase 5.2: the harnesses)
 
-v0.9.0 (unreleased), ~18,900 lines of Rust (`std`-only except `src/tls.rs`, which is behind the
-optional feature), 129 unit + 128 integration tests green on both feature sets. **Phases 0–3 are done
-and phase 4 is in progress.** Tagged and **pushed** to public `origin`: `v0.7.0` (phases 0–2 + the
-pulled-forward sentinel security fix) and `v0.8.0` (phase 3). Phase-4 work (session 5) is committed on
-`main` but unreleased.
+v0.11.0 (unreleased), ~19,000 lines of Rust plus ~3,500 of new test harness (`std`-only except
+`src/tls.rs`, which is behind the optional feature), 135 unit + 128 integration + 6 embedding +
+5 differential + 7 fault tests green on both feature sets. **Phases 0–5 are done.** Tagged and
+**pushed** to public `origin`: `v0.7.0` (phases 0–2 + the pulled-forward sentinel security fix) and
+`v0.8.0` (phase 3). `v0.9.0` (phase 4) and `v0.10.0` (the library) are tagged but not pushed; `v0.11.0`
+(session 8's fixes) is committed, untagged and unreleased.
 
 - **Phase 1** — the hub has a panic boundary (`catch_unwind`; a command bug becomes one `-ERR`, not an
   outage), and the three live-verified ACL defects are closed. Session 1b cleared the debt behind it
@@ -149,10 +152,36 @@ with a backward-compatible load. This is committed as **unreleased v0.9.0** (`Ca
 the `[0.9.0]` CHANGELOG section is open) but **not tagged and not pushed** — v0.9.0 waits for the rest
 of phase 4.
 
-**Still open before the v0.9.0 tag:**
-**Next: session 8** — the differential + fault-injection harness (phase 5.2), a two-part harness
-(in-process command differential vs `redis-server`, plus spawn-a-server fault injection on
-replication/failover/reshard). It closes phase 5 and is the credibility gate.
+**Phase 5 is closed.** Session 8 landed item 5.2, the credibility gate: two harnesses, and they found
+nine defects between them.
+
+`tests/differential.rs` runs randomized, seeded command sequences against the `locusdb` engine
+**in-process** and a real `redis-server` over a socket and diffs the replies — **2,245,423 commands
+clean** in one run after the fixes (4,000 sequences x 500 commands, fresh seeds). Its normalizations
+(unordered replies as multisets, errors by code, TTL slack) are each *counted*, and the counts say
+something worth knowing: out of 33,373 float-shaped and 500,905 error comparisons, the float and
+error-text relaxations fired **zero** times — Locus's double formatting and its error messages are
+byte-identical to Redis's everywhere the harness reaches.
+
+`tests/fault.rs` covers what an in-process diff cannot: a real binary over a socket with the master
+SIGKILLed under load (the replica must hold a consistent prefix), a replication link dropped mid-stream
+(the resumed stream must replay exactly the missed commands), a stale replica past the backlog (must be
+sent for a full resync, not handed a hole), a failover raced by two sentinels (exactly one promotion,
+every `WAIT`-acknowledged write survives), and a slot migrated under concurrent writes (nothing lost,
+nothing duplicated). **It found no product bug** — those paths hold under the faults injected. Per the
+ratified phase-6 posture, the documented-unsafe path is *pinned as an assertion*: a returned old master
+is not fenced and its writes are silently discarded, exactly as `docs/DEPLOYMENT.md` says, so a change
+in either direction now fails a test.
+
+The seven behavioural divergences and two panics it found are fixed and released as **v0.11.0**
+(unreleased, untagged) — negative-index clamping in `GETRANGE`/`BITCOUNT`/`BITPOS`, the
+missing-source short-circuit in `LMOVE`/`RPOPLPUSH`/`SMOVE`, a self-move silently dropping a key's TTL,
+`SET`'s contradictory-option handling, non-canonical integers (`+1`, `02`, `-0`) being accepted, a glob
+matcher with no `[...]` character classes (**which silently emptied any ACL pattern using them**),
+`INCRBYFLOAT`'s rendering, and two commands that panicked on a bare command name. See the `[0.11.0]`
+CHANGELOG section; each has a regression test verified red on `469b376`.
+
+**Next: session 9** — the P3-batch of small correctness items, and the loose end in session 3b.
 
 **Phase 6 is DECIDED (2026-09-01): freeze & document (A).** The cluster/sentinel layer ships as
 documented-unsafe — "trusted network, operator-driven, not partition-safe" — and gets **no further
@@ -193,6 +222,16 @@ out ports from a fixed window below every OS ephemeral range, walked by a proces
 sliced by pid, so neither another test nor another `cargo test` process can take a port out from under
 a spawning node. If a cluster node ever does die at startup again, the panic now carries the child's
 exit status and stderr instead of just "node exited early".
+
+**Session 8 tightened `free_port` again.** The pid-derived slice separated two concurrent `cargo test`
+*processes* but left the test binaries *inside* one run leaning on their pids happening to differ — and
+with four server-spawning binaries (session 8 added the third and fourth) that started losing:
+`EADDRINUSE` at child startup in two of six full runs. The slice index now carries the harness's own id
+in its low bits, so integration, perf, differential and fault provably cannot collide with each other,
+and the window widened to 16384–32768 so pid separation was not traded away for it. The differential
+harness also keeps **one** reference `redis-server` alive at a time rather than one per test — a full
+concurrent run had managed to get one killed mid-assertion — and handshakes with `PING` before handing
+the connection out.
 
 **Both test flakes are fixed.** `free_port()` above (session 1b), and
 `disk_tier_survives_kill9_with_aof_and_rewrite` (session 2b, item 2b.4) — it no longer sleeps a fixed

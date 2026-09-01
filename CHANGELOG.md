@@ -64,6 +64,41 @@ sequences of 500 commands — 2,245,423 executed, zero unexplained divergences.
   guard cannot come back quietly. (Found by the differential harness's own coverage probe, which asks
   each command name whether the engine knows it by sending exactly that: the name and nothing else.)
 
+### Added
+
+- **`tests/differential.rs`** — the command-level differential harness. Randomized, seeded sequences
+  over strings, lists, hashes, sets, sorted sets, bitmaps, expiry and the scan family, executed against
+  a `Db` in-process and a `redis-server` over a socket, with the replies diffed after a written-down set
+  of normalizations (unordered replies as multisets, errors by code, TTLs with wall-clock slack) — each
+  of which is *counted*, so the run reports how often it actually had to relax a comparison. A failure
+  prints the seed, the sequence, both replies and the command line that reproduces it. The default
+  `cargo test` runs a smoke subset; `--ignored` runs the long one, plus a coverage report that probes
+  which Redis commands in the shared families the engine implements.
+- **`tests/fault.rs`** — the fault-injection harness. A real `locus` binary over a socket with a fault
+  injected mid-path: the master SIGKILLed under load (the replica must hold a consistent prefix), a
+  replication link dropped mid-stream (the resumed stream must replay exactly the missed commands), a
+  replica whose offset fell out of the backlog (must be sent for a full resync, not handed a hole), a
+  failover raced by two sentinels (exactly one promotion; every `WAIT`-acknowledged write survives), and
+  a slot migrated under concurrent writes (nothing lost, nothing left duplicated on the source).
+  Documented-unsafe paths are *asserted rather than failed*: `docs/DEPLOYMENT.md` says a returned old
+  master is never fenced and its writes are silently discarded, and the harness pins exactly that.
+
+- **The test harnesses' port windows are now provably disjoint.** `free_port` slices a fixed window
+  below every platform's ephemeral range; the slice index used to come from the pid alone, which
+  separated two concurrent `cargo test` *processes* but left the test binaries *within* one run relying
+  on their pids happening to differ. With four server-spawning binaries running at once (this release
+  added the third and fourth) that started losing — two of six full runs died on `EADDRINUSE` at
+  startup. The slice index now carries the harness's own id in its low bits, so integration, perf,
+  differential and fault cannot draw the same number as each other however their pids fall, and the
+  window widened to 16384–32768 so pid separation was not traded away for it. The differential harness
+  additionally holds a lock while it has a reference server up, so one `redis-server` exists at a time
+  rather than one per test — a full concurrent run had otherwise managed to get one killed
+  mid-assertion — and it handshakes with `PING` before handing the connection out, because a listening
+  socket is not a ready server.
+
+Both harnesses need a `redis-server` on `PATH` only where they compare against one, and skip cleanly —
+printing why — when there isn't one. A missing Redis never fails the suite.
+
 ## [0.10.0] — 2026-09-01
 
 - Internal: the release profile now enables thin LTO — the library split moved the hub→engine calls

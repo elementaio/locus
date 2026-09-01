@@ -88,6 +88,14 @@ The seam is the `Db` + `execute` pair: the hub calls `execute_proto` on the keys
 embedder calls exactly the same function on a `Db` it owns. Nothing in the library knows a server
 exists. See [Embedding Locus as a library](../README.md#embedding-locus-as-a-library).
 
+The two-target split is also what makes the test harnesses possible, and they divide along the same
+line. `tests/differential.rs` drives the **library** in-process — no ports, no threads, the `Db`
+inspectable between commands — and diffs its replies against a real `redis-server` over a socket; the
+asymmetry is deliberate, because it removes every timing variable from our side of the comparison. What
+it can therefore never see is the hub, the connection layer, replication or the cluster, so
+`tests/fault.rs` covers those the other way: the real **binary** over a real socket, with a fault
+injected mid-path.
+
 ## Values and expiry
 
 A key maps to a `Value` — one of `Str`, `List`, `Hash`, `Set`, `ZSet`, `Stream`, `Geo` (a lon/lat

@@ -536,7 +536,21 @@ cargo fmt                  # formatting
 # it spawns a redis-server too when the machine has one, and skips that
 # column cleanly when it doesn't.
 cargo test --release --test perf -- --ignored --nocapture
+
+# the differential harness — randomized command sequences run against the
+# locusdb engine in-process AND a real redis-server, with the replies diffed.
+# The default run is a small smoke subset; --ignored is the long one.
+cargo test --test differential -- --ignored --nocapture
+
+# the fault-injection harness — a real server over a real socket with the
+# master killed mid-stream, a replication link dropped, a failover raced, and
+# a slot migrated under concurrent writes.
+cargo test --test fault
 ```
+
+`differential` and `perf` both need a `redis-server` on `PATH` to compare against
+and skip cleanly, printing why, when there isn't one — a missing Redis never
+fails the suite.
 
 ## Contributing
 

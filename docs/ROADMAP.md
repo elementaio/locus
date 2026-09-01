@@ -58,6 +58,12 @@ See [CHANGEFEED.md](CHANGEFEED.md), [GEO.md](GEO.md), [SKETCHES.md](SKETCHES.md)
   connections, replication, cluster, sentinel) stays in the binary. It is also what the fuzz targets and
   the differential harness are built on. See
   [Embedding Locus as a library](../README.md#embedding-locus-as-a-library).
+- **Differential + fault testing (since 0.11.0):** `tests/differential.rs` runs randomized, seeded
+  command sequences against the engine in-process *and* a real `redis-server`, diffing the replies past
+  a written-down list of legitimate normalizations; `tests/fault.rs` injects faults into a live server —
+  master SIGKILLed under load, replication link dropped mid-stream, failover raced by two sentinels,
+  slot migrated under concurrent writes — and asserts the invariant that has to hold. Documented-unsafe
+  HA paths are pinned as assertions rather than treated as failures.
 - **Geo depth:** geohash **spatial index** (sub-linear `GEOSEARCH`) + combined `WHERE` attribute filters.
 - **Sorted sets:** ordered index (std `BTreeSet`) for range/rank without re-sorting on read — and
   since 0.7.0 the range reads walk it in place rather than cloning the set, so a top-10 is O(log n + m)
