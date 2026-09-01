@@ -209,16 +209,25 @@ single-threaded hub guarantees it). The connection enters push mode (like pub/su
 | `CDCUNSUBSCRIBE` | leave push mode |
 | `CDCREAD <offset> [COUNT n] [PREFIX p]` | pull retained changes after `offset` (catch-up after a disconnect); each entry `[offset, event, key, value]` |
 | `CDCGROUP CREATE <group> [offset\|$\|0]` / `CDCGROUP DESTROY <group>` | consumer group (load-balanced read mode); `$`/default = only new, `0` = all retained |
-| `CDCREADGROUP <group> <consumer> [COUNT n]` | deliver the next un-delivered records to a consumer (disjoint across the group); tracked as pending until acked |
+| `CDCREADGROUP <group> <consumer> [0\|FROMPENDING] [COUNT n]` | deliver the next un-delivered records to a consumer (disjoint across the group); tracked as pending until acked. With the `0` / `FROMPENDING` sentinel (as `XREADGROUP … 0`) it re-delivers **this consumer's own** still-pending entries in offset order instead — how a restarted consumer recovers its in-flight work — without moving the group cursor |
 | `CDCACK <group> <offset> [offset ...]` | acknowledge delivery (drop from the pending list) |
-| `CDCPENDING <group>` | `[total, [[consumer, count], …]]` |
+| `CDCPENDING <group> [COUNT n]` | `[total, [[consumer, count], …], [[offset, consumer, idle-ms, delivery-count], …]]` — the third element is the oldest `n` pending entries (default 10; `COUNT 0` = all) |
+| `CDCCLAIM <group> <consumer> <min-idle-ms> <offset> [offset ...]` | transfer the named pending entries to `consumer`, but **only** those idle at least `min-idle-ms` — how a live worker takes over a dead worker's records. Entries that are not pending or not idle enough are skipped, not errors. Resets the idle clock, bumps the delivery count |
+| `CDCAUTOCLAIM <group> <consumer> <min-idle-ms> <start> [COUNT n]` | scan the pending list from offset `start` and claim the first `n` (default 100) idle-enough entries in one call → `[next-start, [entries…]]`; `next-start` is `0` once the scan reached the end, so a recovery sweep loops until it comes back 0 |
 
 Every change carries a **monotonic offset**. Retention for `CDCREAD` is opt-in via
 `LOCUS_CDC_MAXLEN=<records>` (a ring buffer); reading from an offset older than what's retained returns
 `offset out of range` so a consumer knows to re-snapshot. `CDCSUBSCRIBE`'s `snapshot-done` reports the
 high-water offset, so a dropped subscriber can reconnect and `CDCREAD` that offset to catch up, then
 resubscribe. Values are inlined for string keys; other types signal change-only (client re-fetches).
-(Consumer groups / geo-region filters are the next phases.)
+
+Consumer groups are **at-least-once**: a delivered record stays in the group's pending list until it is
+acked, and if the consumer holding it dies, another one recovers it — with `CDCREADGROUP … 0` under the
+same name, or with `CDCCLAIM`/`CDCAUTOCLAIM` from a different one. The pending list rides in the snapshot
+trailer and the full-resync payload, so it survives a graceful restart and reaches a replica on sync —
+but group commands are not themselves logged or replicated, so after an unclean stop a group is only as
+fresh as the last snapshot. See [CHANGEFEED.md](CHANGEFEED.md) for the full recovery loop and its
+limits.
 
 ## Access control (ACL)
 

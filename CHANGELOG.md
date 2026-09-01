@@ -4,6 +4,78 @@ All notable changes to Locus are documented here. The format is based on
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and the project follows
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.9.0] — 2026-09-01
+
+The changefeed's at-least-once promise, made true. Locus positions itself on "a reliable, ordered
+changefeed", and for consumer groups that was not the case: the pending-entries list was written and
+never read back. This release closes it. Existing snapshots and masters load unchanged; nothing about
+the existing `CDCREADGROUP` / `CDCACK` flow changes shape.
+
+### Fixed
+
+- **A dead consumer's in-flight records are no longer lost.** `CDCREADGROUP` added delivered records to
+  a group's pending list and `CDCACK` removed them, but nothing in the server could ever redeliver one.
+  A consumer that crashed between the read and the ack held its records forever — delivered to nobody,
+  acked by nobody — until the `LOCUS_CDC_PEL_MAX` cap silently evicted them. Group delivery was
+  effectively **at-most-once** while being documented as reliable.
+
+  Recovery now has two doors, and which one you use depends on who comes back:
+
+  - **The same consumer restarts.** `CDCREADGROUP <group> <consumer> 0` (the `0` sentinel, or
+    `FROMPENDING` — mirroring `XREADGROUP … 0`) returns that consumer's own still-pending entries in
+    offset order instead of new ones, without moving the group cursor.
+  - **A different consumer takes over.** `CDCCLAIM <group> <consumer> <min-idle-ms> <offset…>`
+    transfers named pending entries, and `CDCAUTOCLAIM <group> <consumer> <min-idle-ms> <start>
+    [COUNT n]` scans and claims in one call, returning `[next-start, [entries…]]` with `next-start = 0`
+    once the scan reaches the end.
+
+  Both are gated on `min-idle-ms`, which is the entire safety story: it is what stops a second worker
+  taking a record the first is still processing. Set it above your slowest expected processing time.
+
+### Added
+
+- **`CDCCLAIM`** and **`CDCAUTOCLAIM`** (above). Offsets that are not pending, or not idle long enough,
+  are skipped rather than erroring — a claim sweep is a race by nature, and the loser should simply get
+  fewer entries back. `CDCAUTOCLAIM` examines at most ten times `COUNT` entries per call and hands back
+  a resume cursor: this runs on the hub, and a pending list at `LOCUS_CDC_PEL_MAX` full of not-yet-idle
+  entries must not turn one command into a global stall.
+- **Pending entries carry metadata.** Each one now records the owning consumer, the last delivery time
+  and a delivery count (mirroring Redis's stream PEL) — the data a claim needs to exist at all.
+- **`CDCPENDING <group> [COUNT n]`** surfaces it:
+  `[total, [[consumer, count], …], [[offset, consumer, idle-ms, delivery-count], …]]`. **The first two
+  elements are unchanged** — the per-entry detail is a third element appended, so existing readers keep
+  working. It lists the oldest `n` entries (default 10, `COUNT 0` for all); bounded by default because a
+  pending list runs to `LOCUS_CDC_PEL_MAX` entries and introspection must not become a stall either. A
+  climbing idle time is a dead consumer; a climbing delivery count is a poison record.
+
+### Changed
+
+- **Snapshot/replication trailer format → `LXT3`.** The trailer that carries changefeed and index state
+  gained the two new per-pending-entry fields. `LXT2` (0.8.0) and `LXT1` snapshots and full-resync
+  payloads **still load**, with the delivery time defaulted to "unknown" — which reads as maximally
+  idle, and that is the correct restore semantic: whoever held an entry before a restart is not coming
+  back for it, so it is immediately claimable.
+
+  **Upgrade replicas before masters.** A 0.9.0 replica reads a 0.8.0 master's full-resync payload; a
+  0.8.0 replica cannot read a 0.9.0 master's, and will refuse it with `bad RDB trailer magic`.
+- A pending entry whose record has since aged out of the retained log (`LOCUS_CDC_MAXLEN`) comes back
+  from a re-read or a claim as `[offset, nil, nil, nil]`. The payload is genuinely gone and the consumer
+  can only ack it — saying so plainly beats dropping the entry and making it look like it was never
+  delivered. Size retention above your worst-case consumer downtime.
+
+### Known limits
+
+- The pending list is still capped at `LOCUS_CDC_PEL_MAX` per group (default 100,000). At the cap the
+  **oldest** unacked entries are dropped with a warning in the log: a consumer that never acks degrades
+  to at-most-once rather than growing hub memory without bound. Unchanged from 0.8.0.
+- **Group state is snapshot-durable, not log-durable** — also unchanged, and worth stating plainly now
+  that redelivery depends on it. `CDCREADGROUP`, `CDCACK` and the claim verbs are not written to the
+  AOF and not propagated over the replication link; the cursor and the pending list travel only in the
+  snapshot trailer and the full-resync payload. After a `kill -9` or a failover a group is therefore
+  only as fresh as the last snapshot: already-acked records can be redelivered (a duplicate, which
+  at-least-once permits), and a group created since the last snapshot is gone. Leave `LOCUS_SAVE` at
+  its default cadence if you depend on group state surviving an unclean stop.
+
 ## [0.8.0] — 2026-09-01
 
 Durability. Four holes between "we have persistence" and "your data is still there afterwards", plus
@@ -662,7 +734,8 @@ milestone. Zero third-party dependencies (pure `std`).
   a skiplist for O(log n) sorted-set ops; full RESP3 typing of every reply; thread-per-core execution.
 - No authentication or TLS yet — bind to a trusted network only.
 
-[Unreleased]: https://github.com/elementaio/locus/compare/v0.8.0...HEAD
+[Unreleased]: https://github.com/elementaio/locus/compare/v0.9.0...HEAD
+[0.9.0]: https://github.com/elementaio/locus/compare/v0.8.0...v0.9.0
 [0.8.0]: https://github.com/elementaio/locus/compare/v0.7.0...v0.8.0
 [0.7.0]: https://github.com/elementaio/locus/compare/v0.6.1...v0.7.0
 [0.6.1]: https://github.com/elementaio/locus/compare/v0.6.0...v0.6.1

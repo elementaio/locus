@@ -46,6 +46,9 @@ See [CHANGEFEED.md](CHANGEFEED.md), [GEO.md](GEO.md), [SKETCHES.md](SKETCHES.md)
   `everysec` fsync moved off the hub onto its own thread. `BGSAVE` still serializes on the hub (no
   `fork()` — see [DEPLOYMENT.md](DEPLOYMENT.md#backing-up-from-a-replica-recommended-at-scale)); the
   stall is published as `rdb_last_bgsave_hub_stall_us`.
+- **Reactive:** and since 0.9.0 the changefeed's consumer groups are genuinely **at-least-once** —
+  a pending entry carries its owner, idle time and delivery count, so a dead consumer's in-flight
+  records are recovered by `CDCREADGROUP … 0`, `CDCCLAIM` or `CDCAUTOCLAIM` instead of being lost.
 - **Replication:** real replid/offset, **`WAIT`**, **PSYNC partial-resync** over a backlog ring, no expiry divergence.
 - **HA + TLS:** built-in **sentinel** auto-failover (quorum + inter-sentinel agreement over an authenticated peer plane) — for a **trusted network**, and **not partition-safe** ([what it guarantees](DEPLOYMENT.md#what-failover-guarantees--and-what-it-does-not)); TLS via sidecar or the optional `tls` feature.
 - **Compat/observability:** `SCAN`/`COMMAND`/`CONFIG`/`SLOWLOG`/`INFO` (works with `redis_exporter`), RESP3 typed replies.

@@ -44,6 +44,12 @@ impl Server {
         Server::spawn_at(rdb.to_string(), &[])
     }
 
+    /// `start_with_rdb` plus environment — a restart test that needs a feature
+    /// switched on (changefeed retention, say) must set it on BOTH rounds.
+    fn start_with_rdb_env(rdb: &str, extra_env: &[(&str, &str)]) -> Server {
+        Server::spawn_at(rdb.to_string(), extra_env)
+    }
+
     fn spawn_at(rdb: String, extra_env: &[(&str, &str)]) -> Server {
         // LOCUS_PORT=0 -> the OS picks a free port; we read the real one back
         // from the server's stdout. No bind-then-drop race between tests.
@@ -921,6 +927,248 @@ fn changefeed_consumer_groups() {
     );
     assert_eq!(g.cmd(&["CDCGROUP", "DESTROY", "grp"]), "1");
     assert_eq!(g.cmd(&["CDCGROUP", "DESTROY", "grp"]), "0");
+}
+
+// === changefeed redelivery (phase 4, item 4.1) ==============================
+//
+// The at-least-once promise: a record delivered to a consumer that then dies
+// must be recoverable by somebody. Before session 5 the pending list was a
+// write-only graveyard — these four tests are the promise made true.
+
+#[test]
+fn changefeed_pending_shows_idle_and_delivery_count() {
+    // 5.1 — the PEL carries who / since when / how often, and CDCPENDING
+    // surfaces it. Without the timestamp there is nothing for CDCCLAIM's
+    // min-idle guard to compare against.
+    let s = Server::start_inner(&[("LOCUS_CDC_MAXLEN", "100")]);
+    let mut w = s.connect();
+    w.cmd(&["SET", "a", "1"]);
+    w.cmd(&["SET", "b", "2"]);
+
+    let mut g = s.connect();
+    assert_eq!(g.cmd(&["CDCGROUP", "CREATE", "grp", "0"]), "OK");
+    assert_eq!(
+        g.cmd(&["CDCREADGROUP", "grp", "c1"]),
+        "[[1, write, a, 1], [2, write, b, 2]]"
+    );
+
+    // [total, [[consumer, count]], [[offset, consumer, idle-ms, delivery-count]]]
+    let p = g.cmd(&["CDCPENDING", "grp"]);
+    assert!(p.starts_with("[2, [[c1, 2]], [[1, c1, "), "{p}");
+    assert!(
+        p.ends_with(", 1]]]"),
+        "delivery count should start at 1: {p}"
+    );
+    // 1 mention in the breakdown + 2 in the detail list.
+    assert_eq!(p.matches("c1").count(), 3, "{p}");
+    // COUNT bounds the detail list (the breakdown is untouched).
+    let p1 = g.cmd(&["CDCPENDING", "grp", "COUNT", "1"]);
+    assert_eq!(p1.matches("c1").count(), 2, "{p1}");
+
+    // A re-delivery bumps the count.
+    assert_eq!(
+        g.cmd(&["CDCREADGROUP", "grp", "c1", "0"]),
+        "[[1, write, a, 1], [2, write, b, 2]]"
+    );
+    let p2 = g.cmd(&["CDCPENDING", "grp"]);
+    assert!(p2.ends_with(", 2]]]"), "delivery count should be 2: {p2}");
+}
+
+#[test]
+fn changefeed_consumer_rereads_its_own_pending() {
+    // 5.2 — a restarted consumer that keeps its name gets its in-flight work
+    // back with the `0` sentinel, in offset order, without moving the cursor.
+    let s = Server::start_inner(&[("LOCUS_CDC_MAXLEN", "100")]);
+    let mut w = s.connect();
+    for (k, v) in [("a", "1"), ("b", "2"), ("c", "3")] {
+        w.cmd(&["SET", k, v]);
+    }
+    let mut g = s.connect();
+    assert_eq!(g.cmd(&["CDCGROUP", "CREATE", "grp", "0"]), "OK");
+    assert_eq!(
+        g.cmd(&["CDCREADGROUP", "grp", "c1", "COUNT", "2"]),
+        "[[1, write, a, 1], [2, write, b, 2]]"
+    );
+    assert_eq!(g.cmd(&["CDCREADGROUP", "grp", "c2"]), "[[3, write, c, 3]]");
+
+    // Each consumer sees ONLY its own pending — c1 does not get c2's record.
+    assert_eq!(
+        g.cmd(&["CDCREADGROUP", "grp", "c1", "0"]),
+        "[[1, write, a, 1], [2, write, b, 2]]"
+    );
+    assert_eq!(
+        g.cmd(&["CDCREADGROUP", "grp", "c2", "FROMPENDING"]),
+        "[[3, write, c, 3]]"
+    );
+
+    // The group cursor did not move: the next new record is delivered once.
+    w.cmd(&["SET", "d", "4"]);
+    assert_eq!(g.cmd(&["CDCREADGROUP", "grp", "c1"]), "[[4, write, d, 4]]");
+    assert_eq!(g.cmd(&["CDCREADGROUP", "grp", "c2"]), "[]");
+
+    // Acked entries drop out of the re-read; the still-unacked one stays.
+    assert_eq!(g.cmd(&["CDCACK", "grp", "1", "2"]), "2");
+    assert_eq!(
+        g.cmd(&["CDCREADGROUP", "grp", "c1", "0"]),
+        "[[4, write, d, 4]]"
+    );
+
+    // A pending record that has since aged out of the retained log comes back
+    // as nulls — the payload is genuinely gone, and saying so beats dropping
+    // the entry and making it look like it was never delivered.
+    let s2 = Server::start_inner(&[("LOCUS_CDC_MAXLEN", "2")]);
+    let mut w2 = s2.connect();
+    w2.cmd(&["SET", "k0", "v"]); // offset 1
+    w2.cmd(&["SET", "k1", "v"]); // offset 2
+    let mut g2 = s2.connect();
+    assert_eq!(g2.cmd(&["CDCGROUP", "CREATE", "g2", "0"]), "OK");
+    assert_eq!(
+        g2.cmd(&["CDCREADGROUP", "g2", "c1"]),
+        "[[1, write, k0, v], [2, write, k1, v]]"
+    );
+    w2.cmd(&["SET", "k2", "v"]); // offset 3 -> evicts 1
+    w2.cmd(&["SET", "k3", "v"]); // offset 4 -> evicts 2
+    assert_eq!(
+        g2.cmd(&["CDCREADGROUP", "g2", "c1", "0"]),
+        "[[1, (nil), (nil), (nil)], [2, (nil), (nil), (nil)]]"
+    );
+}
+
+#[test]
+fn changefeed_claim_recovers_a_dead_consumers_records() {
+    // 5.3 — the acceptance criterion, end to end: a consumer reads records and
+    // never acks (it "crashed"); a NEW consumer claims them after the idle
+    // window and acks them. The records are not lost.
+    let s = Server::start_inner(&[("LOCUS_CDC_MAXLEN", "100")]);
+    let mut w = s.connect();
+    w.cmd(&["SET", "a", "1"]);
+    w.cmd(&["SET", "b", "2"]);
+
+    let mut g = s.connect();
+    assert_eq!(g.cmd(&["CDCGROUP", "CREATE", "grp", "0"]), "OK");
+    assert_eq!(
+        g.cmd(&["CDCREADGROUP", "grp", "worker-1"]),
+        "[[1, write, a, 1], [2, write, b, 2]]"
+    );
+    // ...worker-1 dies here, holding both records.
+
+    // The idle guard holds: a fresh entry cannot be stolen from a live worker.
+    assert_eq!(
+        g.cmd(&["CDCCLAIM", "grp", "worker-2", "10000", "1", "2"]),
+        "[]"
+    );
+    let p = g.cmd(&["CDCPENDING", "grp"]);
+    assert!(p.contains("worker-1") && !p.contains("worker-2"), "{p}");
+
+    // Past the window, worker-2 takes them over and gets the payloads back.
+    sleep(Duration::from_millis(120));
+    assert_eq!(
+        g.cmd(&["CDCCLAIM", "grp", "worker-2", "100", "1", "2"]),
+        "[[1, write, a, 1], [2, write, b, 2]]"
+    );
+    let p = g.cmd(&["CDCPENDING", "grp"]);
+    assert!(p.starts_with("[2, [[worker-2, 2]]"), "{p}");
+    // The claim reset the idle clock and bumped the count (1 -> 2).
+    assert!(p.ends_with(", 2]]]"), "{p}");
+
+    // worker-2 processes and acks: the work is done, nothing is left pending.
+    assert_eq!(g.cmd(&["CDCACK", "grp", "1", "2"]), "2");
+    assert_eq!(g.cmd(&["CDCPENDING", "grp"]), "[0, [], []]");
+
+    // Errors + guards.
+    assert!(
+        g.cmd(&["CDCCLAIM", "nope", "w", "0", "1"])
+            .starts_with("-NOGROUP")
+    );
+    assert!(
+        g.cmd(&["CDCCLAIM", "grp", "w", "0", "notanoffset"])
+            .starts_with("-ERR")
+    );
+}
+
+#[test]
+fn changefeed_autoclaim_sweeps_the_pending_list() {
+    // 5.3 — the scan-and-claim form: one call finds idle entries instead of the
+    // caller naming offsets, and returns a cursor so a sweep can be resumed.
+    let s = Server::start_inner(&[("LOCUS_CDC_MAXLEN", "100")]);
+    let mut w = s.connect();
+    for (k, v) in [("a", "1"), ("b", "2"), ("c", "3")] {
+        w.cmd(&["SET", k, v]);
+    }
+    let mut g = s.connect();
+    assert_eq!(g.cmd(&["CDCGROUP", "CREATE", "grp", "0"]), "OK");
+    assert_eq!(
+        g.cmd(&["CDCREADGROUP", "grp", "worker-1"]),
+        "[[1, write, a, 1], [2, write, b, 2], [3, write, c, 3]]"
+    );
+
+    // Nothing is idle yet -> nothing claimed, and the cursor says "end of list".
+    assert_eq!(
+        g.cmd(&["CDCAUTOCLAIM", "grp", "worker-2", "10000", "0"]),
+        "[0, []]"
+    );
+
+    sleep(Duration::from_millis(120));
+    // COUNT bounds the batch and the cursor points past the last one taken.
+    assert_eq!(
+        g.cmd(&["CDCAUTOCLAIM", "grp", "worker-2", "100", "0", "COUNT", "2"]),
+        "[3, [[1, write, a, 1], [2, write, b, 2]]]"
+    );
+    // Resuming from the cursor finishes the sweep and returns 0 = done.
+    assert_eq!(
+        g.cmd(&["CDCAUTOCLAIM", "grp", "worker-2", "100", "3"]),
+        "[0, [[3, write, c, 3]]]"
+    );
+    let p = g.cmd(&["CDCPENDING", "grp"]);
+    assert!(p.starts_with("[3, [[worker-2, 3]]"), "{p}");
+
+    assert!(
+        g.cmd(&["CDCAUTOCLAIM", "grp", "w", "0", "0", "BOGUS", "2"])
+            .starts_with("-ERR")
+    );
+}
+
+#[test]
+fn changefeed_pending_list_survives_a_restart() {
+    // 5.4 — the pending list (with its new per-entry metadata) is carried in
+    // the snapshot trailer, so a crash does not silently drop in-flight work:
+    // after a restart the entries are still pending, still owned, and still
+    // claimable.
+    let rdb = format!(
+        "{}/locus-cdc-pel-restart-{}.rdb",
+        std::env::temp_dir().display(),
+        std::process::id()
+    );
+    let _ = std::fs::remove_file(&rdb);
+    let env = [("LOCUS_CDC_MAXLEN", "100")];
+    {
+        let mut s = Server::start_with_rdb_env(&rdb, &env);
+        let mut c = s.connect();
+        c.cmd(&["SET", "a", "1"]);
+        c.cmd(&["SET", "b", "2"]);
+        assert_eq!(c.cmd(&["CDCGROUP", "CREATE", "grp", "0"]), "OK");
+        assert_eq!(
+            c.cmd(&["CDCREADGROUP", "grp", "worker-1"]),
+            "[[1, write, a, 1], [2, write, b, 2]]"
+        );
+        assert_eq!(c.cmd(&["SAVE"]), "OK");
+        c.send(&["SHUTDOWN"]);
+        assert!(s.wait_exit().success());
+        std::mem::forget(s); // keep the RDB for round 2
+    }
+    {
+        let s = Server::start_with_rdb_env(&rdb, &env);
+        let mut c = s.connect();
+        let p = c.cmd(&["CDCPENDING", "grp"]);
+        assert!(p.starts_with("[2, [[worker-1, 2]]"), "{p}");
+        // worker-1 did not survive the restart; worker-2 takes over its work.
+        assert_eq!(
+            c.cmd(&["CDCCLAIM", "grp", "worker-2", "0", "1", "2"]),
+            "[[1, write, a, 1], [2, write, b, 2]]"
+        );
+        assert_eq!(c.cmd(&["CDCACK", "grp", "1", "2"]), "2");
+    }
+    let _ = std::fs::remove_file(&rdb);
 }
 
 #[test]

@@ -110,18 +110,43 @@ while True:
         time.sleep(0.25)
 ```
 
-### Consumer groups (load-balanced pull)
+### Consumer groups (load-balanced pull, at-least-once)
 
-Also plain request/reply — N workers share one feed, each record delivered once:
+Also plain request/reply — N workers share one feed, each record delivered to one of them and held
+pending until it is acked:
 
 ```python
 r.execute_command('CDCGROUP', 'CREATE', 'workers', '$')   # $ = only new; 0 = all retained
+
+# On start-up, first drain whatever THIS worker still had in flight when it died.
+# The `0` sentinel re-reads its own pending entries instead of new ones.
+for off, event, key, value in r.execute_command('CDCREADGROUP', 'workers', 'worker-1', '0'):
+    if event is not None:          # None = the record aged out of retention; just ack it
+        process(event, key, value)
+    r.execute_command('CDCACK', 'workers', off)
+
 while True:
+    # Adopt anything a DIFFERENT worker died holding (idle > 60s), then take new work.
+    cursor = 0
+    while True:
+        cursor, claimed = r.execute_command(
+            'CDCAUTOCLAIM', 'workers', 'worker-1', 60000, cursor, 'COUNT', 100)
+        for off, event, key, value in claimed:
+            if event is not None:
+                process(event, key, value)
+            r.execute_command('CDCACK', 'workers', off)
+        if int(cursor) == 0:
+            break
+
     batch = r.execute_command('CDCREADGROUP', 'workers', 'worker-1', 'COUNT', 10)
     for off, event, key, value in batch:
         process(event, key, value)
         r.execute_command('CDCACK', 'workers', off)
 ```
+
+`CDCPENDING workers` shows what is still in flight and how long each entry has been idle — pick the
+`min-idle-ms` above your slowest expected processing time so a live worker is never robbed of a record
+it is still working on. Full semantics in [CHANGEFEED.md](CHANGEFEED.md).
 
 ### Push (live broadcast + geofencing)
 

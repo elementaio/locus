@@ -497,13 +497,25 @@ pub struct CdcRec {
 pub struct CdcGrp {
     pub name: Vec<u8>,
     pub last_delivered: u64,
-    pub pending: Vec<(u64, Vec<u8>)>, // (offset, consumer)
+    pub pending: Vec<CdcPel>,
 }
 
-// Trailer format versions. LXT2 adds the hub HLC (`hlc_last`) and a per-record
-// HLC stamp; LXT1 (pre-clustering) snapshots still load, with HLC defaulted to 0.
+/// One pending-entries-list record: a change delivered to a consumer and not yet
+/// acked, with the metadata redelivery needs (see `PelEntry` in `main.rs`).
+pub struct CdcPel {
+    pub offset: u64,
+    pub consumer: Vec<u8>,
+    pub delivered_ms: u64, // 0 for a pre-LXT3 trailer: unknown = maximally idle
+    pub delivery_count: u64, // 1 for a pre-LXT3 trailer
+}
+
+// Trailer format versions, newest first. LXT3 adds the per-pending-entry
+// delivery timestamp and count that `CDCCLAIM` needs; LXT2 added the hub HLC
+// (`hlc_last`) and a per-record HLC stamp; LXT1 is pre-clustering. All three
+// still load — an older one just defaults the fields it never carried.
 const TRAILER_MAGIC_V1: &[u8; 4] = b"LXT1";
-const TRAILER_MAGIC: &[u8; 4] = b"LXT2";
+const TRAILER_MAGIC_V2: &[u8; 4] = b"LXT2";
+const TRAILER_MAGIC: &[u8; 4] = b"LXT3";
 
 fn put_bytes(buf: &mut Vec<u8>, b: &[u8]) {
     buf.extend_from_slice(&(b.len() as u32).to_le_bytes());
@@ -534,9 +546,11 @@ pub fn append_extras(buf: &mut Vec<u8>, x: &Extras) {
         put_bytes(buf, &g.name);
         buf.extend_from_slice(&g.last_delivered.to_le_bytes());
         buf.extend_from_slice(&(g.pending.len() as u32).to_le_bytes());
-        for (off, consumer) in &g.pending {
-            buf.extend_from_slice(&off.to_le_bytes());
-            put_bytes(buf, consumer);
+        for p in &g.pending {
+            buf.extend_from_slice(&p.offset.to_le_bytes());
+            put_bytes(buf, &p.consumer);
+            buf.extend_from_slice(&p.delivered_ms.to_le_bytes());
+            buf.extend_from_slice(&p.delivery_count.to_le_bytes());
         }
     }
     buf.extend_from_slice(&(x.index_defs.len() as u32).to_le_bytes());
@@ -555,19 +569,24 @@ fn read_extras<R: Read>(r: &mut R) -> io::Result<Extras> {
         Err(e) if e.kind() == io::ErrorKind::UnexpectedEof => return Ok(Extras::default()),
         Err(e) => return Err(e),
     }
-    let v2 = &marker == TRAILER_MAGIC;
-    if !v2 && &marker != TRAILER_MAGIC_V1 {
+    let ver = if &marker == TRAILER_MAGIC {
+        3
+    } else if &marker == TRAILER_MAGIC_V2 {
+        2
+    } else if &marker == TRAILER_MAGIC_V1 {
+        1
+    } else {
         return Err(io::Error::new(
             io::ErrorKind::InvalidData,
             "bad RDB trailer magic",
         ));
-    }
+    };
     let cdc_next_offset = read_u64(r)?;
-    let hlc_last = if v2 { read_u64(r)? } else { 0 };
+    let hlc_last = if ver >= 2 { read_u64(r)? } else { 0 };
     let mut cdc_log = Vec::new();
     for _ in 0..read_u32(r)? {
         let offset = read_u64(r)?;
-        let hlc = if v2 { read_u64(r)? } else { 0 };
+        let hlc = if ver >= 2 { read_u64(r)? } else { 0 };
         let event = read_bytes(r)?;
         let key = read_bytes(r)?;
         let value = if read_u8(r)? == 1 {
@@ -589,8 +608,22 @@ fn read_extras<R: Read>(r: &mut R) -> io::Result<Extras> {
         let last_delivered = read_u64(r)?;
         let mut pending = Vec::new();
         for _ in 0..read_u32(r)? {
-            let off = read_u64(r)?;
-            pending.push((off, read_bytes(r)?));
+            let offset = read_u64(r)?;
+            let consumer = read_bytes(r)?;
+            // Pre-LXT3: no timestamp, no counter. `delivered_ms: 0` reads as
+            // maximally idle, which is the right restore semantic — whoever held
+            // the entry before the restart is not coming back for it.
+            let (delivered_ms, delivery_count) = if ver >= 3 {
+                (read_u64(r)?, read_u64(r)?)
+            } else {
+                (0, 1)
+            };
+            pending.push(CdcPel {
+                offset,
+                consumer,
+                delivered_ms,
+                delivery_count,
+            });
         }
         cdc_groups.push(CdcGrp {
             name,
@@ -928,7 +961,12 @@ mod tests {
             cdc_groups: vec![CdcGrp {
                 name: b"g".to_vec(),
                 last_delivered: 5,
-                pending: vec![(3, b"c1".to_vec())],
+                pending: vec![CdcPel {
+                    offset: 3,
+                    consumer: b"c1".to_vec(),
+                    delivered_ms: 1_700_000_000_123,
+                    delivery_count: 4,
+                }],
             }],
             index_defs: vec![(b"by_city".to_vec(), b"city".to_vec())],
         };
@@ -941,7 +979,11 @@ mod tests {
         assert_eq!(got.cdc_log[0].offset, 7);
         assert_eq!(got.cdc_log[0].hlc, 88);
         assert_eq!(got.cdc_log[0].value.as_deref(), Some(&b"v"[..]));
-        assert_eq!(got.cdc_groups[0].pending, vec![(3u64, b"c1".to_vec())]);
+        let pel = &got.cdc_groups[0].pending[0];
+        assert_eq!(pel.offset, 3);
+        assert_eq!(pel.consumer, b"c1".to_vec());
+        assert_eq!(pel.delivered_ms, 1_700_000_000_123);
+        assert_eq!(pel.delivery_count, 4);
         assert_eq!(
             got.index_defs,
             vec![(b"by_city".to_vec(), b"city".to_vec())]
@@ -1054,6 +1096,116 @@ mod tests {
         );
         assert_eq!(extras.cdc_next_offset, 12);
         let _ = fs::remove_file(path);
+    }
+
+    /// Write the trailer exactly as v0.8.0 did: `LXT2`, and a pending entry
+    /// that is only `(offset, consumer)` — no delivery timestamp, no counter.
+    fn append_extras_lxt2(buf: &mut Vec<u8>, x: &Extras) {
+        buf.extend_from_slice(TRAILER_MAGIC_V2);
+        buf.extend_from_slice(&x.cdc_next_offset.to_le_bytes());
+        buf.extend_from_slice(&x.hlc_last.to_le_bytes());
+        buf.extend_from_slice(&(x.cdc_log.len() as u32).to_le_bytes());
+        for r in &x.cdc_log {
+            buf.extend_from_slice(&r.offset.to_le_bytes());
+            buf.extend_from_slice(&r.hlc.to_le_bytes());
+            put_bytes(buf, &r.event);
+            put_bytes(buf, &r.key);
+            match &r.value {
+                Some(v) => {
+                    buf.push(1);
+                    put_bytes(buf, v);
+                }
+                None => buf.push(0),
+            }
+        }
+        buf.extend_from_slice(&(x.cdc_groups.len() as u32).to_le_bytes());
+        for g in &x.cdc_groups {
+            put_bytes(buf, &g.name);
+            buf.extend_from_slice(&g.last_delivered.to_le_bytes());
+            buf.extend_from_slice(&(g.pending.len() as u32).to_le_bytes());
+            for p in &g.pending {
+                buf.extend_from_slice(&p.offset.to_le_bytes());
+                put_bytes(buf, &p.consumer);
+            }
+        }
+        buf.extend_from_slice(&(x.index_defs.len() as u32).to_le_bytes());
+        for (name, field) in &x.index_defs {
+            put_bytes(buf, name);
+            put_bytes(buf, field);
+        }
+    }
+
+    fn v0_8_0_extras() -> Extras {
+        Extras {
+            cdc_next_offset: 9,
+            hlc_last: 77,
+            cdc_log: vec![CdcRec {
+                offset: 8,
+                hlc: 77,
+                event: b"write".to_vec(),
+                key: b"k".to_vec(),
+                value: Some(b"v".to_vec()),
+            }],
+            cdc_groups: vec![CdcGrp {
+                name: b"g".to_vec(),
+                last_delivered: 8,
+                pending: vec![CdcPel {
+                    offset: 8,
+                    consumer: b"dead-worker".to_vec(),
+                    delivered_ms: 0, // never written by the v0.8.0 writer
+                    delivery_count: 0,
+                }],
+            }],
+            index_defs: vec![],
+        }
+    }
+
+    #[test]
+    fn a_v0_8_0_snapshot_file_still_loads() {
+        // Session 5 grew the pending-entries list; a snapshot written before
+        // that must still open, with the two new fields defaulted.
+        let path = "/tmp/locus_rdb_lxt2.rdb";
+        let _ = fs::remove_file(path);
+        let mut db = Db::new();
+        execute(&to(&[b"SET", b"k", b"v"]), &mut db);
+        let mut bytes = serialize(&db);
+        append_extras_lxt2(&mut bytes, &v0_8_0_extras());
+        write_snapshot(&bytes, path).unwrap(); // v0.8.0 also wrote the CRC footer
+        let (mut loaded, x) = load_with_extras(path).unwrap();
+        assert_eq!(
+            execute(&to(&[b"GET", b"k"]), &mut loaded),
+            b"$1\r\nv\r\n".to_vec()
+        );
+        assert_eq!(x.cdc_next_offset, 9);
+        assert_eq!(x.hlc_last, 77);
+        assert_eq!(x.cdc_log.len(), 1);
+        let pel = &x.cdc_groups[0].pending[0];
+        assert_eq!(pel.offset, 8);
+        assert_eq!(pel.consumer, b"dead-worker".to_vec());
+        // Unknown delivery time reads as maximally idle (0 = the epoch), so an
+        // entry restored from an old snapshot is claimable immediately — which
+        // is right: the consumer that held it did not survive the restart.
+        assert_eq!(pel.delivered_ms, 0);
+        assert_eq!(pel.delivery_count, 1);
+        let _ = fs::remove_file(path);
+    }
+
+    #[test]
+    fn a_v0_8_0_full_resync_payload_still_loads() {
+        // The other half of the compat story: a v0.8.0 MASTER ships this exact
+        // byte sequence (serialize_wire + LXT2 trailer, no footer) to a replica
+        // on full resync.
+        let mut db = Db::new();
+        execute(&to(&[b"SET", b"k", b"v"]), &mut db);
+        let mut wire = serialize_wire(&db);
+        append_extras_lxt2(&mut wire, &v0_8_0_extras());
+        let (mut loaded, x) = deserialize_with_extras(&wire).unwrap();
+        assert_eq!(
+            execute(&to(&[b"GET", b"k"]), &mut loaded),
+            b"$1\r\nv\r\n".to_vec()
+        );
+        assert_eq!(x.cdc_groups[0].pending.len(), 1);
+        assert_eq!(x.cdc_groups[0].pending[0].delivery_count, 1);
     }
 
     #[test]

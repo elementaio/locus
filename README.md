@@ -8,8 +8,8 @@
 
 Point any Redis client at Locus — then get what a vanilla Redis can't cleanly give you:
 
-- a reliable, ordered **[changefeed](docs/CHANGEFEED.md)** — snapshot + live deltas, offsets, consumer
-  groups (keyspace notifications done right);
+- a reliable, ordered **[changefeed](docs/CHANGEFEED.md)** — snapshot + live deltas, offsets, and
+  at-least-once consumer groups with redelivery (keyspace notifications done right);
 - **[geo-first](docs/GEO.md)** objects with `GEOSEARCH` and **live geofencing**;
 - mergeable **[sketches](docs/SKETCHES.md)** — Bloom, HyperLogLog, Count-Min, Top-K, t-digest;
 - atomic **CAS** write verbs and a drift-free **secondary index** (query by field).
@@ -113,7 +113,10 @@ $ redis-cli -p 6379 GEOSEARCH fleet FROMLONLAT 55.27 25.2 BYRADIUS 5 km ASC   # 
 **Reactive + geo differentiators**
 
 - **[Changefeed](docs/CHANGEFEED.md):** `CDCSUBSCRIBE` (snapshot + live deltas, no gap/dup), offsets +
-  `CDCREAD` catch-up, and consumer groups — a reliable, ordered keyspace feed (persisted + replicated).
+  `CDCREAD` catch-up, and **at-least-once** consumer groups — a delivered record stays pending until it
+  is acked, and if its consumer dies another one recovers it (`CDCREADGROUP … 0` under the same name,
+  `CDCCLAIM`/`CDCAUTOCLAIM` from a different one). A reliable, ordered keyspace feed, with the pending
+  list written into the snapshot and handed to a replica on sync.
 - **[Geo-first](docs/GEO.md):** `GEOSET`/`GEOPOS`/`GEODIST`/`GEOSEARCH` (backed by a **geohash spatial
   index** → sub-linear radius/box queries) with **combined attribute filters** (`GEOSEARCH … WHERE
   status active`), plus **live geofencing** via `CDCSUBSCRIBE REGION`.
@@ -136,6 +139,7 @@ The shapes Locus is good at, each one or two commands deep:
 | **Cache / sessions** | `SET … EX`, `GETEX`, `maxmemory` + eviction — the classic role, minus a second moving part |
 | **Rate limits & quotas** | `INCRCAP` (atomic increment-with-cap: one verb, no script), `CAS` for optimistic writes, `SETNX + EX` for idempotency keys and locks |
 | **Live dashboards / sync** | `CDCSUBSCRIBE prefix` — snapshot **then** every change, gap-free with offsets and consumer groups; UIs stop polling |
+| **Work queues over the keyspace** | `CDCGROUP` + `CDCREADGROUP` fan a change feed across N workers, at-least-once: `CDCAUTOCLAIM` recovers whatever a dead worker was holding |
 | **Fleet / delivery / anything moving** | `GEOSET` with attributes, `GEOSEARCH … WHERE status active`, live geofences via `CDCSUBSCRIBE REGION` |
 | **Analytics counters** | `PFADD`/`PFCOUNT` daily uniques in 16 KB, `TOPKADD` trending, `CMSINCRBY` frequencies, `TDADD`/`TDQUANTILE` live p99s — all mergeable across shards/days |
 | **Dedup** | `BFADD` — "have I seen this id?" in constant memory |

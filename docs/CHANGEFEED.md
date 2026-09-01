@@ -16,7 +16,7 @@ data*: you don't publish to it — the keyspace itself feeds it.
 | History | none | snapshot of current state, then deltas |
 | Payload | whatever was published | the changed key + value, with an offset |
 
-## Two read modes
+## Three read modes
 
 ### 1. Broadcast (push) — `CDCSUBSCRIBE`
 
@@ -58,18 +58,83 @@ consumer that disconnected can resume from its last-seen offset:
 If the requested offset is older than the oldest retained record, `CDCREAD` returns
 `offset out of range` — the signal to re-snapshot. Each entry is `[offset, event, key, value]`.
 
-### 3. Consumer groups (load-balanced)
+### 3. Consumer groups (load-balanced, at-least-once)
 
 ```
 CDCGROUP CREATE <group> [offset|$|0]   # $ / default = only new; 0 = all retained
 CDCGROUP DESTROY <group>
-CDCREADGROUP <group> <consumer> [COUNT n]
+CDCREADGROUP <group> <consumer> [0|FROMPENDING] [COUNT n]
 CDCACK <group> <offset> [offset ...]
-CDCPENDING <group>                     # -> [total, [[consumer, count], ...]]
+CDCPENDING <group> [COUNT n]
+CDCCLAIM <group> <consumer> <min-idle-ms> <offset> [offset ...]
+CDCAUTOCLAIM <group> <consumer> <min-idle-ms> <start> [COUNT n]
 ```
-A group is a shared cursor over the log plus a pending list. `CDCREADGROUP` hands the next un-delivered
-records to the calling consumer — **disjoint** across the group, so N workers share the feed. Delivered
-records are pending until `CDCACK`ed. (Built on retention; requires `LOCUS_CDC_MAXLEN`.)
+A group is a shared cursor over the log plus a **pending-entries list** (the PEL). `CDCREADGROUP` hands
+the next un-delivered records to the calling consumer — **disjoint** across the group, so N workers share
+the feed. Delivered records stay pending until `CDCACK`ed. (Built on retention; requires
+`LOCUS_CDC_MAXLEN`.)
+
+Each pending entry records **who** holds it, **when** it was last delivered, and **how many times** it
+has been delivered. That is what makes the next two paragraphs possible — and it is what "at-least-once"
+actually costs. (Before 0.9.0 the pending list was recorded and never redelivered: a consumer that died
+mid-processing took its in-flight records with it. See the [CHANGELOG](../CHANGELOG.md).)
+
+**A restarted consumer recovers its own work.** `CDCREADGROUP <group> <consumer> 0` (the `0` sentinel, or
+`FROMPENDING`; mirrors `XREADGROUP … 0`) returns that consumer's still-pending entries in offset order
+instead of new ones. The group cursor does not move; each re-read bumps the entry's delivery count and
+restarts its idle clock. This is the recovery path for a worker that crashed and came back **under the
+same name**.
+
+**A live worker takes over a dead one's work.** `CDCCLAIM` transfers the named pending entries to a new
+consumer, but only those idle at least `min-idle-ms`; `CDCAUTOCLAIM` scans the PEL from `start` and
+claims the first `COUNT` (default 100) idle entries in one call, returning `[next-start, [entries…]]` —
+`next-start` is `0` when the scan reached the end, so a recovery sweep is a loop that ends on 0. Both
+reset the idle clock and bump the delivery count.
+
+The `min-idle-ms` guard is the whole safety story: it is what stops two workers processing the same
+in-flight record. Set it comfortably above your slowest expected processing time. An offset that is not
+pending, or not idle long enough, is skipped rather than erroring — a claim sweep is a race by nature,
+and the loser should just get fewer entries back.
+
+```console
+# worker-1 read offsets 1 and 2, then died holding them.
+redis-cli CDCPENDING workers
+1) (integer) 2
+2) 1) 1) "worker-1"
+      2) (integer) 2
+3) 1) 1) (integer) 1
+      2) "worker-1"
+      3) (integer) 94213     # idle ms — worker-1 has been gone 94 seconds
+      4) (integer) 1         # delivered once
+   ...
+redis-cli CDCAUTOCLAIM workers worker-2 60000 0      # take everything idle > 60s
+redis-cli CDCACK workers 1 2                         # worker-2 processed them
+```
+
+`CDCPENDING` returns `[total, [[consumer, count], …], [[offset, consumer, idle-ms, delivery-count], …]]`.
+The first two elements are unchanged from 0.8.0. The third lists the **oldest `COUNT` entries** (default
+10, `COUNT 0` for all) — bounded by default because a pending list runs to `LOCUS_CDC_PEL_MAX` entries and
+an introspection command must not become a hub stall. A climbing idle time means a dead consumer; a
+climbing delivery count means a poison record that keeps being redelivered and never acked.
+
+**Two honest limits.** The PEL is capped at `LOCUS_CDC_PEL_MAX` entries per group; at the cap the *oldest*
+unacked entries are dropped with a warning in the log, so a consumer that never acks degrades to
+at-most-once rather than growing hub memory without bound. And a pending entry whose record has aged out
+of the retained log (`LOCUS_CDC_MAXLEN`) comes back from a re-read or a claim as `[offset, nil, nil, nil]`
+— the payload is genuinely gone, and saying so beats dropping the entry and making it look like it was
+never delivered. Size retention above your worst-case consumer downtime.
+
+**Where group state is durable, and where it is not.** The cursor and the pending list ride in the
+snapshot trailer and in the full-resync payload, so they survive a graceful restart (`SAVE` and
+`SHUTDOWN` both write them) and they are handed to a replica when it syncs. They are *not* a logged
+command stream: `CDCREADGROUP`, `CDCACK` and the claim verbs go to neither the AOF nor the replication
+link. So after a `kill -9` or a failover, a group is only as fresh as the last snapshot or the last
+resync — already-acked records can come back (duplicates, which is what at-least-once permits), and a
+group **created** since then is missing entirely. If you depend on group state surviving an unclean
+stop, leave `LOCUS_SAVE` at its default cadence rather than turning snapshots off.
+
+Entries restored from a snapshot count as maximally idle — whoever held them before the restart is not
+coming back for them — so they are claimable immediately.
 
 ## Geofencing — `CDCSUBSCRIBE REGION`
 
@@ -115,6 +180,8 @@ records reloaded from a snapshot sort before live ones until re-stamped.)
 | Variable | Meaning |
 |---|---|
 | `LOCUS_CDC_MAXLEN` | retained change-log size (records) for `CDCREAD` / consumer groups / `CLUSTER CDCMERGE`; `0`/unset = off (push still works) |
+| `LOCUS_CDC_MAXBYTES` | byte cap on the retained change-log (default `64mb`; counts toward `used_memory`) |
+| `LOCUS_CDC_PEL_MAX` | per-group pending-entries cap (default `100000`; at the cap the oldest unacked entries are dropped with a warning) |
 
 ## Not goals
 

@@ -180,7 +180,15 @@ one ordered stream it serves three consumption modes — broadcast push (`CDCSUB
 pull (`CDCREAD`, backed by an optional retained ring), and load-balanced consumer groups
 (`CDCREADGROUP`) — and live geofencing (`CDCSUBSCRIBE REGION`). Because subscriber registration and the
 initial snapshot happen in the same hub turn, snapshot-then-tail is gap-free and dup-free without
-offsets. Full details in [CHANGEFEED.md](CHANGEFEED.md).
+offsets.
+
+A group's pending-entries list (delivered-but-unacked offset → owning consumer, last delivery time,
+delivery count) is what makes group reads **at-least-once** rather than at-most-once: a consumer that
+dies mid-processing has its entries re-read under its own name (`CDCREADGROUP … 0`) or claimed by
+another consumer past an idle window (`CDCCLAIM`/`CDCAUTOCLAIM`). It is ordered by offset, so recovery
+walks it in delivery order. It rides in the snapshot trailer and the full-resync payload — but not in
+the AOF or the replication stream, so across an unclean stop a group is only as fresh as the last
+snapshot. Full details in [CHANGEFEED.md](CHANGEFEED.md).
 
 ## Geo
 

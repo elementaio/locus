@@ -966,12 +966,66 @@ enum CdcFilter {
     },
 }
 
+/// One delivered-but-unacked record in a group's pending-entries list (PEL).
+///
+/// The owning consumer alone is not enough to redeliver: a claim has to know
+/// *how long* an entry has been idle — that is the guard that stops a second
+/// worker stealing a record the first one is still processing — and a delivery
+/// count makes a poison record visible instead of invisible. Mirrors Redis's
+/// stream PEL.
+struct PelEntry {
+    consumer: Vec<u8>,
+    delivered_ms: u64,   // wall clock of the last delivery or claim
+    delivery_count: u64, // 1 on first delivery, +1 per re-read or claim
+}
+
 /// A changefeed consumer group: a shared cursor over the log plus a pending list
-/// (delivered-but-unacked offsets → the consumer that got them). In-memory only.
+/// (delivered-but-unacked offset → who holds it, since when, how often).
+///
+/// Ordered by offset, because all three redelivery paths walk it in that order:
+/// a consumer re-reading its own pending, an `CDCAUTOCLAIM` scan resuming from a
+/// cursor, and the `LOCUS_CDC_PEL_MAX` cap dropping the oldest entries first.
+/// In-memory only — carried across restarts and full resync in the snapshot
+/// trailer, not replicated as commands.
 #[derive(Default)]
 struct CdcGroup {
     last_delivered: u64,
-    pending: HashMap<u64, Vec<u8>>,
+    pending: BTreeMap<u64, PelEntry>,
+}
+
+/// One retained change as the wire entry every changefeed pull returns:
+/// `[offset, event, key, value]` (value null for non-string writes).
+fn cdc_entry(r: &ChangeRecord) -> Vec<u8> {
+    resp::array(&[
+        resp::integer(r.offset as i64),
+        resp::bulk_string(&r.event),
+        resp::bulk_string(&r.key),
+        match &r.value {
+            Some(v) => resp::bulk_string(v),
+            None => resp::null_bulk(),
+        },
+    ])
+}
+
+/// Parse a decimal `u64` command argument — the file's usual inline idiom,
+/// factored out because the changefeed claim verbs take four of them.
+fn arg_u64(t: &[u8]) -> Option<u64> {
+    std::str::from_utf8(t)
+        .ok()
+        .and_then(|s| s.parse::<u64>().ok())
+}
+
+/// The same entry shape for a pending offset whose record has already aged out
+/// of the retained log: the offset, then nulls. The payload is genuinely gone,
+/// so the consumer can only ACK it — saying that plainly beats dropping the
+/// entry from the reply and letting it look like it was never pending.
+fn cdc_entry_gone(offset: u64) -> Vec<u8> {
+    resp::array(&[
+        resp::integer(offset as i64),
+        resp::null_bulk(),
+        resp::null_bulk(),
+        resp::null_bulk(),
+    ])
 }
 
 /// A client parked on a blocking pop. The original command is kept verbatim:
@@ -1227,7 +1281,24 @@ impl Hub {
                     g.name,
                     CdcGroup {
                         last_delivered: g.last_delivered,
-                        pending: g.pending.into_iter().collect(),
+                        pending: g
+                            .pending
+                            .into_iter()
+                            .map(|p| {
+                                (
+                                    p.offset,
+                                    PelEntry {
+                                        consumer: p.consumer,
+                                        // 0 for a pre-0.9.0 trailer, which carried no
+                                        // timestamp: that reads as maximally idle, which
+                                        // is the right answer — whoever held the entry
+                                        // before the restart is not coming back.
+                                        delivered_ms: p.delivered_ms,
+                                        delivery_count: p.delivery_count,
+                                    },
+                                )
+                            })
+                            .collect(),
                     },
                 )
             })
@@ -1259,7 +1330,16 @@ impl Hub {
                 .map(|(name, g)| rdb::CdcGrp {
                     name: name.clone(),
                     last_delivered: g.last_delivered,
-                    pending: g.pending.iter().map(|(o, c)| (*o, c.clone())).collect(),
+                    pending: g
+                        .pending
+                        .iter()
+                        .map(|(off, e)| rdb::CdcPel {
+                            offset: *off,
+                            consumer: e.consumer.clone(),
+                            delivered_ms: e.delivered_ms,
+                            delivery_count: e.delivery_count,
+                        })
+                        .collect(),
                 })
                 .collect(),
             index_defs: self
@@ -3198,6 +3278,8 @@ impl Hub {
             b"CDCREADGROUP" => self.handle_cdc_readgroup(id, &tokens),
             b"CDCACK" => self.handle_cdc_ack(id, &tokens),
             b"CDCPENDING" => self.handle_cdc_pending(id, &tokens),
+            b"CDCCLAIM" => self.handle_cdc_claim(id, &tokens),
+            b"CDCAUTOCLAIM" => self.handle_cdc_autoclaim(id, &tokens),
             b"XREAD" => self.handle_xread(id, &tokens),
             b"HELLO" => self.handle_hello(id, &tokens),
             b"AUTH" => self.handle_auth(id, &tokens),
@@ -4003,7 +4085,7 @@ impl Hub {
                     group,
                     CdcGroup {
                         last_delivered: start,
-                        pending: HashMap::new(),
+                        pending: BTreeMap::new(),
                     },
                 );
                 self.send(id, resp::simple_string("OK"));
@@ -4016,9 +4098,15 @@ impl Hub {
         }
     }
 
-    /// CDCREADGROUP <group> <consumer> [COUNT n] — deliver the next un-delivered
-    /// records to this consumer (load-balanced across the group) and track them
-    /// as pending until acked.
+    /// CDCREADGROUP <group> <consumer> [0|FROMPENDING] [COUNT n] — deliver the
+    /// next un-delivered records to this consumer (load-balanced across the
+    /// group) and track them as pending until acked.
+    ///
+    /// With the `0` / `FROMPENDING` sentinel (mirroring `XREADGROUP … 0`) it
+    /// re-delivers this consumer's OWN still-pending entries instead, oldest
+    /// offset first: how a *restarted* consumer that kept its name recovers the
+    /// work it had in flight. The group cursor does not move, and each re-read
+    /// bumps the entry's delivery count and restarts its idle clock.
     fn handle_cdc_readgroup(&mut self, id: u64, tokens: &[Vec<u8>]) {
         if tokens.len() < 3 {
             return self.send(
@@ -4027,25 +4115,42 @@ impl Hub {
             );
         }
         let mut count: Option<usize> = None;
-        if tokens.len() >= 5 && tokens[3].eq_ignore_ascii_case(b"COUNT") {
-            count = match std::str::from_utf8(&tokens[4])
-                .ok()
-                .and_then(|s| s.parse().ok())
-            {
-                Some(c) => Some(c),
-                None => {
-                    return self.send(
-                        id,
-                        resp::error("ERR value is not an integer or out of range"),
-                    );
+        let mut from_pending = false;
+        let mut i = 3;
+        while i < tokens.len() {
+            match tokens[i].to_ascii_uppercase().as_slice() {
+                b"COUNT" => {
+                    i += 1;
+                    count = match tokens
+                        .get(i)
+                        .and_then(|t| std::str::from_utf8(t).ok())
+                        .and_then(|s| s.parse::<usize>().ok())
+                    {
+                        Some(c) => Some(c),
+                        None => {
+                            return self.send(
+                                id,
+                                resp::error("ERR value is not an integer or out of range"),
+                            );
+                        }
+                    };
                 }
-            };
+                b"0" | b"FROMPENDING" => from_pending = true,
+                _ => return self.send(id, resp::error("ERR syntax error")),
+            }
+            i += 1;
         }
         let consumer = tokens[2].clone();
         let last = match self.cdc_groups.get(&tokens[1]) {
             Some(g) => g.last_delivered,
             None => return self.send(id, resp::error("NOGROUP No such changefeed group")),
         };
+        if from_pending {
+            // Deliberately BEFORE the truncation guard below: re-reading what is
+            // already pending is exactly what a consumer must still be able to
+            // do after the log moved past the group cursor.
+            return self.deliver_pending(id, &tokens[1], &consumer, count);
+        }
         // If the log was trimmed PAST this group's cursor, records between the
         // cursor and the oldest retained record are gone — the group would
         // silently jump the gap (at-least-once broken). Error instead, exactly
@@ -4067,16 +4172,7 @@ impl Hub {
         let mut maxoff = last;
         for rec in &self.cdc_log {
             if rec.offset > last {
-                let val = match &rec.value {
-                    Some(v) => resp::bulk_string(v),
-                    None => resp::null_bulk(),
-                };
-                out.push(resp::array(&[
-                    resp::integer(rec.offset as i64),
-                    resp::bulk_string(&rec.event),
-                    resp::bulk_string(&rec.key),
-                    val,
-                ]));
+                out.push(cdc_entry(rec));
                 offsets.push(rec.offset);
                 maxoff = rec.offset;
                 if count.is_some_and(|c| c > 0 && out.len() >= c) {
@@ -4089,17 +4185,23 @@ impl Hub {
         // dropped (delivered-but-unacked → treated as lost/at-most-once for
         // those), with a warning — better than unbounded hub memory.
         let cap = self.cdc_pel_max;
+        let now = now_ms();
         if let Some(g) = self.cdc_groups.get_mut(&tokens[1]) {
             g.last_delivered = maxoff;
             for off in offsets {
-                g.pending.insert(off, consumer.clone());
+                g.pending.insert(
+                    off,
+                    PelEntry {
+                        consumer: consumer.clone(),
+                        delivered_ms: now,
+                        delivery_count: 1,
+                    },
+                );
             }
             if cap > 0 && g.pending.len() > cap {
-                let mut keys: Vec<u64> = g.pending.keys().copied().collect();
-                keys.sort_unstable();
                 let drop_n = g.pending.len() - cap;
-                for k in keys.into_iter().take(drop_n) {
-                    g.pending.remove(&k);
+                for _ in 0..drop_n {
+                    g.pending.pop_first(); // ordered by offset: oldest first
                 }
                 log::warn(&format!(
                     "changefeed group {}: pending list hit {cap} — dropped {drop_n} oldest unacked entries (a consumer isn't acking)",
@@ -4108,6 +4210,197 @@ impl Hub {
             }
         }
         self.send(id, resp::array(&out));
+    }
+
+    /// Build the reply entries for a list of ascending PEL offsets. Walks the
+    /// retained log once alongside the offsets — both are offset-ordered — so a
+    /// big pending list costs one pass, not a log scan per entry.
+    fn cdc_entries_for(&self, offsets: &[u64]) -> Vec<Vec<u8>> {
+        let mut out = Vec::with_capacity(offsets.len());
+        let mut it = self.cdc_log.iter().peekable();
+        for off in offsets {
+            while it.peek().is_some_and(|r| r.offset < *off) {
+                it.next();
+            }
+            match it.peek() {
+                Some(r) if r.offset == *off => out.push(cdc_entry(r)),
+                _ => out.push(cdc_entry_gone(*off)),
+            }
+        }
+        out
+    }
+
+    /// `CDCREADGROUP <group> <consumer> 0` — re-deliver this consumer's own
+    /// pending entries, oldest first. The group cursor is untouched: these
+    /// records were already delivered, this is the second chance at them.
+    fn deliver_pending(&mut self, id: u64, group: &[u8], consumer: &[u8], count: Option<usize>) {
+        let mut offsets: Vec<u64> = match self.cdc_groups.get(group) {
+            Some(g) => g
+                .pending
+                .iter()
+                .filter(|(_, e)| e.consumer.as_slice() == consumer)
+                .map(|(off, _)| *off)
+                .collect(),
+            None => return self.send(id, resp::error("NOGROUP No such changefeed group")),
+        };
+        if let Some(c) = count
+            && c > 0
+            && offsets.len() > c
+        {
+            offsets.truncate(c);
+        }
+        let out = self.cdc_entries_for(&offsets);
+        let now = now_ms();
+        if let Some(g) = self.cdc_groups.get_mut(group) {
+            for off in &offsets {
+                if let Some(e) = g.pending.get_mut(off) {
+                    e.delivered_ms = now;
+                    e.delivery_count += 1;
+                }
+            }
+        }
+        self.send(id, resp::array(&out));
+    }
+
+    /// CDCCLAIM <group> <consumer> <min-idle-ms> <offset> [offset ...] —
+    /// transfer the named pending entries to `consumer`, but only those idle at
+    /// least `min-idle-ms`.
+    ///
+    /// The idle window is the whole safety story: it is what keeps a live worker
+    /// from having a record taken out from under it while it is still being
+    /// processed. An offset that is not pending, or not idle long enough, is
+    /// skipped rather than erroring (as `XCLAIM` does) — a claim sweep is a
+    /// race by nature and the loser should simply get fewer entries back.
+    fn handle_cdc_claim(&mut self, id: u64, tokens: &[Vec<u8>]) {
+        if tokens.len() < 5 {
+            return self.send(
+                id,
+                resp::error("ERR wrong number of arguments for 'cdcclaim' command"),
+            );
+        }
+        let min_idle = match arg_u64(&tokens[3]) {
+            Some(n) => n,
+            None => {
+                return self.send(
+                    id,
+                    resp::error("ERR value is not an integer or out of range"),
+                );
+            }
+        };
+        let mut want: Vec<u64> = Vec::with_capacity(tokens.len() - 4);
+        for t in &tokens[4..] {
+            match arg_u64(t) {
+                Some(o) => want.push(o),
+                None => {
+                    return self.send(
+                        id,
+                        resp::error("ERR value is not an integer or out of range"),
+                    );
+                }
+            }
+        }
+        let consumer = tokens[2].clone();
+        let now = now_ms();
+        let mut claimed: Vec<u64> = Vec::new();
+        match self.cdc_groups.get_mut(&tokens[1]) {
+            None => return self.send(id, resp::error("NOGROUP No such changefeed group")),
+            Some(g) => {
+                for off in want {
+                    if let Some(e) = g.pending.get_mut(&off)
+                        && now.saturating_sub(e.delivered_ms) >= min_idle
+                    {
+                        e.consumer = consumer.clone();
+                        e.delivered_ms = now;
+                        e.delivery_count += 1;
+                        claimed.push(off);
+                    }
+                }
+            }
+        }
+        claimed.sort_unstable(); // the caller may pass offsets in any order
+        let out = self.cdc_entries_for(&claimed);
+        self.send(id, resp::array(&out));
+    }
+
+    /// CDCAUTOCLAIM <group> <consumer> <min-idle-ms> <start> [COUNT n] — scan
+    /// the pending list from offset `start` and claim the first `n` (default
+    /// 100) entries idle at least `min-idle-ms`. Reply: `[next-start, [entries…]]`,
+    /// where `next-start` is `0` once the scan reached the end of the list and
+    /// otherwise the offset to resume from — so a recovery sweep is a loop that
+    /// ends when the cursor comes back 0.
+    ///
+    /// The scan is bounded at ten times `COUNT` entries examined, exactly
+    /// because this runs on the hub: a pending list at `LOCUS_CDC_PEL_MAX` full
+    /// of not-yet-idle entries must not turn one command into a global stall.
+    /// A bounded sweep just returns a non-zero cursor and is resumed.
+    fn handle_cdc_autoclaim(&mut self, id: u64, tokens: &[Vec<u8>]) {
+        if tokens.len() < 5 {
+            return self.send(
+                id,
+                resp::error("ERR wrong number of arguments for 'cdcautoclaim' command"),
+            );
+        }
+        let (min_idle, start) = match (arg_u64(&tokens[3]), arg_u64(&tokens[4])) {
+            (Some(m), Some(s)) => (m, s),
+            _ => {
+                return self.send(
+                    id,
+                    resp::error("ERR value is not an integer or out of range"),
+                );
+            }
+        };
+        let mut count: usize = 100;
+        if tokens.len() > 5 {
+            if tokens.len() != 7 || !tokens[5].eq_ignore_ascii_case(b"COUNT") {
+                return self.send(id, resp::error("ERR syntax error"));
+            }
+            count = match arg_u64(&tokens[6]) {
+                Some(n) => n as usize,
+                None => {
+                    return self.send(
+                        id,
+                        resp::error("ERR value is not an integer or out of range"),
+                    );
+                }
+            };
+        }
+        let consumer = tokens[2].clone();
+        let now = now_ms();
+        let mut claimed: Vec<u64> = Vec::new();
+        let mut next: u64 = 0; // 0 = the scan reached the end of the pending list
+        match self.cdc_groups.get_mut(&tokens[1]) {
+            None => return self.send(id, resp::error("NOGROUP No such changefeed group")),
+            Some(g) => {
+                let attempts = if count > 0 {
+                    count.saturating_mul(10)
+                } else {
+                    usize::MAX
+                };
+                let mut scanned = 0usize;
+                for (off, e) in g.pending.range(start..) {
+                    scanned += 1;
+                    if now.saturating_sub(e.delivered_ms) >= min_idle {
+                        claimed.push(*off);
+                    }
+                    if (count > 0 && claimed.len() >= count) || scanned >= attempts {
+                        next = off.saturating_add(1);
+                        break;
+                    }
+                }
+                for off in &claimed {
+                    if let Some(e) = g.pending.get_mut(off) {
+                        e.consumer = consumer.clone();
+                        e.delivered_ms = now;
+                        e.delivery_count += 1;
+                    }
+                }
+            }
+        }
+        let out = self.cdc_entries_for(&claimed);
+        self.send(
+            id,
+            resp::array(&[resp::integer(next as i64), resp::array(&out)]),
+        );
     }
 
     /// CDCACK <group> <offset> [offset ...] — acknowledge delivery (drop from PEL).
@@ -4135,29 +4428,74 @@ impl Hub {
         self.send(id, resp::integer(acked));
     }
 
-    /// CDCPENDING <group> — total pending plus a per-consumer breakdown.
+    /// CDCPENDING <group> [COUNT n] — total pending, the per-consumer breakdown,
+    /// and the oldest `n` entries in detail:
+    ///
+    /// `[total, [[consumer, count], …], [[offset, consumer, idle-ms, delivery-count], …]]`
+    ///
+    /// The first two elements are unchanged. The third is new: it is what tells
+    /// an operator whether a consumer is dead (a climbing idle time) or a record
+    /// is poison (a climbing delivery count), and it feeds the `min-idle-ms`
+    /// argument of `CDCCLAIM`. `n` defaults to 10 and is capped on purpose — a
+    /// pending list runs to `LOCUS_CDC_PEL_MAX` entries and dumping all of it by
+    /// default would make an introspection command a hub stall. `COUNT 0` asks
+    /// for all of them anyway.
     fn handle_cdc_pending(&mut self, id: u64, tokens: &[Vec<u8>]) {
-        if tokens.len() != 2 {
+        if tokens.len() != 2 && tokens.len() != 4 {
             return self.send(
                 id,
                 resp::error("ERR wrong number of arguments for 'cdcpending' command"),
             );
+        }
+        let mut detail: usize = 10;
+        if tokens.len() == 4 {
+            if !tokens[2].eq_ignore_ascii_case(b"COUNT") {
+                return self.send(id, resp::error("ERR syntax error"));
+            }
+            detail = match arg_u64(&tokens[3]) {
+                Some(n) if n > 0 => n as usize,
+                Some(_) => usize::MAX, // COUNT 0 = every entry
+                None => {
+                    return self.send(
+                        id,
+                        resp::error("ERR value is not an integer or out of range"),
+                    );
+                }
+            };
         }
         let g = match self.cdc_groups.get(&tokens[1]) {
             Some(g) => g,
             None => return self.send(id, resp::error("NOGROUP No such changefeed group")),
         };
         let mut counts: HashMap<&Vec<u8>, usize> = HashMap::new();
-        for c in g.pending.values() {
-            *counts.entry(c).or_insert(0) += 1;
+        for e in g.pending.values() {
+            *counts.entry(&e.consumer).or_insert(0) += 1;
         }
         let per: Vec<Vec<u8>> = counts
             .iter()
             .map(|(c, n)| resp::array(&[resp::bulk_string(c), resp::integer(*n as i64)]))
             .collect();
+        let now = now_ms();
+        let entries: Vec<Vec<u8>> = g
+            .pending
+            .iter()
+            .take(detail)
+            .map(|(off, e)| {
+                resp::array(&[
+                    resp::integer(*off as i64),
+                    resp::bulk_string(&e.consumer),
+                    resp::integer(now.saturating_sub(e.delivered_ms) as i64),
+                    resp::integer(e.delivery_count as i64),
+                ])
+            })
+            .collect();
         self.send(
             id,
-            resp::array(&[resp::integer(g.pending.len() as i64), resp::array(&per)]),
+            resp::array(&[
+                resp::integer(g.pending.len() as i64),
+                resp::array(&per),
+                resp::array(&entries),
+            ]),
         );
     }
 

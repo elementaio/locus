@@ -476,6 +476,8 @@ pub fn command_meta(cmd: &[u8]) -> Option<CmdMeta> {
         | b"PSETEX" | b"SETRANGE" | b"LREM" | b"LTRIM" | b"SMOVE" | b"ZREMRANGEBYRANK"
         | b"ZREMRANGEBYSCORE" | b"ZUNIONSTORE" | b"ZINTERSTORE" | b"SETBIT" | b"BITOP"
         | b"GEOSET" | b"CAS" | b"INCRCAP" | b"CMSINCRBY" | b"LMPOP" | b"ZMPOP" => (4, true),
+        // arity 5 reads (changefeed redelivery: group, consumer, min-idle, offset)
+        b"CDCCLAIM" | b"CDCAUTOCLAIM" => (5, false),
         // arity 5 writes
         b"XADD" | b"LINSERT" | b"LMOVE" | b"BFLOAD" | b"CMSLOAD" => (5, true),
         // arity 6 writes (internal: AOF-rewrite stub restore)
@@ -540,6 +542,8 @@ static COMMAND_NAMES: &[&[u8]] = &[
     b"CADEL",
     b"CAS",
     b"CDCACK",
+    b"CDCAUTOCLAIM",
+    b"CDCCLAIM",
     b"CDCGROUP",
     b"CDCPENDING",
     b"CDCREAD",
