@@ -4,6 +4,55 @@ All notable changes to Locus are documented here. The format is based on
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and the project follows
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.11.0] — 2026-09-01
+
+**The differential harness found these.** Phase 5.2 added two test harnesses — randomized command
+sequences run against the `locusdb` engine in-process *and* a real `redis-server`, with the replies
+diffed; plus fault injection over a spawned server. The first one found seven behavioural divergences
+from Redis in its first afternoon, all of them fixed below. A single clean run is now 4,000
+sequences of 500 commands — 2,245,423 executed, zero unexplained divergences.
+
+### Fixed
+
+- **A negative index that stayed negative was not clamped.** `GETRANGE key -100 -90` on `"hello"`
+  returned `""` instead of `"h"`, and `BITCOUNT`/`BITPOS` with a range reaching before the start
+  answered 0. Redis pins *both* ends of the range to the value, not just the start; `GETRANGE` had its
+  own copy of the normalization, which is how one defect became two. `GETRANGE`, `BITCOUNT` and
+  `BITPOS` now share one implementation — including the quirk that `GETRANGE` and `BITCOUNT` (but not
+  `BITPOS`) discard an inverted all-negative range *before* wrapping it.
+- **`RPOPLPUSH`/`LMOVE`/`SMOVE` answered `WRONGTYPE` for a missing source.** When the source did not
+  exist and the destination held another type, Locus reported the destination's type where Redis
+  answers nil (or 0 for `SMOVE`) — the missing source short-circuits first. The destination is still
+  type-checked before anything is popped, so a move never removes and then fails.
+- **A self-move made an expiring key immortal.** `RPOPLPUSH k k` on a one-element list — a rotate — and
+  `SMOVE s s m` on a one-member set retired the key in the gap between the pop and the push, taking its
+  TTL with it; the push then recreated a fresh, *persistent* key. A value that was supposed to expire
+  never did. The push now happens before the emptied source is retired, which is Redis's order.
+- **`SET` accepted contradictory options.** `SET k v NX XX` returned nil, two expire options let the
+  last one win, an expire option alongside `KEEPTTL` was accepted, and `SET k v EX 0` set a key that was
+  already expired when the `+OK` went out. All four are now `-ERR syntax error` / `-ERR invalid expire
+  time in 'set' command`, as on Redis.
+- **An integer had more than one accepted spelling.** Rust's `str::parse::<i64>` takes a leading `+`,
+  leading zeros and `-0`; Redis's `string2ll` takes none of them. `DECR` on a value that `APPEND` had
+  made `"02"` answered `1` instead of an error, and `LRANGE key +0 -1` was accepted. Stored values and
+  arguments now use one strict parser. Numbers Locus writes itself are always canonical, so nothing
+  internal changes — but a client that was sending `+5` or `007` will now get
+  `-ERR value is not an integer or out of range`.
+- **The glob matcher understood only `*` and `?`.** Every bracket pattern therefore matched *nothing*:
+  `KEYS user:[0-9]*`, `SCAN … MATCH`, `HSCAN`/`SSCAN`/`ZSCAN`, `PSUBSCRIBE`, `CLIENT LIST` filters and —
+  this is the one to check on upgrade — **ACL key and channel patterns**. An ACL grant written
+  `&app:[0-9]*` was silently an empty grant; it now grants what it says. `[abc]`, `[a-z]`, `[^a]` and
+  `\` escapes all work, matching Redis's `stringmatchlen` (quirks included: `[1-]` really is the range
+  `'1'..=']'`).
+- **`INCRBYFLOAT` used the sorted-set score formatter.** Redis has two double renderings and this
+  command uses the other one — plain notation with trailing zeros trimmed, not shortest-round-trip — and
+  the reply is also the stored value, so the difference stuck to the key. `INCRBYFLOAT` on `-2.251` by
+  `-5.25` returned `-7.5009999999999994`; it now returns `-7.501`. `ZSCORE` keeps the shortest-round-trip
+  rendering it already shared with Redis. One difference remains and is deliberate: Redis accumulates
+  this command in C `long double` (80-bit on x86, plain `double` on arm64 — Redis does not agree with
+  itself across machines), and Locus is pure `std`, so results needing more than f64's 15 significant
+  digits differ in the last digits.
+
 ## [0.10.0] — 2026-09-01
 
 - Internal: the release profile now enables thin LTO — the library split moved the hub→engine calls

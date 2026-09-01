@@ -201,10 +201,35 @@ fn not_integer() -> Vec<u8> {
 fn wrongtype() -> Vec<u8> {
     error("WRONGTYPE Operation against a key holding the wrong kind of value")
 }
+/// Redis's `string2ll`: an integer has exactly one accepted spelling.
+///
+/// `str::parse::<i64>` is looser than Redis in three ways that matter — it takes
+/// a leading `+`, leading zeros, and `-0` — so `DECR` on a value that `APPEND`
+/// had made `"02"` answered `1` here and `-ERR value is not an integer` on
+/// Redis, and `LRANGE key +0 -1` was accepted where Redis refuses it. Numbers
+/// this engine writes itself are always canonical, so nothing internal changes.
 fn parse_int(arg: &[u8]) -> Option<i64> {
-    std::str::from_utf8(arg)
-        .ok()
-        .and_then(|s| s.parse::<i64>().ok())
+    if arg == b"0" {
+        return Some(0);
+    }
+    let (neg, digits) = match arg.first()? {
+        b'-' => (true, &arg[1..]),
+        _ => (false, arg),
+    };
+    // No leading zero, no bare sign, digits only.
+    if !matches!(digits.first(), Some(b'1'..=b'9')) || !digits.iter().all(u8::is_ascii_digit) {
+        return None;
+    }
+    let mut v: u64 = 0;
+    for &c in digits {
+        v = v.checked_mul(10)?.checked_add(u64::from(c - b'0'))?;
+    }
+    if neg {
+        // 2^63 is representable only as i64::MIN, and negating it is itself.
+        (v <= i64::MAX as u64 + 1).then(|| (v as i64).wrapping_neg())
+    } else {
+        (v <= i64::MAX as u64).then_some(v as i64)
+    }
 }
 
 pub fn execute(tokens: &[Vec<u8>], db: &mut Db) -> Vec<u8> {
@@ -1314,10 +1339,7 @@ fn incr_cmd(db: &mut Db, tokens: &[Vec<u8>], fixed_delta: i64, has_arg: bool) ->
 
     let current = match db.get(&tokens[1]) {
         None => 0,
-        Some(Value::Str(v)) => match std::str::from_utf8(v)
-            .ok()
-            .and_then(|s| s.parse::<i64>().ok())
-        {
+        Some(Value::Str(v)) => match parse_int(v) {
             Some(n) => n,
             None => return not_integer(),
         },
@@ -1435,20 +1457,15 @@ fn getrange_cmd(db: &mut Db, tokens: &[Vec<u8>]) -> Vec<u8> {
         Some(Value::Str(s)) => s,
         Some(_) => return wrongtype(),
     };
-    let len = s.len() as i64;
-    // Normalize inclusive [start, end] with negative-from-end indices (Redis).
-    let mut start = if start < 0 { len + start } else { start };
-    let mut end = if end < 0 { len + end } else { end };
-    if start < 0 {
-        start = 0;
-    }
-    if end >= len {
-        end = len - 1;
-    }
-    if len == 0 || start > end || start >= len {
+    // The same inclusive, negative-from-end normalization BITCOUNT/BITPOS use.
+    // It used to be open-coded here, which is how one defect became two.
+    if inverted_negative(start, end) {
         return bulk_string(b"");
     }
-    bulk_string(&s[start as usize..=end as usize])
+    match norm_range(start, end, s.len()) {
+        Some((lo, hi)) => bulk_string(&s[lo..=hi]),
+        None => bulk_string(b""),
+    }
 }
 
 fn setrange_cmd(db: &mut Db, tokens: &[Vec<u8>]) -> Vec<u8> {
@@ -1506,9 +1523,46 @@ fn incrbyfloat_cmd(db: &mut Db, tokens: &[Vec<u8>]) -> Vec<u8> {
     if !next.is_finite() {
         return error("ERR increment would produce NaN or Infinity");
     }
-    let formatted = fmt_score(next);
+    let formatted = fmt_human_float(next);
     db.insert(tokens[1].clone(), Value::Str(formatted.clone())); // preserves TTL
     bulk_string(&formatted)
+}
+
+/// Render `INCRBYFLOAT`'s result the way Redis renders it — which is *not* the
+/// way it renders a sorted-set score.
+///
+/// Redis has two double formatters and this command uses the other one:
+/// `addReplyHumanLongDouble` (`%.17Lf`, then trailing zeros trimmed) rather than
+/// `addReplyDouble` (shortest round-trip, which is what `fmt_score` gives and
+/// what `ZSCORE` correctly matches). Using `fmt_score` here made `INCRBYFLOAT`
+/// on `-2.251` by `-5.25` answer `-7.5009999999999994` where Redis answers
+/// `-7.501` — and the answer is also the *stored value*, so the noise stuck.
+///
+/// Redis accumulates in `long double`, whose extra mantissa keeps the rounding
+/// noise below the 17th decimal. In pure `std` we have `f64`, so we print to
+/// f64's guaranteed round-trip precision — 15 significant digits, C's `DBL_DIG`
+/// — capped at Redis's own 17 decimals, and trim identically. That agrees with
+/// Redis on every value an `f64` can carry. What it cannot reach is what the
+/// wider type can: Redis answers `1 INCRBYFLOAT 1e-17` with
+/// `1.00000000000000001` and we answer `1`, because for us that sum *is* 1.
+fn fmt_human_float(v: f64) -> Vec<u8> {
+    const SIG: i32 = 15;
+    let exp = if v == 0.0 {
+        0
+    } else {
+        v.abs().log10().floor() as i32
+    };
+    let decimals = (SIG - 1 - exp).clamp(0, 17) as usize;
+    let mut s = format!("{v:.decimals$}");
+    if s.contains('.') {
+        while s.ends_with('0') {
+            s.pop();
+        }
+        if s.ends_with('.') {
+            s.pop();
+        }
+    }
+    s.into_bytes()
 }
 
 /// Parse a finite float (rejects inf/-inf/NaN — unlike `parse_score`).
@@ -1525,7 +1579,24 @@ struct SetOpts {
     get: bool,
 }
 
-fn parse_set_opts(args: &[Vec<u8>]) -> Option<SetOpts> {
+/// Parse `SET`'s trailing options, rejecting the combinations Redis rejects.
+///
+/// The contradictory ones used to be accepted and silently reconciled: `SET k v
+/// NX XX` answered nil (both conditions can never hold, so the write was just
+/// dropped), two expire options let the last one win, and `EX 0` set a key that
+/// was already expired when the `+OK` went out. Redis answers `-ERR syntax
+/// error` for the first three and `-ERR invalid expire time` for the last, and
+/// a client that relies on the error to catch its own bad call got nothing.
+///
+/// Returns the encoded error reply on failure, because the two failures have
+/// different messages.
+fn parse_set_opts(args: &[Vec<u8>]) -> Result<SetOpts, Vec<u8>> {
+    fn syntax() -> Vec<u8> {
+        error("ERR syntax error")
+    }
+    fn invalid() -> Vec<u8> {
+        error("ERR invalid expire time in 'set' command")
+    }
     let mut o = SetOpts {
         expire_at: None,
         keepttl: false,
@@ -1539,10 +1610,17 @@ fn parse_set_opts(args: &[Vec<u8>]) -> Option<SetOpts> {
         let a = args[i].to_ascii_uppercase();
         match a.as_slice() {
             b"EX" | b"PX" | b"EXAT" | b"PXAT" => {
+                // Exactly one expire option, and never alongside KEEPTTL.
+                if o.expire_at.is_some() || o.keepttl {
+                    return Err(syntax());
+                }
                 i += 1;
-                let n = parse_int(args.get(i)?)?;
-                if n < 0 {
-                    return None;
+                let n = match args.get(i).and_then(|t| parse_int(t)) {
+                    Some(n) => n,
+                    None => return Err(syntax()),
+                };
+                if n <= 0 {
+                    return Err(invalid());
                 }
                 let n = n as u64;
                 // Checked arithmetic: a huge TTL must not overflow (panic in
@@ -1553,17 +1631,35 @@ fn parse_set_opts(args: &[Vec<u8>]) -> Option<SetOpts> {
                     b"EXAT" => n.checked_mul(1000),
                     _ => Some(n),
                 };
-                o.expire_at = Some(at?);
+                match at {
+                    Some(t) => o.expire_at = Some(t),
+                    None => return Err(invalid()),
+                }
             }
-            b"KEEPTTL" => o.keepttl = true,
-            b"NX" => o.nx = true,
-            b"XX" => o.xx = true,
+            b"KEEPTTL" => {
+                if o.expire_at.is_some() {
+                    return Err(syntax());
+                }
+                o.keepttl = true;
+            }
+            b"NX" => {
+                if o.xx {
+                    return Err(syntax());
+                }
+                o.nx = true;
+            }
+            b"XX" => {
+                if o.nx {
+                    return Err(syntax());
+                }
+                o.xx = true;
+            }
             b"GET" => o.get = true,
-            _ => return None,
+            _ => return Err(syntax()),
         }
         i += 1;
     }
-    Some(o)
+    Ok(o)
 }
 
 fn set_cmd(db: &mut Db, tokens: &[Vec<u8>]) -> Vec<u8> {
@@ -1573,8 +1669,8 @@ fn set_cmd(db: &mut Db, tokens: &[Vec<u8>]) -> Vec<u8> {
     let key = &tokens[1];
     let val = &tokens[2];
     let opts = match parse_set_opts(&tokens[3..]) {
-        Some(o) => o,
-        None => return error("ERR syntax error"),
+        Ok(o) => o,
+        Err(e) => return e,
     };
     // SET ... GET requires the existing value (if any) to be a string.
     let old = if opts.get {
@@ -2022,7 +2118,16 @@ fn lpos_cmd(db: &mut Db, tokens: &[Vec<u8>]) -> Vec<u8> {
 /// Pop one element from `src` and push it onto `dst` (the engine for RPOPLPUSH
 /// and LMOVE). `src`/`dst` may be the same key (a rotation).
 fn lmove_core(db: &mut Db, src: &[u8], dst: &[u8], from_left: bool, to_left: bool) -> Vec<u8> {
-    // Type-check the destination up front so we never pop from src and then fail.
+    // Order is load-bearing, and it is Redis's: a *missing source* answers nil
+    // before the destination's type is looked at at all. Checking dst first
+    // turned `LMOVE missing a-string LEFT LEFT` into a WRONGTYPE where Redis
+    // replies nil. The "never pop from src and then fail" property is kept —
+    // dst is still type-checked before the pop, just not before the lookup.
+    match db.get(src) {
+        None => return null_bulk(),
+        Some(Value::List(_)) => {}
+        Some(_) => return wrongtype(),
+    }
     match db.get(dst) {
         None | Some(Value::List(_)) => {}
         Some(_) => return wrongtype(),
@@ -2039,7 +2144,12 @@ fn lmove_core(db: &mut Db, src: &[u8], dst: &[u8], from_left: bool, to_left: boo
         },
         Some(_) => return wrongtype(),
     };
-    db.remove_if_empty(src);
+    // Push into dst *before* retiring an emptied src, which is the order Redis
+    // uses and the only one that survives `src == dst`. `RPOPLPUSH k k` on a
+    // one-element list is a rotate: popping empties the list, and deleting the
+    // key at that moment takes its TTL with it — the push then recreates a
+    // fresh, *persistent* key and a value that was supposed to expire never
+    // does. Pushing first leaves the key non-empty, so nothing is retired.
     match db.get_or_insert_with(dst, || Value::List(VecDeque::new())) {
         Value::List(l) => {
             if to_left {
@@ -2050,6 +2160,7 @@ fn lmove_core(db: &mut Db, src: &[u8], dst: &[u8], from_left: bool, to_left: boo
         }
         _ => return wrongtype(), // unreachable: dst was type-checked above
     }
+    db.remove_if_empty(src);
     bulk_string(&elem)
 }
 
@@ -2094,6 +2205,18 @@ fn getbit_at(s: &[u8], offset: usize) -> u8 {
 
 /// Normalize an inclusive [start, end] range with negative-from-end indices over
 /// a length, returning concrete bounds, or None if the range is empty.
+/// `GETRANGE` and `BITCOUNT` (but **not** `BITPOS`) short-circuit a range whose
+/// ends are both negative and inverted, *before* either is wrapped: `GETRANGE k
+/// -1 -3` and `BITCOUNT k -1 -3` are empty however long the value is, even
+/// though -3 would wrap to a perfectly valid low index. `BITPOS k 1 -1 -3` on
+/// the same value answers 0, because it clamps first and only then notices the
+/// range. The asymmetry is odd; it is also what redis-server 8.8 does, verified
+/// command by command, and a differential harness is exactly the thing that
+/// makes copying it cheaper than rationalizing it.
+fn inverted_negative(start: i64, end: i64) -> bool {
+    start < 0 && end < 0 && start > end
+}
+
 fn norm_range(start: i64, end: i64, len: usize) -> Option<(usize, usize)> {
     if len == 0 {
         return None;
@@ -2103,6 +2226,14 @@ fn norm_range(start: i64, end: i64, len: usize) -> Option<(usize, usize)> {
     let mut e = if end < 0 { end + len } else { end };
     if s < 0 {
         s = 0;
+    }
+    // Both ends clamp to 0, not just the start. An index that is *still*
+    // negative after the wrap means "before the beginning", and Redis pins it
+    // to the first byte rather than emptying the range: `BITCOUNT k -5 -2` on a
+    // one-byte string counts byte 0, and `GETRANGE k -100 -90` on "hello"
+    // returns "h". Leaving `e` negative made `s > e` true and answered empty.
+    if e < 0 {
+        e = 0;
     }
     if e >= len {
         e = len - 1;
@@ -2184,6 +2315,9 @@ fn bitcount_cmd(db: &mut Db, tokens: &[Vec<u8>]) -> Vec<u8> {
     } else {
         false
     };
+    if inverted_negative(start, end) {
+        return integer(0);
+    }
     if bit_mode {
         match norm_range(start, end, s.len() * 8) {
             Some((lo, hi)) => integer((lo..=hi).map(|o| getbit_at(s, o) as i64).sum()),
@@ -3270,10 +3404,7 @@ fn hincrby_cmd(db: &mut Db, tokens: &[Vec<u8>]) -> Vec<u8> {
     };
     let cur = match h.get(&tokens[2]) {
         None => 0,
-        Some(v) => match std::str::from_utf8(v)
-            .ok()
-            .and_then(|s| s.parse::<i64>().ok())
-        {
+        Some(v) => match parse_int(v) {
             Some(n) => n,
             None => return error("ERR hash value is not an integer"),
         },
@@ -3528,26 +3659,35 @@ fn smove_cmd(db: &mut Db, tokens: &[Vec<u8>]) -> Vec<u8> {
         return wrong_args("smove");
     }
     let (src, dst, member) = (&tokens[1], &tokens[2], &tokens[3]);
-    // Type-check dst up front so we never remove from src and then fail.
+    // As in `lmove_core`: a missing source answers 0 before dst's type is even
+    // looked at (Redis's order). dst is still type-checked before anything is
+    // removed, so we never take from src and then fail.
+    match db.get(src) {
+        None => return integer(0),
+        Some(Value::Set(_)) => {}
+        Some(_) => return wrongtype(),
+    }
     match db.get(dst) {
         None | Some(Value::Set(_)) => {}
         Some(_) => return wrongtype(),
     }
     let removed = match db.get_mut(src) {
-        None => false,
         Some(Value::Set(s)) => s.remove(member),
-        Some(_) => return wrongtype(),
+        _ => false, // unreachable: src was type-checked just above
     };
     if !removed {
         return integer(0);
     }
-    db.remove_if_empty(src);
+    // Insert into dst before retiring an emptied src — see `lmove_core`.
+    // `SMOVE s s m` on a one-member set is a no-op, and retiring the key in the
+    // gap between the remove and the insert dropped its TTL.
     match db.get_or_insert_with(dst, || Value::Set(HashSet::new())) {
         Value::Set(s) => {
             s.insert(member.clone());
         }
         _ => return wrongtype(), // unreachable: dst was type-checked
     }
+    db.remove_if_empty(src);
     integer(1)
 }
 
@@ -6651,5 +6791,228 @@ mod tests {
         assert!(
             cmd(&mut db, &[b"SET", b"k", b"v2", b"EX", b"99999999999999999"]).starts_with(b"-")
         );
+    }
+
+    // === session 8 regression tests ========================================
+    //
+    // Each of these is one numbered finding from the phase-5.2 differential
+    // harness (`tests/differential.rs`), reproduced here so it is checked by the
+    // ordinary `cargo test` — the harness itself skips when the machine has no
+    // `redis-server`, and a regression test that can silently not run is not one.
+    // Every expected value below was read off redis-server 8.8.
+
+    /// 8.1 — a negative index that is still negative after wrapping clamps to 0
+    /// on *both* ends, not just the start.
+    #[test]
+    fn negative_ranges_clamp_to_the_first_byte() {
+        let mut db = Db::new();
+        cmd(&mut db, &[b"SET", b"k", b"hello"]);
+        // -100 -> 5-100 = -95 -> 0; -90 -> 5-90 = -85 -> 0. Range [0,0] = "h".
+        assert_eq!(
+            cmd(&mut db, &[b"GETRANGE", b"k", b"-100", b"-90"]),
+            bulk_string(b"h")
+        );
+        assert_eq!(
+            cmd(&mut db, &[b"BITCOUNT", b"k", b"-100", b"-90"]),
+            integer(3)
+        );
+        assert_eq!(
+            cmd(&mut db, &[b"BITPOS", b"k", b"1", b"-100", b"-90"]),
+            integer(1)
+        );
+        // One byte: 0xff. -5 -> -4 -> 0, -2 -> -1 -> 0.
+        cmd(&mut db, &[b"SET", b"b", b"\xff"]);
+        assert_eq!(cmd(&mut db, &[b"BITCOUNT", b"b", b"-5", b"-2"]), integer(8));
+    }
+
+    /// 8.1 (the other half) — `GETRANGE` and `BITCOUNT` short-circuit an
+    /// inverted all-negative range before wrapping; `BITPOS` does not. Odd, and
+    /// exactly what redis-server does.
+    #[test]
+    fn inverted_negative_ranges_are_empty_except_for_bitpos() {
+        let mut db = Db::new();
+        cmd(&mut db, &[b"SET", b"b", b"\xff"]);
+        assert_eq!(
+            cmd(&mut db, &[b"GETRANGE", b"b", b"-1", b"-3"]),
+            bulk_string(b"")
+        );
+        assert_eq!(cmd(&mut db, &[b"BITCOUNT", b"b", b"-1", b"-3"]), integer(0));
+        // BITPOS clamps first and answers from [0,0], so it finds bit 0.
+        assert_eq!(
+            cmd(&mut db, &[b"BITPOS", b"b", b"1", b"-1", b"-3"]),
+            integer(0)
+        );
+    }
+
+    /// 8.2 — a *missing source* answers before the destination is type-checked.
+    #[test]
+    fn a_missing_move_source_answers_before_the_destination_type() {
+        let mut db = Db::new();
+        cmd(&mut db, &[b"SET", b"str", b"v"]); // destination of the wrong type
+        assert_eq!(
+            cmd(&mut db, &[b"RPOPLPUSH", b"nolist", b"str"]),
+            null_bulk()
+        );
+        assert_eq!(
+            cmd(&mut db, &[b"LMOVE", b"nolist", b"str", b"LEFT", b"LEFT"]),
+            null_bulk()
+        );
+        assert_eq!(
+            cmd(&mut db, &[b"SMOVE", b"noset", b"str", b"m"]),
+            integer(0)
+        );
+        // A source that exists with the wrong type is still a WRONGTYPE, and so
+        // is a real source with a wrong-typed destination.
+        assert_eq!(cmd(&mut db, &[b"RPOPLPUSH", b"str", b"other"]), wrongtype());
+        cmd(&mut db, &[b"RPUSH", b"list", b"a"]);
+        assert_eq!(cmd(&mut db, &[b"RPOPLPUSH", b"list", b"str"]), wrongtype());
+        // ...and the failed move left the source list untouched.
+        assert_eq!(
+            cmd(&mut db, &[b"LRANGE", b"list", b"0", b"-1"]),
+            array(&[bulk_string(b"a")])
+        );
+    }
+
+    /// 8.3 — contradictory `SET` options are a syntax error, and a
+    /// non-positive expire is an invalid-expire error.
+    #[test]
+    fn set_rejects_contradictory_options_and_bad_expiries() {
+        let mut db = Db::new();
+        let syntax = error("ERR syntax error");
+        let invalid = error("ERR invalid expire time in 'set' command");
+        assert_eq!(cmd(&mut db, &[b"SET", b"k", b"v", b"NX", b"XX"]), syntax);
+        assert_eq!(cmd(&mut db, &[b"SET", b"k", b"v", b"XX", b"NX"]), syntax);
+        assert_eq!(
+            cmd(&mut db, &[b"SET", b"k", b"v", b"EX", b"10", b"PX", b"100"]),
+            syntax
+        );
+        assert_eq!(
+            cmd(&mut db, &[b"SET", b"k", b"v", b"EX", b"10", b"KEEPTTL"]),
+            syntax
+        );
+        assert_eq!(
+            cmd(&mut db, &[b"SET", b"k", b"v", b"KEEPTTL", b"EX", b"10"]),
+            syntax
+        );
+        assert_eq!(cmd(&mut db, &[b"SET", b"k", b"v", b"EX", b"0"]), invalid);
+        assert_eq!(cmd(&mut db, &[b"SET", b"k", b"v", b"PX", b"-1"]), invalid);
+        assert_eq!(cmd(&mut db, &[b"SET", b"k", b"v", b"EXAT", b"0"]), invalid);
+        // Not one of them wrote anything.
+        assert_eq!(cmd(&mut db, &[b"EXISTS", b"k"]), integer(0));
+        // A repeated *identical* flag is still fine, as it is on Redis.
+        assert_eq!(
+            cmd(&mut db, &[b"SET", b"k", b"v", b"XX", b"XX"]),
+            null_bulk()
+        );
+        assert_eq!(
+            cmd(&mut db, &[b"SET", b"k", b"v", b"NX", b"GET"]),
+            null_bulk()
+        );
+    }
+
+    /// 8.5 — an integer has one spelling. Rust's parser is looser than Redis's
+    /// `string2ll`, and the gap showed up as `DECR` succeeding on a value that
+    /// `APPEND` had made "02".
+    #[test]
+    fn integers_are_parsed_the_way_redis_parses_them() {
+        assert_eq!(parse_int(b"0"), Some(0));
+        assert_eq!(parse_int(b"-1"), Some(-1));
+        assert_eq!(parse_int(b"9223372036854775807"), Some(i64::MAX));
+        assert_eq!(parse_int(b"-9223372036854775808"), Some(i64::MIN));
+        for bad in [
+            &b"+1"[..],
+            b"02",
+            b"-0",
+            b"-02",
+            b" 1",
+            b"1 ",
+            b"",
+            b"-",
+            b"0x10",
+            b"1.0",
+            b"9223372036854775808",
+            b"-9223372036854775809",
+        ] {
+            assert_eq!(parse_int(bad), None, "{:?} must not parse", show(bad));
+        }
+        let mut db = Db::new();
+        cmd(&mut db, &[b"SET", b"k", b"0"]);
+        cmd(&mut db, &[b"APPEND", b"k", b"2"]); // -> "02"
+        assert_eq!(cmd(&mut db, &[b"DECR", b"k"]), not_integer());
+        assert_eq!(cmd(&mut db, &[b"GET", b"k"]), bulk_string(b"02"));
+        cmd(&mut db, &[b"HSET", b"h", b"f", b"+1"]);
+        assert!(cmd(&mut db, &[b"HINCRBY", b"h", b"f", b"1"]).starts_with(b"-ERR"));
+        // Arguments are held to the same rule.
+        cmd(&mut db, &[b"RPUSH", b"l", b"a"]);
+        assert_eq!(
+            cmd(&mut db, &[b"LRANGE", b"l", b"+0", b"-1"]),
+            not_integer()
+        );
+    }
+
+    /// 8.6 — a self-move must not take the key's TTL with it. Popping the last
+    /// element retired the key mid-command, and the push then recreated a fresh,
+    /// *persistent* one: a value that was supposed to expire never did.
+    #[test]
+    fn a_self_move_keeps_the_keys_ttl() {
+        let mut db = Db::new();
+        cmd(&mut db, &[b"RPUSH", b"l", b"one"]);
+        cmd(&mut db, &[b"EXPIRE", b"l", b"1000"]);
+        assert_eq!(
+            cmd(&mut db, &[b"RPOPLPUSH", b"l", b"l"]),
+            bulk_string(b"one")
+        );
+        assert_eq!(cmd(&mut db, &[b"TTL", b"l"]), integer(1000));
+        assert_eq!(
+            cmd(&mut db, &[b"LMOVE", b"l", b"l", b"LEFT", b"RIGHT"]),
+            bulk_string(b"one")
+        );
+        assert_eq!(cmd(&mut db, &[b"TTL", b"l"]), integer(1000));
+
+        cmd(&mut db, &[b"SADD", b"s", b"m"]);
+        cmd(&mut db, &[b"EXPIRE", b"s", b"1000"]);
+        assert_eq!(cmd(&mut db, &[b"SMOVE", b"s", b"s", b"m"]), integer(1));
+        assert_eq!(cmd(&mut db, &[b"TTL", b"s"]), integer(1000));
+        assert_eq!(cmd(&mut db, &[b"SCARD", b"s"]), integer(1));
+
+        // A move to a *different* key still retires an emptied source.
+        cmd(&mut db, &[b"RPOPLPUSH", b"l", b"dst"]);
+        assert_eq!(cmd(&mut db, &[b"EXISTS", b"l"]), integer(0));
+    }
+
+    /// 8.7 — `INCRBYFLOAT` renders its result the human way (Redis's
+    /// `addReplyHumanLongDouble`), not the shortest-round-trip way a sorted-set
+    /// score is rendered. The result is also the stored value, so the noise stuck.
+    #[test]
+    fn incrbyfloat_is_rendered_the_human_way() {
+        let mut db = Db::new();
+        for (start, incr, want) in [
+            ("-2.251", "-5.25", "-7.501"),
+            ("0.1", "0.2", "0.3"),
+            ("10.5", "0.1", "10.6"),
+            ("5.0e3", "2.0e2", "5200"),
+            ("0.000001", "0.0000001", "0.0000011"),
+            ("1e20", "1", "100000000000000000000"),
+        ] {
+            cmd(&mut db, &[b"SET", b"k", start.as_bytes()]);
+            assert_eq!(
+                cmd(&mut db, &[b"INCRBYFLOAT", b"k", incr.as_bytes()]),
+                bulk_string(want.as_bytes()),
+                "INCRBYFLOAT {start} by {incr}"
+            );
+            // The reply is the stored value.
+            assert_eq!(cmd(&mut db, &[b"GET", b"k"]), bulk_string(want.as_bytes()));
+        }
+        // A sorted-set score keeps the *other* rendering — the two Redis
+        // formatters stay distinct.
+        cmd(&mut db, &[b"ZADD", b"z", b"0.30000000000000004", b"m"]);
+        assert_eq!(
+            cmd(&mut db, &[b"ZSCORE", b"z", b"m"]),
+            bulk_string(b"0.30000000000000004")
+        );
+    }
+
+    fn show(b: &[u8]) -> String {
+        String::from_utf8_lossy(b).to_string()
     }
 }

@@ -168,18 +168,73 @@ impl PubSub {
     }
 }
 
-/// Glob matching for PSUBSCRIBE: supports `*` and `?` (and literals).
+/// Match the single-character pattern token at `pat[p]` against `ch`, returning
+/// the index just past the token when it matches. `pat[p]` is never `*` — the
+/// caller handles that, because it is the only token that spans many characters.
+///
+/// The grammar is Redis's `stringmatchlen`, quirks included: a class runs to
+/// the first unescaped `]`, `^` right after `[` negates it, `a-b` inside a class
+/// is a range (endpoints swapped if reversed), `\` escapes the next byte both
+/// inside and outside a class, and a trailing `\` is a literal backslash.
+fn match_one(pat: &[u8], p: usize, ch: u8) -> Option<usize> {
+    match pat[p] {
+        b'?' => Some(p + 1),
+        b'\\' => {
+            if p + 1 < pat.len() {
+                (pat[p + 1] == ch).then_some(p + 2)
+            } else {
+                (ch == b'\\').then_some(p + 1)
+            }
+        }
+        b'[' => {
+            let mut i = p + 1;
+            let neg = i < pat.len() && pat[i] == b'^';
+            if neg {
+                i += 1;
+            }
+            let mut hit = false;
+            while i < pat.len() {
+                if pat[i] == b'\\' && i + 1 < pat.len() {
+                    hit |= pat[i + 1] == ch;
+                    i += 2;
+                } else if pat[i] == b']' {
+                    i += 1;
+                    break;
+                } else if i + 2 < pat.len() && pat[i + 1] == b'-' {
+                    // Redis does not exclude `]` as a range endpoint, so `[1-]`
+                    // really is the range '1'..=']'. Matching that exactly is
+                    // the point of a differential harness.
+                    let (lo, hi) = (pat[i].min(pat[i + 2]), pat[i].max(pat[i + 2]));
+                    hit |= (lo..=hi).contains(&ch);
+                    i += 3;
+                } else {
+                    hit |= pat[i] == ch;
+                    i += 1;
+                }
+            }
+            // An unterminated class simply ends with the pattern.
+            (hit != neg).then_some(i)
+        }
+        c => (c == ch).then_some(p + 1),
+    }
+}
+
+/// Glob matching for `KEYS`, the `SCAN` family's `MATCH`, `PSUBSCRIBE` and the
+/// ACL key/channel patterns: `*`, `?`, `[...]` character classes (with `^`
+/// negation and `a-z` ranges) and `\` escapes — Redis's `stringmatchlen`.
 pub fn glob_match(pat: &[u8], text: &[u8]) -> bool {
     let (mut p, mut t) = (0usize, 0usize);
     let (mut star, mut mark) = (None, 0usize);
     while t < text.len() {
-        if p < pat.len() && (pat[p] == b'?' || pat[p] == text[t]) {
-            p += 1;
-            t += 1;
-        } else if p < pat.len() && pat[p] == b'*' {
+        if p < pat.len() && pat[p] == b'*' {
             star = Some(p);
             mark = t;
             p += 1;
+        } else if p < pat.len()
+            && let Some(next) = match_one(pat, p, text[t])
+        {
+            p = next;
+            t += 1;
         } else if let Some(sp) = star {
             p = sp + 1;
             mark += 1;
@@ -256,5 +311,37 @@ mod tests {
         assert!(glob_match(b"h?llo", b"hello"));
         assert!(glob_match(b"*", b"anything"));
         assert!(!glob_match(b"h?llo", b"heello"));
+    }
+
+    /// Session 8, finding 8.4 — the matcher only knew `*` and `?`, so every
+    /// bracket pattern matched **nothing**: `KEYS a[12]`, `SCAN MATCH`,
+    /// `PSUBSCRIBE` and the ACL key/channel patterns all silently returned or
+    /// granted an empty set. Expected values read off redis-server 8.8.
+    #[test]
+    fn glob_character_classes_match_the_way_redis_matches() {
+        // A class, and its negation.
+        assert!(glob_match(b"a[12]", b"a1") && glob_match(b"a[12]", b"a2"));
+        assert!(!glob_match(b"a[12]", b"a3"));
+        assert!(glob_match(b"a[^1]", b"a2") && !glob_match(b"a[^1]", b"a1"));
+        // Ranges, including a reversed one (Redis swaps the endpoints).
+        assert!(glob_match(b"a[0-9]", b"a7") && !glob_match(b"a[0-9]", b"ax"));
+        assert!(glob_match(b"a[9-0]", b"a7"));
+        assert!(glob_match(b"[ab]1", b"a1") && glob_match(b"[ab]1", b"b1"));
+        // Redis does NOT treat `]` as ending a range's endpoint, so `[1-]` is
+        // literally the range '1'..=']' — which contains '2'.
+        assert!(glob_match(b"a[1-]", b"a1") && glob_match(b"a[1-]", b"a2"));
+        // Escapes, inside a class and out.
+        assert!(glob_match(br"a\-1", b"a-1") && !glob_match(br"a\-1", b"ax1"));
+        assert!(glob_match(br"[\]]", b"]"));
+        assert!(glob_match(br"\*", b"*") && !glob_match(br"\*", b"anything"));
+        // Classes compose with the star's backtracking.
+        assert!(glob_match(b"*[0-9]", b"user42"));
+        assert!(!glob_match(b"*[0-9]", b"user"));
+        assert!(glob_match(b"user:[0-9]*", b"user:1234:name"));
+        assert!(!glob_match(b"user:[0-9]*", b"user:abc"));
+        // And the plain cases still behave.
+        assert!(glob_match(b"*", b"") && glob_match(b"", b""));
+        assert!(!glob_match(b"", b"x"));
+        assert!(glob_match(b"?", b"*")); // the ACL trap, unchanged
     }
 }

@@ -26,7 +26,7 @@ works. This is a curated subset of Redis — the common, useful commands per typ
 |---|---|
 | `DEL key [key ...]` / `UNLINK key [key ...]` | returns count removed (UNLINK is synchronous here) |
 | `EXISTS key [key ...]` / `TOUCH key [key ...]` | counts each occurrence (no LRU, so TOUCH == EXISTS) |
-| `KEYS pattern` | keys matching a glob (`*`/`?`) |
+| `KEYS pattern` | keys matching a glob: `*`, `?`, `[abc]` / `[a-z]` / `[^a]` character classes, and `\` escapes |
 | `DBSIZE` | number of keys (cluster-wide total across shards when cluster mode is on) |
 | `RANDOMKEY` | a random key (nil if empty) |
 | `RENAME key newkey` / `RENAMENX key newkey` | move value+TTL; RENAMENX fails if dest exists |
@@ -42,15 +42,15 @@ works. This is a curated subset of Redis — the common, useful commands per typ
 
 | Command | Notes |
 |---|---|
-| `SET key val [EX\|PX\|EXAT\|PXAT n] [NX\|XX] [KEEPTTL] [GET]` | |
+| `SET key val [EX\|PX\|EXAT\|PXAT n] [NX\|XX] [KEEPTTL] [GET]` | at most one expire option, never with `KEEPTTL`, and `NX` never with `XX` — contradictions are `-ERR syntax error`; a non-positive expire is `-ERR invalid expire time` |
 | `SETNX key val` / `GETSET key val` | set-if-absent / set-and-return-old |
 | `SETEX key sec val` / `PSETEX key ms val` | set with TTL |
 | `GET key` / `GETDEL key` | |
 | `MGET key [key ...]` / `MSET key val [key val ...]` / `MSETNX key val [...]` | bulk get/set; MSETNX is all-or-nothing |
-| `INCR` / `DECR` / `INCRBY` / `DECRBY` | integer, errors on non-int / overflow |
-| `INCRBYFLOAT key incr` | float; rejects nan/inf |
+| `INCR` / `DECR` / `INCRBY` / `DECRBY` | integer, errors on non-int / overflow. An integer has exactly one spelling, as in Redis: `+1`, `02` and `-0` are **not** integers, in a stored value or an argument |
+| `INCRBYFLOAT key incr` | float; rejects nan/inf. Rendered the way Redis renders it — plain notation, trailing zeros trimmed — but accumulated in `f64`, where Redis uses C `long double`, so results needing more than f64's 15 significant digits differ (Redis's own answer is platform-dependent there) |
 | `APPEND key val` / `STRLEN key` | |
-| `GETRANGE key start end` / `SETRANGE key offset val` | substring (inclusive, neg indices) / overwrite-pad |
+| `GETRANGE key start end` / `SETRANGE key offset val` | substring (inclusive, negative-from-end indices, each end clamped to the value) / overwrite-pad |
 
 ## Lists
 
@@ -199,7 +199,7 @@ _Consumer groups (`XGROUP`/`XREADGROUP`/`XACK`) are not yet implemented._
 ## Pub/Sub
 
 `SUBSCRIBE` `UNSUBSCRIBE` `PSUBSCRIBE` `PUNSUBSCRIBE` `PUBLISH` `PUBSUB CHANNELS|NUMSUB|NUMPAT`
-(glob `*`/`?` patterns)
+(glob patterns: `*`, `?`, `[abc]`/`[a-z]`/`[^a]` classes, `\` escapes)
 
 ## Changefeed (Locus-native, reactive)
 
@@ -282,6 +282,11 @@ them outright.
 against the **pattern itself, literally**: a user granted `&news.*` may `PSUBSCRIBE news.*` but not
 `PSUBSCRIBE *`. (Redis's rule — glob-testing the pattern would let `*` through.) `PUBSUB
 CHANNELS`/`NUMSUB` only report channels inside the user's scope.
+
+Channel patterns use the same glob as `KEYS`, which since 0.11.0 includes `[abc]` / `[a-z]` / `[^a]`
+character classes and `\` escapes. Before that the matcher understood only `*` and `?`, so a bracket
+pattern matched **nothing** — a grant written `&app:[0-9]*` was silently an empty grant. It now grants
+what it says. Check any `&`/`~` pattern containing `[` or `\` when upgrading.
 
 ```console
 # a tenant app: read+write its own keys, its own channels, nothing else
