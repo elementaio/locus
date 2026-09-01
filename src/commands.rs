@@ -2291,6 +2291,13 @@ fn getbit_cmd(db: &mut Db, tokens: &[Vec<u8>]) -> Vec<u8> {
 }
 
 fn bitcount_cmd(db: &mut Db, tokens: &[Vec<u8>]) -> Vec<u8> {
+    // The arity guard rejected 3 and >5 but never *fewer than 2*, so a bare
+    // `BITCOUNT` indexed `tokens[1]` and panicked. On the server the hub's panic
+    // boundary turns that into one `-ERR`; in the library — a published API
+    // since 0.10.0 — it is the embedder's panic.
+    if tokens.len() < 2 {
+        return wrong_args("bitcount");
+    }
     if tokens.len() == 3 || tokens.len() > 5 {
         return error("ERR syntax error");
     }
@@ -3024,8 +3031,12 @@ fn copy_cmd(db: &mut Db, tokens: &[Vec<u8>]) -> Vec<u8> {
 
 fn cmsincrby_cmd(db: &mut Db, tokens: &[Vec<u8>]) -> Vec<u8> {
     // CMSINCRBY key item count [item count ...]
+    // Arity first: `&tokens[2..]` panics on a bare `CMSINCRBY`.
+    if tokens.len() < 4 {
+        return wrong_args("cmsincrby");
+    }
     let pairs = &tokens[2..];
-    if tokens.len() < 4 || !pairs.len().is_multiple_of(2) {
+    if !pairs.len().is_multiple_of(2) {
         return wrong_args("cmsincrby");
     }
     // Validate all counts up front so a bad arg doesn't half-apply.
@@ -7014,5 +7025,77 @@ mod tests {
 
     fn show(b: &[u8]) -> String {
         String::from_utf8_lossy(b).to_string()
+    }
+}
+
+#[cfg(test)]
+mod arity_probe {
+    use super::*;
+
+    /// 8.8 — **no command may panic on a short argument list.**
+    ///
+    /// The hub has a panic boundary (phase 1), so on the *server* a missing
+    /// arity check degrades to one `-ERR` rather than an outage. The
+    /// **library** has no such boundary: `execute` is a plain function an
+    /// embedder calls on its own thread, and a panic there is the embedder's
+    /// panic. Since 0.10.0 that is a published API.
+    ///
+    /// `BITCOUNT` was the one this found — its guard rejected `len == 3` and
+    /// `len > 5` but never `len < 2`, so `execute(&[b"BITCOUNT"])` indexed
+    /// `tokens[1]` and panicked. It surfaced from the differential harness's own
+    /// coverage probe, which asks every command name whether the engine knows it
+    /// by sending exactly that: the name and nothing else.
+    ///
+    /// Every command name, every length from 1 to 6, against an empty keyspace
+    /// and against one holding every value kind. A panic fails the test by
+    /// existing; there is nothing to assert.
+    #[test]
+    fn no_command_panics_on_a_short_argument_list() {
+        let mut populated = Db::new();
+        for setup in [
+            &[b"SET".as_slice(), b"k", b"1"][..],
+            &[b"RPUSH", b"l", b"a", b"b"],
+            &[b"HSET", b"h", b"f", b"v"],
+            &[b"SADD", b"s", b"m"],
+            &[b"ZADD", b"z", b"1", b"m"],
+            &[b"XADD", b"x", b"*", b"f", b"v"],
+            &[b"GEOSET", b"g", b"13.361", b"38.115"],
+            &[b"PFADD", b"hll", b"a"],
+            &[b"BFADD", b"bf", b"a"],
+            &[b"SETBIT", b"bits", b"7", b"1"],
+        ] {
+            let t: Vec<Vec<u8>> = setup.iter().map(|p| p.to_vec()).collect();
+            execute(&t, &mut populated);
+        }
+        // Four filler alphabets, so a short call reaches past the first parse
+        // instead of always bouncing off it: plausible arguments, all-numeric,
+        // all-empty (a zero-length bulk is legal on the wire), and a hostile
+        // count that several commands use to size a slice.
+        const FILLERS: [&[&[u8]]; 4] = [
+            &[b"k", b"1", b"m", b"0", b"v"],
+            &[b"0", b"0", b"0", b"0", b"0"],
+            &[b"", b"", b"", b"", b""],
+            &[
+                b"k",
+                b"-1",
+                b"-1",
+                b"9223372036854775807",
+                b"-9223372036854775808",
+            ],
+        ];
+        let mut count = 0;
+        for name in COMMAND_NAMES {
+            for filler in FILLERS {
+                for len in 1..=7usize {
+                    let mut tokens = vec![name.to_vec()];
+                    tokens.extend(filler.iter().cycle().take(len - 1).map(|f| f.to_vec()));
+                    let mut empty = Db::new();
+                    execute(&tokens, &mut empty);
+                    execute(&tokens, &mut populated);
+                    count += 1;
+                }
+            }
+        }
+        assert_eq!(count, COMMAND_NAMES.len() * FILLERS.len() * 7);
     }
 }

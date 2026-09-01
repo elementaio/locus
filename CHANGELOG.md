@@ -9,7 +9,7 @@ All notable changes to Locus are documented here. The format is based on
 **The differential harness found these.** Phase 5.2 added two test harnesses — randomized command
 sequences run against the `locusdb` engine in-process *and* a real `redis-server`, with the replies
 diffed; plus fault injection over a spawned server. The first one found seven behavioural divergences
-from Redis in its first afternoon, all of them fixed below. A single clean run is now 4,000
+from Redis and two outright panics in its first afternoon, all of them fixed below. A single clean run is now 4,000
 sequences of 500 commands — 2,245,423 executed, zero unexplained divergences.
 
 ### Fixed
@@ -52,6 +52,17 @@ sequences of 500 commands — 2,245,423 executed, zero unexplained divergences.
   this command in C `long double` (80-bit on x86, plain `double` on arm64 — Redis does not agree with
   itself across machines), and Locus is pure `std`, so results needing more than f64's 15 significant
   digits differ in the last digits.
+
+- **Two commands panicked on a bare command name.** `execute(&[b"BITCOUNT"])` and
+  `execute(&[b"CMSINCRBY"])` indexed past the end of the argument list: `BITCOUNT`'s arity guard
+  rejected 3 and more-than-5 arguments but never *fewer than 2*, and `CMSINCRBY` sliced `tokens[2..]`
+  before checking anything. On the server the hub's panic boundary (0.7.0) turns that into one `-ERR`
+  rather than an outage, but the `locusdb` **library** has no such boundary — `execute` is a plain
+  function an embedder calls on its own thread — and since 0.10.0 that is a published API. Both are
+  fixed, and a probe now calls **every** command name with one to seven arguments drawn from four
+  filler alphabets, against an empty keyspace and one holding every value kind, so a missing arity
+  guard cannot come back quietly. (Found by the differential harness's own coverage probe, which asks
+  each command name whether the engine knows it by sending exactly that: the name and nothing else.)
 
 ## [0.10.0] — 2026-09-01
 
