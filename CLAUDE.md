@@ -106,10 +106,10 @@ or issue.
 | `plans/IMPROVEMENTS-AUDIT-2026-07.md` | The July multi-agent audit — 84 findings, mostly still open |
 | `docs/` | The published documentation (README's targets) |
 
-## Current state — updated 2026-09-01 after session 5
+## Current state — updated 2026-09-01 after session 5b
 
 v0.9.0 (unreleased), ~18,900 lines of Rust (`std`-only except `src/tls.rs`, which is behind the
-optional feature), 118 unit + 121 integration tests green on both feature sets. **Phases 0–3 are done
+optional feature), 120 unit + 126 integration tests green on both feature sets. **Phases 0–3 are done
 and phase 4 is in progress.** Tagged and **pushed** to public `origin`: `v0.7.0` (phases 0–2 + the
 pulled-forward sentinel security fix) and `v0.8.0` (phase 3). Phase-4 work (session 5) is committed on
 `main` but unreleased.
@@ -143,12 +143,17 @@ the `[0.9.0]` CHANGELOG section is open) but **not tagged and not pushed** — v
 of phase 4.
 
 **Still open before the v0.9.0 tag:**
-- **Session 5b** — group *existence* is only snapshot-durable (a group created since the last snapshot
-  vanishes on an unclean stop; replicas have no groups). Propagate `CDCGROUP CREATE`/`DESTROY` (only
-  those) to the AOF and replication; cursor and PEL stay snapshot-durable.
 - **Session 6** — spatial-index precision (item 4.2): `GEOSEARCH` at a large radius still stalls the
   hub (~133 ms at 20 km on 200k points) because `ranges_for_box` picks cells too coarse.
-- **Session 3b** — small: convert `ZRANGEBYSCORE`'s low-bound `skip_while` to a `range` seek.
+- **Session 5c** — reclassify `CDCGROUP CREATE`/`DESTROY` from `@read` to `@write` (they mutate
+  replicated state now); one-line BREAKING ACL change.
+- **Session 3b** (anytime) — convert `ZRANGEBYSCORE`'s low-bound `skip_while` to a `range` seek.
+
+Session 5b landed: `CDCGROUP CREATE`/`DESTROY` (only those) now propagate to the AOF and replication,
+so a group survives an unclean stop and reaches a replica. It also fixed a **pre-existing** durability
+bug — `propagate` (eviction/expiry/slot-migration writes) did not mirror into an in-flight
+`BGREWRITEAOF` tail, so such writes landing mid-rewrite were lost on crash replay; now fixed for every
+`propagate` site.
 
 See `plans/EXECUTION-PLAN-2026-08.md` and `plans/SESSIONS.md`.
 
