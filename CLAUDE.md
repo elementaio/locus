@@ -106,10 +106,10 @@ or issue.
 | `plans/IMPROVEMENTS-AUDIT-2026-07.md` | The July multi-agent audit — 84 findings, mostly still open |
 | `docs/` | The published documentation (README's targets) |
 
-## Current state — updated 2026-09-01 after session 5b
+## Current state — updated 2026-09-01 after session 6
 
 v0.9.0 (unreleased), ~18,900 lines of Rust (`std`-only except `src/tls.rs`, which is behind the
-optional feature), 120 unit + 126 integration tests green on both feature sets. **Phases 0–3 are done
+optional feature), 128 unit + 127 integration tests green on both feature sets. **Phases 0–3 are done
 and phase 4 is in progress.** Tagged and **pushed** to public `origin`: `v0.7.0` (phases 0–2 + the
 pulled-forward sentinel security fix) and `v0.8.0` (phase 3). Phase-4 work (session 5) is committed on
 `main` but unreleased.
@@ -143,17 +143,25 @@ the `[0.9.0]` CHANGELOG section is open) but **not tagged and not pushed** — v
 of phase 4.
 
 **Still open before the v0.9.0 tag:**
-- **Session 6** — spatial-index precision (item 4.2): `GEOSEARCH` at a large radius still stalls the
-  hub (~133 ms at 20 km on 200k points) because `ranges_for_box` picks cells too coarse.
 - **Session 5c** — reclassify `CDCGROUP CREATE`/`DESTROY` from `@read` to `@write` (they mutate
-  replicated state now); one-line BREAKING ACL change.
-- **Session 3b** (anytime) — convert `ZRANGEBYSCORE`'s low-bound `skip_while` to a `range` seek.
+  replicated state since 5b); one-line BREAKING ACL change. **This is the last item before the v0.9.0
+  tag.**
+- **Session 3b** (anytime, post-0.9.0 is fine) — convert `ZRANGEBYSCORE`'s low-bound `skip_while` to a
+  `range` seek.
 
 Session 5b landed: `CDCGROUP CREATE`/`DESTROY` (only those) now propagate to the AOF and replication,
 so a group survives an unclean stop and reaches a replica. It also fixed a **pre-existing** durability
 bug — `propagate` (eviction/expiry/slot-migration writes) did not mirror into an in-flight
 `BGREWRITEAOF` tail, so such writes landing mid-rewrite were lost on crash replay; now fixed for every
 `propagate` site.
+
+Session 6 closed item 4.2: `ranges_for_box` now covers a query box with up to 64 fine cells (per-axis
+precision, adjacent cells merged into single `BTreeMap` seeks) instead of ≤4 coarse ones, and `COUNT n`
+is a real nearest-neighbour probe. `GEOSEARCH 20 km COUNT 10` on 200k points went from ~181 ms to
+**0.082 ms** — now *faster than Redis*, which does geo over an O(n) zset. Correctness proved against a
+brute-force oracle (the old HashSet-order path was never byte-stable). The one honest limit: a wide
+search with no `COUNT` is reply-bound (~190 ms for 103k members) — the cost is the reply, not the index;
+bound wide searches.
 
 See `plans/EXECUTION-PLAN-2026-08.md` and `plans/SESSIONS.md`.
 
