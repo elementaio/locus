@@ -106,10 +106,10 @@ or issue.
 | `plans/IMPROVEMENTS-AUDIT-2026-07.md` | The July multi-agent audit — 84 findings, mostly still open |
 | `docs/` | The published documentation (README's targets) |
 
-## Current state — updated 2026-09-01 after session 6
+## Current state — updated 2026-09-01 after session 5c (phase 4 complete)
 
 v0.9.0 (unreleased), ~18,900 lines of Rust (`std`-only except `src/tls.rs`, which is behind the
-optional feature), 128 unit + 127 integration tests green on both feature sets. **Phases 0–3 are done
+optional feature), 129 unit + 128 integration tests green on both feature sets. **Phases 0–3 are done
 and phase 4 is in progress.** Tagged and **pushed** to public `origin`: `v0.7.0` (phases 0–2 + the
 pulled-forward sentinel security fix) and `v0.8.0` (phase 3). Phase-4 work (session 5) is committed on
 `main` but unreleased.
@@ -133,7 +133,7 @@ pulled-forward sentinel security fix) and `v0.8.0` (phase 3). Phase-4 work (sess
 `ZRANK` remains O(rank) — deliberately (no order-statistic tree in `std`; the bookkeeping would risk
 the map-and-index lock-step invariant for a cold-path gain).
 
-**Phase 4 is in progress ("make the flagship honest").** Session 5 landed item 4.1: the changefeed's
+**Phase 4 is complete ("make the flagship honest"), tagged `v0.9.0` (not yet pushed).** Session 5 landed item 4.1: the changefeed's
 at-least-once promise is now real. A consumer that died between `CDCREADGROUP` and `CDCACK` used to
 strand its records forever; now the PEL carries per-entry `{consumer, delivered_ms, delivery_count}`,
 `CDCREADGROUP … 0` re-delivers a consumer's own pending, and `CDCCLAIM`/`CDCAUTOCLAIM` (min-idle-gated,
@@ -143,14 +143,18 @@ the `[0.9.0]` CHANGELOG section is open) but **not tagged and not pushed** — v
 of phase 4.
 
 **Still open before the v0.9.0 tag:**
-- **Session 5c** — reclassify `CDCGROUP CREATE`/`DESTROY` from `@read` to `@write` (they mutate
-  replicated state since 5b); one-line BREAKING ACL change. **This is the last item before the v0.9.0
-  tag.**
-- **Session 3b** (anytime, post-0.9.0 is fine) — convert `ZRANGEBYSCORE`'s low-bound `skip_while` to a
-  `range` seek.
+**Next: the phase 6 posture decision is the owner's, and it blocks any further distribution work** —
+either harden the cluster/sentinel layer (fencing, coordinated epochs, chunked migration) or narrow the
+documented guarantees. The authentication and the false-partition-safety claims were already pulled
+forward (session 2b); what remains is a product call, not a coding task.
+
+Loose ends, none blocking: **session 3b** (convert `ZRANGEBYSCORE`'s low-bound `skip_while` to a `range`
+seek) and a P3-batch (session 9) of small correctness items — `NaN` in zsets, `EXPIRE` flags,
+`EXPIRETIME`/`HINCRBYFLOAT`/`ZRANGEBYLEX`/`MEMORY USAGE`, observability counters, an
+eviction-during-BGREWRITEAOF regression test, and the `LOCUS_MAXCLIENTS` default.
 
 Session 5b landed: `CDCGROUP CREATE`/`DESTROY` (only those) now propagate to the AOF and replication,
-so a group survives an unclean stop and reaches a replica. It also fixed a **pre-existing** durability
+so a group survives an unclean stop and reaches a replica (5c then reclassified `CDCGROUP` as `@write`). It also fixed a **pre-existing** durability
 bug — `propagate` (eviction/expiry/slot-migration writes) did not mirror into an in-flight
 `BGREWRITEAOF` tail, so such writes landing mid-rewrite were lost on crash replay; now fixed for every
 `propagate` site.
