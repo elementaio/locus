@@ -233,7 +233,14 @@ harness also keeps **one** reference `redis-server` alive at a time rather than 
 concurrent run had managed to get one killed mid-assertion — and handshakes with `PING` before handing
 the connection out.
 
-**Both test flakes are fixed.** `free_port()` above (session 1b), and
+**The cluster spawn race is fixed properly now** (session 8). `free_port` binds a number, drops it, and
+only then does the child bind — a window a *previous* `cargo test` invocation's node can still occupy,
+which is why `integration.rs`'s cluster tests kept losing it at ~1 run in 20. A cluster node cannot
+answer `EADDRINUSE` by taking a different port (its address is in the topology string every other node
+was given), so `spawn_cluster_node*` now waits for the address to become bindable and retries the spawn
+on the same port. Same for `tests/fault.rs`'s resurrected-master respawn.
+
+**Both earlier test flakes are fixed.** `free_port()` above (session 1b), and
 `disk_tier_survives_kill9_with_aof_and_rewrite` (session 2b, item 2b.4) — it no longer sleeps a fixed
 300 ms for `BGREWRITEAOF`; it polls `aof_rewrite_in_progress` down to 0. The suite is green on both
 feature sets with no known timing races.

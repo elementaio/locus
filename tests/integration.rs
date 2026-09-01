@@ -4074,7 +4074,16 @@ fn cluster_routing_moved_and_crossslot() {
 /// with the message "node exited early" and sent the child's stderr to
 /// `/dev/null`, so the one thing needed to diagnose it — the bind error — was
 /// thrown away. Keep the child's stderr and put it in the panic.
-fn await_listening(child: &mut Child, port: u16, stderr: Option<std::process::ChildStderr>) {
+/// Wait for a cluster/sentinel node to announce its listener.
+///
+/// `Err(why)` when the child died at startup instead — the caller retries, since
+/// a node's port is baked into the topology every other node was told about and
+/// cannot simply be swapped for a different one.
+fn await_listening(
+    child: &mut Child,
+    port: u16,
+    stderr: Option<std::process::ChildStderr>,
+) -> Result<(), String> {
     let mut stderr = stderr;
     let mut reader = BufReader::new(child.stdout.take().unwrap());
     loop {
@@ -4092,10 +4101,10 @@ fn await_listening(child: &mut Child, port: u16, stderr: Option<std::process::Ch
             let _ = e.read_to_string(&mut why);
         }
         let status = child.wait().ok();
-        panic!(
+        return Err(format!(
             "node on port {port} exited early (status {status:?}): {}",
             why.trim()
-        );
+        ));
     }
     // Listening. Both pipes must now be drained for the life of the child, or
     // it blocks the first time a full one backs up — the server logs to stderr
@@ -4109,6 +4118,37 @@ fn await_listening(child: &mut Child, port: u16, stderr: Option<std::process::Ch
             let mut sink = Vec::new();
             let _ = e.read_to_end(&mut sink);
         });
+    }
+    Ok(())
+}
+
+/// Wait until `port` is actually bindable, then run `spawn`, retrying if the
+/// child still lost the race.
+///
+/// `free_port` hands out a number it has just successfully bound and dropped,
+/// which leaves a window before the child's own bind — and unlike an ordinary
+/// server, a cluster node cannot answer `EADDRINUSE` by taking a different port:
+/// its address is written into the topology string every other node was given.
+/// So retry the same port instead. Back-to-back `cargo test` invocations are
+/// where this bites (a previous run's node releasing the address late), which is
+/// exactly when a flake is most annoying to reproduce.
+fn spawn_retrying(port: u16, mut spawn: impl FnMut() -> Result<Child, String>) -> Child {
+    let deadline = Instant::now() + Duration::from_secs(20);
+    loop {
+        while TcpListener::bind(("127.0.0.1", port)).is_err() {
+            assert!(
+                Instant::now() < deadline,
+                "port {port} never became bindable"
+            );
+            sleep(Duration::from_millis(50));
+        }
+        match spawn() {
+            Ok(child) => return child,
+            Err(why) => {
+                assert!(Instant::now() < deadline, "{why}");
+                sleep(Duration::from_millis(100));
+            }
+        }
     }
 }
 
@@ -4139,10 +4179,11 @@ fn spawn_cluster_node_env(port: u16, nodes: &str, extra: &[(&str, &str)]) -> Chi
     for (k, v) in extra {
         cmd.env(k, v);
     }
-    let mut child = cmd.spawn().expect("spawn cluster node");
-    let stderr = child.stderr.take();
-    await_listening(&mut child, port, stderr);
-    child
+    spawn_retrying(port, move || {
+        let mut child = cmd.spawn().expect("spawn cluster node");
+        let stderr = child.stderr.take();
+        await_listening(&mut child, port, stderr).map(|()| child)
+    })
 }
 
 /// Spawn a cluster node on a fixed port with the given topology; wait until it
@@ -4169,10 +4210,11 @@ fn spawn_cluster_node_cells(port: u16, nodes: &str, cell_bits: u32) -> Child {
     if cell_bits > 0 {
         cmd.env("LOCUS_CLUSTER_CELL_BITS", cell_bits.to_string());
     }
-    let mut child = cmd.spawn().expect("spawn cluster node");
-    let stderr = child.stderr.take();
-    await_listening(&mut child, port, stderr);
-    child
+    spawn_retrying(port, move || {
+        let mut child = cmd.spawn().expect("spawn cluster node");
+        let stderr = child.stderr.take();
+        await_listening(&mut child, port, stderr).map(|()| child)
+    })
 }
 
 fn conn_to(port: u16) -> Conn {
