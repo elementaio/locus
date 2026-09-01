@@ -339,22 +339,30 @@ fn replication_master_killed_mid_stream_leaves_a_consistent_prefix() {
         info_field(&mut replica.connect(), "master_link_status") == "up"
     });
 
-    // A writer at full speed, one command at a time so "acked" is exact.
+    // A writer at full speed, one command at a time. It counts *issued* (bytes
+    // handed to the kernel) and *acked* (a `+OK` read back) separately, because
+    // the kill lands between the two often enough to matter: the master can have
+    // applied and streamed a write whose reply the client never got.
     let mut w = master.connect();
     let writer = std::thread::spawn(move || {
-        let mut acked = 0usize;
+        let (mut issued, mut acked) = (0usize, 0usize);
         for i in 0..N {
-            match w.try_cmd(&["SET", &format!("k:{i}"), &i.to_string()]) {
+            let out = Conn::encode(&["SET", &format!("k:{i}"), &i.to_string()]);
+            if w.stream.write_all(&out).is_err() {
+                break;
+            }
+            issued += 1;
+            match w.read_reply() {
                 Some(r) if r == "OK" => acked += 1,
                 _ => break, // the master is gone: stop counting
             }
         }
-        acked
+        (issued, acked)
     });
 
     sleep(Duration::from_millis(120)); // let the stream get going
     master.kill9(); // <-- the fault
-    let acked = writer.join().expect("writer thread");
+    let (issued, acked) = writer.join().expect("writer thread");
     assert!(acked > 0, "no write was acknowledged before the kill");
 
     // Give the replica time to drain whatever bytes were already in flight.
@@ -381,10 +389,16 @@ fn replication_master_killed_mid_stream_leaves_a_consistent_prefix() {
          consistent prefix",
         applied + hole.unwrap(),
     );
+    // The bound is what was *issued*, not what was acknowledged. A write the
+    // master applied and streamed a microsecond before the SIGKILL is on the
+    // replica even though its `+OK` never reached the client — that is ordinary
+    // asynchronous replication, not the replica inventing data. Conversely the
+    // replica is allowed to be *behind* even an acked write, which is exactly
+    // the window `WAIT` exists to bound (see docs/DEPLOYMENT.md).
     assert!(
-        applied <= acked,
-        "the replica applied {applied} writes but only {acked} were ever acknowledged — it is \
-         ahead of the master"
+        applied <= issued,
+        "the replica applied {applied} writes but only {issued} were ever sent — it is ahead of \
+         anything the master could have received"
     );
     // And the values themselves have to be right, not just present.
     if applied > 0 {
@@ -392,8 +406,8 @@ fn replication_master_killed_mid_stream_leaves_a_consistent_prefix() {
         assert_eq!(r.cmd(&["GET", &format!("k:{last}")]), last.to_string());
     }
     println!(
-        "replication under SIGKILL: {acked} writes acknowledged, {applied} applied on the \
-         replica — a prefix, no holes"
+        "replication under SIGKILL: {issued} writes issued, {acked} acknowledged, {applied} \
+         applied on the replica — a prefix, no holes"
     );
 }
 
