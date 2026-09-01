@@ -99,14 +99,16 @@ or issue.
 | `src/sketch.rs` | Bloom, HyperLogLog, Count-Min, Top-K, t-digest |
 | `src/pubsub.rs` · `src/streams.rs` · `src/acl.rs` · `src/tier.rs` · `src/sentinel.rs` · `src/hlc.rs` · `src/log.rs` | One subsystem each |
 | `tests/integration.rs` | 104 end-to-end tests — failover, resharding, partial resync, crash recovery |
-| `tests/perf.rs` | The perf harness — `#[ignore]`d; spawns a server (and a `redis-server`, if present) and prints the comparison table |
+| `src/lib.rs` | The `locusdb` **library** — the engine (keyspace, commands, codec, persistence, geo, sketches), no server; `main.rs` is the thin `locus` binary over it |
+| `src/util.rs` | Tiny shared helpers (`ct_eq`) used by both the library and the binary |
+| `tests/perf.rs` · `tests/embedding.rs` | The perf harness (`#[ignore]`d, spawns a server) · the out-of-crate embedding test (proves the public API) |
 | `plans/EXECUTION-PLAN-2026-08.md` | **The current plan.** What we are fixing and why |
 | `plans/SESSIONS.md` | **The session ledger.** Briefs, delivery reports, manager reviews |
 | `plans/DESIGN-PRINCIPLES.md` | The identity above, argued in full |
 | `plans/IMPROVEMENTS-AUDIT-2026-07.md` | The July multi-agent audit — 84 findings, mostly still open |
 | `docs/` | The published documentation (README's targets) |
 
-## Current state — updated 2026-09-01 after session 5c (phase 4 complete)
+## Current state — updated 2026-09-01 after session 7 (phase 5.1: library)
 
 v0.9.0 (unreleased), ~18,900 lines of Rust (`std`-only except `src/tls.rs`, which is behind the
 optional feature), 129 unit + 128 integration tests green on both feature sets. **Phases 0–3 are done
@@ -130,10 +132,15 @@ pulled-forward sentinel security fix) and `v0.8.0` (phase 3). Phase-4 work (sess
   off the hub; and `BGSAVE` stays on the hub (no `fork()` — unsafe with 2N threads) with the stall
   measured (`rdb_last_bgsave_hub_stall_us`) and a backup-from-a-replica procedure in `docs/DEPLOYMENT.md`.
 
+Session 7 split the engine into the **`locusdb` library** (`src/lib.rs`) with the server as a thin
+binary over it — Locus is now embeddable, fuzzable, and unit-testable from outside the crate; the binary
+is byte-identical and the release profile gained thin LTO. `tls` is a binary-only feature (no-op for the
+library).
+
 `ZRANK` remains O(rank) — deliberately (no order-statistic tree in `std`; the bookkeeping would risk
 the map-and-index lock-step invariant for a cold-path gain).
 
-**Phase 4 is complete ("make the flagship honest"), tagged `v0.9.0` (not yet pushed).** Session 5 landed item 4.1: the changefeed's
+**Phases 0–4 are done and pushed (`v0.7.0`–`v0.9.0`). Phase 5.1 is done: `v0.10.0` (library target) is tagged, not yet pushed.** Session 5 landed item 4.1: the changefeed's
 at-least-once promise is now real. A consumer that died between `CDCREADGROUP` and `CDCACK` used to
 strand its records forever; now the PEL carries per-entry `{consumer, delivered_ms, delivery_count}`,
 `CDCREADGROUP … 0` re-delivers a consumer's own pending, and `CDCCLAIM`/`CDCAUTOCLAIM` (min-idle-gated,
@@ -143,7 +150,11 @@ the `[0.9.0]` CHANGELOG section is open) but **not tagged and not pushed** — v
 of phase 4.
 
 **Still open before the v0.9.0 tag:**
-**Next: the phase 6 posture decision is the owner's, and it blocks any further distribution work** —
+**Next: session 8** — the differential + fault-injection harness (phase 5.2), a two-part harness
+(in-process command differential vs `redis-server`, plus spawn-a-server fault injection on
+replication/failover/reshard). It closes phase 5 and is the credibility gate.
+
+**The phase 6 posture decision is the owner's, and it blocks any further distribution work** —
 either harden the cluster/sentinel layer (fencing, coordinated epochs, chunked migration) or narrow the
 documented guarantees. The authentication and the false-partition-safety claims were already pulled
 forward (session 2b); what remains is a product call, not a coding task.
