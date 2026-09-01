@@ -1533,6 +1533,76 @@ fn changefeed_region_geofencing() {
     assert!(del.contains("del") && del.contains("in2"), "del: {del}");
 }
 
+#[test]
+fn changefeed_region_snapshot_is_exact_over_a_dense_cloud() {
+    // The REGION snapshot goes through the spatial index now (plan item 4.2)
+    // instead of walking every geo key. Over a cloud far larger than the region,
+    // the membership it reports must still be exactly the set inside the circle —
+    // no false negatives from the candidate cells, no false positives from them
+    // either (the exact haversine refinement is still what decides).
+    let s = Server::start();
+    let mut w = s.connect();
+    let (clon, clat) = (13.35_f64, 38.25_f64);
+    // 6000 points over ~0.5 deg, a good deal wider than a 2 km region.
+    let mut expected: Vec<String> = Vec::new();
+    for i in 0..6000u64 {
+        let h = i
+            .wrapping_mul(6_364_136_223_846_793_005)
+            .wrapping_add(1_442_695_040_888_963_407);
+        let a = ((h >> 11) & 0xFFFF) as f64 / 65_536.0;
+        let b = ((h >> 33) & 0xFFFF) as f64 / 65_536.0;
+        let (lon, lat) = (clon - 0.25 + a * 0.5, clat - 0.25 + b * 0.5);
+        let key = format!("p{i}");
+        w.cmd(&["GEOSET", &key, &format!("{lon:.6}"), &format!("{lat:.6}")]);
+        // The server's own distance, so the test agrees with it by construction
+        // rather than by re-implementing haversine here.
+        let d: f64 = {
+            w.cmd(&["GEOSET", "__probe", &format!("{clon}"), &format!("{clat}")]);
+            w.cmd(&["GEODIST", "__probe", &key, "m"])
+                .trim()
+                .parse()
+                .expect("GEODIST returns a number")
+        };
+        if d <= 2000.0 {
+            expected.push(key);
+        }
+    }
+    w.cmd(&["DEL", "__probe"]);
+    assert!(
+        expected.len() > 20,
+        "expected a real membership set, got {}",
+        expected.len()
+    );
+
+    let mut feed = s.connect();
+    feed.send(&["CDCSUBSCRIBE", "REGION", "13.35", "38.25", "2", "km"]);
+    let mut got: Vec<String> = Vec::new();
+    let n = loop {
+        let line = feed.read_reply();
+        if let Some(rest) = line.strip_prefix("[cdc-snapshot-done, ") {
+            break rest
+                .split(',')
+                .next()
+                .unwrap()
+                .trim()
+                .parse::<usize>()
+                .unwrap();
+        }
+        // "[cdc-snapshot, <key>, <lon>,<lat>]"
+        let key = line
+            .trim_start_matches("[cdc-snapshot, ")
+            .split(',')
+            .next()
+            .unwrap()
+            .to_string();
+        got.push(key);
+    };
+    got.sort();
+    expected.sort();
+    assert_eq!(n, got.len(), "snapshot-done count != frames sent");
+    assert_eq!(got, expected, "REGION snapshot membership changed");
+}
+
 // === pub/sub ================================================================
 
 #[test]

@@ -157,6 +157,10 @@ Snapshot of the geo keys inside the circle, then `cdc-change write` as keys **en
 `cdc-change del` as they **leave** (move out, are deleted, or expire). Each region subscriber tracks its
 own membership so the enter/leave transitions are exact.
 
+The snapshot takes the spatial index, not the geo keyspace: since v0.9.0 it uses the same candidate
+prefilter as `GEOSEARCH`, so subscribing to a neighbourhood costs the neighbourhood, not the dataset
+(a 1 km region over 200 000 geo keys: **141 ms → 3 ms**).
+
 ## How it stays correct
 
 Every keyspace mutation funnels through the hub's `record_change`, fed from the **same modification

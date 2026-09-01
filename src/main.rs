@@ -3673,9 +3673,19 @@ impl Hub {
                 ),
             );
         }
+        // Take the spatial index, not the whole geo keyspace: a geofence over one
+        // neighbourhood used to cost an O(all-geo-points) scan on the hub at
+        // every subscribe, which is the same defect item 4.2 fixed in GEOSEARCH.
+        // Same prefilter, same exact haversine refinement below.
+        let candidates = match commands::geo_circle_bbox(lon, lat, radius_m) {
+            Some((mn_lon, mn_lat, mx_lon, mx_lat)) => {
+                self.db.geo_candidates(mn_lon, mn_lat, mx_lon, mx_lat)
+            }
+            None => self.db.geo_keys(), // pole / antimeridian -> full scan
+        };
         let mut members = HashSet::new();
         let mut n = 0;
-        for k in self.db.geo_keys() {
+        for k in candidates {
             let point = match self.db.get(&k) {
                 Some(Value::Geo(klon, klat, _)) => Some((*klon, *klat)),
                 _ => None,

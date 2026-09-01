@@ -6,10 +6,11 @@ All notable changes to Locus are documented here. The format is based on
 
 ## [0.9.0] — 2026-09-01
 
-The changefeed's at-least-once promise, made true. Locus positions itself on "a reliable, ordered
-changefeed", and for consumer groups that was not the case: the pending-entries list was written and
-never read back. This release closes it. Existing snapshots and masters load unchanged; nothing about
-the existing `CDCREADGROUP` / `CDCACK` flow changes shape.
+Both flagship claims, made honest. Locus positions itself on "a reliable, ordered changefeed" and on a
+geo-first spatial model, and neither held up under a hard look: consumer groups wrote a pending-entries
+list they never read back, and the spatial index chose cells so coarse that a large-radius `GEOSEARCH`
+degenerated into a full scan. This release closes both. Existing snapshots and masters load unchanged;
+nothing about the existing `CDCREADGROUP` / `CDCACK` flow or any `GEOSEARCH` reply changes shape.
 
 ### Fixed
 
@@ -52,6 +53,56 @@ the existing `CDCREADGROUP` / `CDCACK` flow changes shape.
   a consumer already has to tolerate. A vanished group was not a duplicate, which is why it was the
   half worth fixing.
 
+- **`GEOSEARCH` no longer stalls the hub as the radius grows.** The spatial index picked a single cell
+  precision coarse enough that the query box spanned at most four cells — which makes every cell 2–3×
+  wider than the query in longitude, so the scan covered 4–9× the query's area (measured at **14.6×**
+  for a 1 km box). On dense data at a large radius one cell swallowed the entire dataset and the index
+  quietly became a full scan: **181 ms of hub time** for `BYRADIUS 20 km ASC COUNT 10` over 200,000
+  points, which on a single-hub design is every client's stall, not just the caller's. A second,
+  compounding bug shared one precision between the axes although longitude spans 360° to latitude's
+  180°, so every cell came out twice as wide as it was tall.
+
+  Three changes, none of which alter a single reply:
+
+  - **The cover is up to 64 fine cells**, chosen as the finest geohash prefix that fits that budget,
+    holding the scanned area to ~1.3× the box. Each extra cell is one `O(log n)` `BTreeMap` seek — far
+    cheaper than the points a coarse cell sweeps in — and adjacent cells are merged into single seeks.
+  - **Longitude gets the extra bit.** The 52-bit code interleaves longitude into the odd bit positions,
+    so an *odd* prefix length gives it one bit more precision than latitude, which is exactly the
+    asymmetry the coordinate ranges call for.
+  - **`COUNT n` is a nearest-neighbour search.** Every point inside a circle of radius ρ is nearer than
+    every point outside it, so an ascending `COUNT n` (the default when `COUNT` is given) probes outward
+    — ρ = r/64, then r/8, then the full shape — and stops at the first radius that already holds n
+    matches. `COUNT n DESC` asks for the n *farthest* and cannot probe, but now collects through a
+    bounded heap instead of sorting every candidate.
+
+  | Query, 200k points over one city | 0.8.0 | 0.9.0 |
+  |---|---:|---:|
+  | `BYRADIUS 20 km ASC COUNT 10` | 181 ms | **0.082 ms** |
+  | `BYRADIUS 1 km ASC COUNT 10` | 1.56 ms | **0.34 ms** |
+  | `BYRADIUS 20 km COUNT 1000` | 192 ms | **6.1 ms** |
+  | `BYRADIUS 20 km COUNT 10 ANY` | 169 ms | **0.09 ms** |
+  | `BYBOX 4×4 km ASC COUNT 10` | 10.0 ms | **0.14 ms** |
+  | `BYRADIUS 1 km`, no `COUNT` (261 results) | 2.98 ms | **1.01 ms** |
+
+  A query with **no `COUNT`** still returns every match and so still costs what its own result costs —
+  `BYRADIUS 20 km` over that set returns 103,450 members in ~190 ms either way. Bound wide searches with
+  `COUNT`. `tests/perf.rs` gained a ratio floor for this: a top-10 at 20 km must not cost dramatically
+  more than a top-10 at 1 km, which is precisely the shape of the defect (it measured 133× before).
+
+- **A tall box at a high latitude no longer loses matches along its poleward edge.** The candidate
+  bounding box scaled longitude by the *center's* latitude, while the exact filter measures east-west on
+  the *point's* own parallel — 22% shorter at the top of a 500 km-tall box at 80°N. The candidate box is
+  now scaled by the box's most poleward latitude: never narrower than before, so nothing that used to be
+  found can be lost. The old oversized cells happened to mask this; with a tight cover it would have
+  become a dropped match.
+
+- **`CDCSUBSCRIBE REGION` snapshots through the spatial index.** The live-geofence snapshot walked every
+  geo key in the keyspace on the hub at every subscribe. It now uses the same candidate prefilter
+  `GEOSEARCH` does, so subscribing to a neighbourhood costs the neighbourhood: a 1 km region over
+  200,000 geo keys went from **141 ms to 3 ms**. Transitions, membership tracking and the snapshot
+  contents are unchanged.
+
 ### Added
 
 - **`CDCCLAIM`** and **`CDCAUTOCLAIM`** (above). Offsets that are not pending, or not idle long enough,
@@ -88,6 +139,9 @@ the existing `CDCREADGROUP` / `CDCACK` flow changes shape.
 - The pending list is still capped at `LOCUS_CDC_PEL_MAX` per group (default 100,000). At the cap the
   **oldest** unacked entries are dropped with a warning in the log: a consumer that never acks degrades
   to at-most-once rather than growing hub memory without bound. Unchanged from 0.8.0.
+- **A clustered `GEOSEARCH` does not get the nearest-neighbour probe.** Shards are handed the query
+  without its `COUNT` (they return raw hits for the coordinator to merge), so each shard still scans its
+  own candidate box. The single-node path and the coordinating node's own hits do use the probe.
 - **A group's cursor and pending list are snapshot-durable** (its *existence* is log-durable — see
   above). `CDCREADGROUP`, `CDCACK` and the claim verbs are not written to the AOF and not propagated
   over the replication link, so after a `kill -9` or a failover a group comes back at the position of

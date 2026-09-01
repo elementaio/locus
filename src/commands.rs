@@ -4328,12 +4328,19 @@ fn geo_bbox(center: (f64, f64), shape: &GeoShape) -> Option<(f64, f64, f64, f64)
     };
     // Generous meters-per-degree (smaller divisor -> larger box) + 20% margin, so
     // the candidate box never under-covers the exact (haversine) matches.
-    let cosl = clat.to_radians().cos();
-    if cosl.abs() < 1e-3 {
+    let lat_delta = (half_ns_m / 110_000.0) * 1.2;
+    // A degree of longitude shrinks toward the poles, so scaling by the CENTER's
+    // latitude under-covers the poleward edge of a TALL box — the exact filter
+    // measures east-west on the point's own parallel, and on a 500 km-tall box at
+    // 80 deg N that parallel is 22% shorter than the center's. Scale by the box's
+    // most poleward latitude instead: never narrower than before, so no match that
+    // used to be found can be lost, and the poleward edge is now covered too.
+    let worst_lat = (clat.abs() + lat_delta).min(90.0);
+    let cosl = worst_lat.to_radians().cos();
+    if cosl < 1e-3 {
         return None; // near a pole: longitude scaling blows up -> full scan
     }
-    let lat_delta = (half_ns_m / 110_000.0) * 1.2;
-    let lon_delta = (half_ew_m / (110_000.0 * cosl.abs())) * 1.2;
+    let lon_delta = (half_ew_m / (110_000.0 * cosl)) * 1.2;
     let (min_lat, max_lat) = (clat - lat_delta, clat + lat_delta);
     let (min_lon, max_lon) = (clon - lon_delta, clon + lon_delta);
     if !(-90.0..=90.0).contains(&min_lat)
@@ -4348,6 +4355,100 @@ fn geo_bbox(center: (f64, f64), shape: &GeoShape) -> Option<(f64, f64, f64, f64)
 
 /// One GEOSEARCH match: (key, distance_m, lon, lat).
 pub type GeoHit = (Vec<u8>, f64, f64, f64);
+
+/// Candidate bounding box for a circle — the same prefilter `GEOSEARCH` uses,
+/// exposed so the live-geofence `REGION` snapshot can take the spatial index
+/// instead of walking every geo key. `None` means "no safe box" (pole or
+/// antimeridian), and the caller falls back to a full scan.
+pub fn geo_circle_bbox(lon: f64, lat: f64, radius_m: f64) -> Option<(f64, f64, f64, f64)> {
+    geo_bbox((lon, lat), &GeoShape::Radius(radius_m))
+}
+
+/// One hit ordered so the *worst* for the current sort direction compares
+/// greatest — `BinaryHeap` is a max-heap, so its root is the one to drop.
+struct Ranked {
+    key: f64, // distance for ASC, negated for DESC
+    hit: GeoHit,
+}
+
+impl Ord for Ranked {
+    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
+        self.key.total_cmp(&other.key)
+    }
+}
+impl PartialOrd for Ranked {
+    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
+        Some(self.cmp(other))
+    }
+}
+impl PartialEq for Ranked {
+    fn eq(&self, other: &Self) -> bool {
+        self.cmp(other) == std::cmp::Ordering::Equal
+    }
+}
+impl Eq for Ranked {}
+
+/// Where a `GEOSEARCH` pass puts its matches. `COUNT n` (without `ANY`) asks for
+/// the n CLOSEST — or the n farthest under `DESC` — so it does not need to
+/// materialize and sort every point in the box: `Best` keeps a bounded heap of n
+/// and drops the rest as it goes. Everything else keeps all matches, because the
+/// reply does.
+enum HitSink {
+    All(Vec<GeoHit>),
+    Best {
+        cap: usize,
+        asc: bool,
+        heap: std::collections::BinaryHeap<Ranked>,
+    },
+}
+
+impl HitSink {
+    fn new(cap: Option<usize>, asc: bool) -> HitSink {
+        match cap {
+            Some(cap) => HitSink::Best {
+                cap,
+                asc,
+                heap: std::collections::BinaryHeap::new(),
+            },
+            None => HitSink::All(Vec::new()),
+        }
+    }
+
+    fn push(&mut self, hit: GeoHit) {
+        match self {
+            HitSink::All(v) => v.push(hit),
+            HitSink::Best { cap, asc, heap } => {
+                let key = if *asc { hit.1 } else { -hit.1 };
+                heap.push(Ranked { key, hit });
+                if heap.len() > *cap {
+                    heap.pop();
+                }
+            }
+        }
+    }
+
+    fn len(&self) -> usize {
+        match self {
+            HitSink::All(v) => v.len(),
+            HitSink::Best { heap, .. } => heap.len(),
+        }
+    }
+
+    fn clear(&mut self) {
+        match self {
+            HitSink::All(v) => v.clear(),
+            HitSink::Best { heap, .. } => heap.clear(),
+        }
+    }
+
+    /// The kept matches, unordered — `GeoQuery::format` sorts.
+    fn into_hits(self) -> Vec<GeoHit> {
+        match self {
+            HitSink::All(v) => v,
+            HitSink::Best { heap, .. } => heap.into_iter().map(|r| r.hit).collect(),
+        }
+    }
+}
 
 /// A parsed GEOSEARCH (without the matches), so a cluster coordinator can replay
 /// it on peers and render the merged result the same way a single node would.
@@ -4578,33 +4679,94 @@ pub fn geosearch_collect(
             ));
         }
     };
-    // Prefilter via the spatial index (a handful of geohash cells), then refine
-    // with the exact shape below. Pole/antimeridian boxes fall back to a full scan.
-    let candidates = match geo_bbox(center, &shape) {
-        Some((mn_lon, mn_lat, mx_lon, mx_lat)) => db.geo_candidates(mn_lon, mn_lat, mx_lon, mx_lat),
-        None => db.geo_keys(),
+    // Prefilter via the spatial index (a bounded set of geohash cells), then
+    // refine with the exact shape below. Pole/antimeridian boxes fall back to a
+    // full scan.
+    let full_bbox = geo_bbox(center, &shape);
+    // What `COUNT n` means here has to mirror `GeoQuery::format`, which is the
+    // half that truncates: with `ANY` and no explicit order it is "any n" and
+    // nothing is sorted; otherwise it is the n nearest, or under `DESC` the n
+    // farthest. `bounded` keeps that many in a heap instead of materializing and
+    // sorting every point in the box; `stop_at` can simply stop once it has them.
+    //
+    // Then the growing-circle probe. Every point inside a circle of radius p is
+    // nearer than every point outside it, so the moment a probe circle already
+    // holds n matches, nothing beyond it can change the answer — a 20 km query
+    // over a dense city settles after scanning a few hundred metres instead of
+    // sweeping the whole box (execution plan, item 4.2). Three passes at r/64,
+    // r/8 and r bound the wasted work at ~1.1x a single pass, and the last pass
+    // IS the full shape, so a sparse region costs exactly what it always did.
+    // Skipped when there is no index box to shrink (pole/antimeridian), where
+    // probing would only repeat a full scan.
+    let sort = order.or(if any { None } else { Some(true) });
+    let asc = sort != Some(false);
+    let bounded = count.filter(|n| *n > 0 && sort.is_some());
+    let stop_at = count.filter(|n| *n > 0 && sort.is_none());
+    let outer_m = match shape {
+        GeoShape::Radius(r) => r,
+        GeoShape::Box(w, h) => (w * w + h * h).sqrt() / 2.0, // circumradius
     };
-    let mut hits: Vec<GeoHit> = Vec::new(); // (key, dist_m, lon, lat)
-    for key in candidates {
-        if let Ok(Some((lon, lat))) = geo_point(db, &key) {
-            let d = haversine_m(center.0, center.1, lon, lat);
-            let matches = match shape {
-                GeoShape::Radius(r) => d <= r,
-                GeoShape::Box(w, h) => {
-                    // East-west extent measured at the POINT's latitude (its own
-                    // parallel), not the center's — the box edges are meridians,
-                    // so at a tall high-latitude box the center-latitude arc
-                    // over/under-counted a point's longitudinal distance.
-                    let ew = haversine_m(center.0, lat, lon, lat);
-                    let ns = haversine_m(center.0, center.1, center.0, lat);
-                    ew <= w / 2.0 && ns <= h / 2.0
+    // The probe is sound whenever "nearer wins": the n nearest, or any n at all.
+    // It is NOT sound for the n farthest, which needs the whole shape.
+    let probe_divs: &[f64] =
+        if full_bbox.is_some() && (stop_at.is_some() || (bounded.is_some() && asc)) {
+            &[64.0, 8.0, 1.0]
+        } else {
+            &[1.0]
+        };
+    let mut sink = HitSink::new(bounded, asc);
+    for (pass, div) in probe_divs.iter().enumerate() {
+        let last = pass + 1 == probe_divs.len();
+        let probe_m = outer_m / div;
+        let candidates = if last {
+            match full_bbox {
+                Some((mn_lon, mn_lat, mx_lon, mx_lat)) => {
+                    db.geo_candidates(mn_lon, mn_lat, mx_lon, mx_lat)
                 }
-            };
-            if matches && geo_attr_match(db, &key, &wheres) {
-                hits.push((key, d, lon, lat));
+                None => db.geo_keys(),
+            }
+        } else {
+            match geo_bbox(center, &GeoShape::Radius(probe_m)) {
+                Some((mn_lon, mn_lat, mx_lon, mx_lat)) => {
+                    db.geo_candidates(mn_lon, mn_lat, mx_lon, mx_lat)
+                }
+                None => continue, // degenerate probe box -> widen
+            }
+        };
+        sink.clear(); // each pass covers the previous one; recollect, never merge
+        for key in candidates {
+            if let Ok(Some((lon, lat))) = geo_point(db, &key) {
+                let d = haversine_m(center.0, center.1, lon, lat);
+                let matches = match shape {
+                    GeoShape::Radius(r) => d <= r,
+                    GeoShape::Box(w, h) => {
+                        // East-west extent measured at the POINT's latitude (its
+                        // own parallel), not the center's — the box edges are
+                        // meridians, so at a tall high-latitude box the
+                        // center-latitude arc over/under-counted a point's
+                        // longitudinal distance.
+                        let ew = haversine_m(center.0, lat, lon, lat);
+                        let ns = haversine_m(center.0, center.1, center.0, lat);
+                        ew <= w / 2.0 && ns <= h / 2.0
+                    }
+                };
+                // A non-final pass keeps ONLY what is inside its probe circle —
+                // that is what makes "n found" mean "the n closest, found".
+                if matches && (last || d <= probe_m) && geo_attr_match(db, &key, &wheres) {
+                    sink.push((key, d, lon, lat));
+                    if stop_at.is_some_and(|n| sink.len() >= n) {
+                        break;
+                    }
+                }
             }
         }
+        // Enough inside the probe circle -> every remaining point is farther
+        // than all of them, so widening cannot change the answer.
+        if sink.len() >= stop_at.or(bounded).unwrap_or(usize::MAX) {
+            break;
+        }
     }
+    let hits = sink.into_hits();
     Ok((
         GeoQuery {
             center,
@@ -5489,6 +5651,340 @@ mod tests {
             .parse()
             .unwrap();
         assert_eq!(n, expected, "indexed GEOSEARCH count != brute force");
+    }
+
+    /// The plain (no WITH*) GEOSEARCH reply is a flat bulk array — pull the
+    /// member names out of it so a test can compare against brute force.
+    fn geo_reply_keys(reply: &[u8]) -> Vec<String> {
+        let mut out = Vec::new();
+        let mut i = reply.iter().position(|&c| c == b'\n').map_or(0, |p| p + 1);
+        while i < reply.len() {
+            assert_eq!(reply[i], b'$', "not a bulk at {i}: {:?}", &reply[i..]);
+            let nl = i + reply[i..].iter().position(|&c| c == b'\n').unwrap();
+            let len: usize = std::str::from_utf8(&reply[i + 1..nl - 1])
+                .unwrap()
+                .parse()
+                .unwrap();
+            out.push(String::from_utf8(reply[nl + 1..nl + 1 + len].to_vec()).unwrap());
+            i = nl + 1 + len + 2;
+        }
+        out
+    }
+
+    /// A reproducible, non-grid point cloud — a grid would flatter any cell
+    /// scheme by aligning with it.
+    fn geo_cloud(n: usize, clon: f64, clat: f64, span_lon: f64, span_lat: f64) -> Vec<(f64, f64)> {
+        (0..n)
+            .map(|i| {
+                let h = (i as u64)
+                    .wrapping_mul(6_364_136_223_846_793_005)
+                    .wrapping_add(1_442_695_040_888_963_407);
+                let a = ((h >> 11) & 0xFFFF) as f64 / 65_536.0;
+                let b = ((h >> 33) & 0xFFFF) as f64 / 65_536.0;
+                (
+                    clon - span_lon / 2.0 + a * span_lon,
+                    clat - span_lat / 2.0 + b * span_lat,
+                )
+            })
+            .collect()
+    }
+
+    #[test]
+    fn geosearch_matches_brute_force_across_radii_and_shapes() {
+        // The differential for item 4.2: the finer cell cover, the COUNT-n probe
+        // and the bounded heap change only which candidates are CONSIDERED, never
+        // which are RETURNED. Every query below is checked against a full
+        // haversine scan of the same points — the ground truth the index is an
+        // optimization of. Compared as sorted sets, because the candidate order
+        // itself has never been defined (the index buckets are HashSets, whose
+        // iteration order is randomized per process).
+        for &(clon, clat, span) in &[
+            (13.35_f64, 38.25_f64, 0.5_f64), // a dense city, the harness's shape
+            (0.0, 0.0, 2.0),                 // equator
+            (-73.9, 40.7, 0.2),              // western hemisphere, tight
+            (18.0, 69.6, 1.0),               // high latitude, where lon/lat skew
+        ] {
+            let mut db = Db::new();
+            let pts = geo_cloud(1200, clon, clat, span, span);
+            for (i, (lon, lat)) in pts.iter().enumerate() {
+                cmd(
+                    &mut db,
+                    &[
+                        b"GEOSET",
+                        format!("p{i}").as_bytes(),
+                        lon.to_string().as_bytes(),
+                        lat.to_string().as_bytes(),
+                    ],
+                );
+            }
+            let (slon, slat) = (clon.to_string(), clat.to_string());
+            // Radii from "smaller than the gap between points" to "swallows the
+            // whole cloud", which is the case that used to degenerate to a scan.
+            for r_m in [50.0_f64, 500.0, 5_000.0, 20_000.0, 200_000.0] {
+                let mut expect: Vec<(String, f64)> = pts
+                    .iter()
+                    .enumerate()
+                    .map(|(i, &(lon, lat))| (format!("p{i}"), haversine_m(clon, clat, lon, lat)))
+                    .filter(|&(_, d)| d <= r_m)
+                    .collect();
+                expect.sort_by(|a, b| a.1.total_cmp(&b.1));
+
+                let r = format!("{r_m}");
+                let all = geo_reply_keys(&cmd(
+                    &mut db,
+                    &[
+                        b"GEOSEARCH",
+                        b"FROMLONLAT",
+                        slon.as_bytes(),
+                        slat.as_bytes(),
+                        b"BYRADIUS",
+                        r.as_bytes(),
+                        b"m",
+                    ],
+                ));
+                let (mut got, mut want) = (
+                    all,
+                    expect.iter().map(|(k, _)| k.clone()).collect::<Vec<_>>(),
+                );
+                got.sort();
+                want.sort();
+                assert_eq!(got, want, "BYRADIUS {r_m} m at ({clon},{clat}) span {span}");
+
+                // COUNT n ASC — the growing-circle probe. Distinct distances in a
+                // pseudorandom cloud, so "the n nearest" is unambiguous.
+                for n in [1_usize, 10, 100] {
+                    let got = geo_reply_keys(&cmd(
+                        &mut db,
+                        &[
+                            b"GEOSEARCH",
+                            b"FROMLONLAT",
+                            slon.as_bytes(),
+                            slat.as_bytes(),
+                            b"BYRADIUS",
+                            r.as_bytes(),
+                            b"m",
+                            b"ASC",
+                            b"COUNT",
+                            n.to_string().as_bytes(),
+                        ],
+                    ));
+                    let want: Vec<String> = expect.iter().take(n).map(|(k, _)| k.clone()).collect();
+                    assert_eq!(
+                        got, want,
+                        "COUNT {n} ASC BYRADIUS {r_m} m at ({clon},{clat})"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn geosearch_count_variants_keep_their_meaning() {
+        // The bounded collector replaces "collect everything, sort, truncate", so
+        // it has to reproduce each of that path's three meanings of COUNT n
+        // exactly: the n nearest (default), the n farthest (DESC), and any n
+        // (ANY, no explicit order) — plus ANY with an explicit order, which does
+        // sort what it took.
+        let mut db = Db::new();
+        let pts = geo_cloud(600, 5.0, 45.0, 0.4, 0.4);
+        for (i, (lon, lat)) in pts.iter().enumerate() {
+            cmd(
+                &mut db,
+                &[
+                    b"GEOSET",
+                    format!("p{i}").as_bytes(),
+                    lon.to_string().as_bytes(),
+                    lat.to_string().as_bytes(),
+                ],
+            );
+        }
+        let r_m = 20_000.0_f64;
+        let mut inside: Vec<(String, f64)> = pts
+            .iter()
+            .enumerate()
+            .map(|(i, &(lon, lat))| (format!("p{i}"), haversine_m(5.0, 45.0, lon, lat)))
+            .filter(|&(_, d)| d <= r_m)
+            .collect();
+        inside.sort_by(|a, b| a.1.total_cmp(&b.1));
+        assert!(inside.len() > 40, "need a set worth truncating");
+        let base: Vec<&[u8]> = vec![
+            b"GEOSEARCH",
+            b"FROMLONLAT",
+            b"5",
+            b"45",
+            b"BYRADIUS",
+            b"20",
+            b"km",
+        ];
+        let run = |db: &mut Db, extra: &[&[u8]]| {
+            let mut t = base.clone();
+            t.extend_from_slice(extra);
+            geo_reply_keys(&cmd(db, &t))
+        };
+
+        // Default and explicit ASC: the 7 nearest, in order.
+        let near: Vec<String> = inside.iter().take(7).map(|(k, _)| k.clone()).collect();
+        assert_eq!(run(&mut db, &[b"COUNT", b"7"]), near);
+        assert_eq!(run(&mut db, &[b"ASC", b"COUNT", b"7"]), near);
+
+        // DESC: the 7 FARTHEST, furthest first — the probe must not apply here.
+        let far: Vec<String> = inside
+            .iter()
+            .rev()
+            .take(7)
+            .map(|(k, _)| k.clone())
+            .collect();
+        assert_eq!(run(&mut db, &[b"DESC", b"COUNT", b"7"]), far);
+
+        // ANY with an explicit order still sorts what it took.
+        assert_eq!(run(&mut db, &[b"ASC", b"COUNT", b"7", b"ANY"]), near);
+        assert_eq!(run(&mut db, &[b"DESC", b"COUNT", b"7", b"ANY"]), far);
+
+        // Bare ANY: any 7, unordered — but all of them genuinely in the radius.
+        let any = run(&mut db, &[b"COUNT", b"7", b"ANY"]);
+        assert_eq!(any.len(), 7);
+        for k in &any {
+            assert!(
+                inside.iter().any(|(m, _)| m == k),
+                "{k} is not inside the radius"
+            );
+        }
+        // COUNT 0 still means an empty reply, not "unbounded".
+        assert!(run(&mut db, &[b"COUNT", b"0"]).is_empty());
+    }
+
+    #[test]
+    fn geosearch_bybox_spanning_many_cells_is_complete() {
+        // A box far wider than one cell — the cover is now dozens of small cells
+        // instead of one huge one, so every seam between them is a chance to drop
+        // a point. Brute force says otherwise.
+        let mut db = Db::new();
+        let pts = geo_cloud(1500, 8.0, 45.0, 3.0, 2.0);
+        for (i, (lon, lat)) in pts.iter().enumerate() {
+            cmd(
+                &mut db,
+                &[
+                    b"GEOSET",
+                    format!("p{i}").as_bytes(),
+                    lon.to_string().as_bytes(),
+                    lat.to_string().as_bytes(),
+                ],
+            );
+        }
+        let (w, h) = (120_000.0_f64, 90_000.0_f64); // 120 km x 90 km
+        let mut want: Vec<String> = pts
+            .iter()
+            .enumerate()
+            .filter(|&(_, &(lon, lat))| {
+                haversine_m(8.0, lat, lon, lat) <= w / 2.0
+                    && haversine_m(8.0, 45.0, 8.0, lat) <= h / 2.0
+            })
+            .map(|(i, _)| format!("p{i}"))
+            .collect();
+        assert!(want.len() > 50, "expected a substantial match set");
+        let mut got = geo_reply_keys(&cmd(
+            &mut db,
+            &[
+                b"GEOSEARCH",
+                b"FROMLONLAT",
+                b"8",
+                b"45",
+                b"BYBOX",
+                b"120",
+                b"90",
+                b"km",
+            ],
+        ));
+        got.sort();
+        want.sort();
+        assert_eq!(got, want, "BYBOX over a many-cell box lost matches");
+    }
+
+    #[test]
+    fn geo_bbox_covers_the_poleward_edge_of_a_tall_box() {
+        // P3-batch, folded into 4.2: the candidate box scaled longitude by the
+        // CENTER's latitude, but the exact filter measures east-west on the
+        // POINT's parallel — which is 22% shorter at the top of a 500 km-tall box
+        // at 80 deg N. A point the exact filter accepts sat outside the candidate
+        // box. It only escaped notice because the old cells were 2-3x oversized
+        // and swallowed the error; with a tight cover it becomes a lost match.
+        let center = (0.0_f64, 80.0_f64);
+        let (w, h) = (100_000.0_f64, 500_000.0_f64);
+        let (lon, lat) = (3.2_f64, 82.2_f64);
+        // The exact filter accepts this point ...
+        assert!(haversine_m(center.0, lat, lon, lat) <= w / 2.0);
+        assert!(haversine_m(center.0, center.1, center.0, lat) <= h / 2.0);
+        // ... so the candidate box must contain it. Old code: max_lon 3.141.
+        let (min_lon, min_lat, max_lon, max_lat) =
+            geo_bbox(center, &GeoShape::Box(w, h)).expect("a box at 80N is not a pole case");
+        assert!(
+            lon >= min_lon && lon <= max_lon && lat >= min_lat && lat <= max_lat,
+            "({lon},{lat}) outside candidate box \
+             ({min_lon},{min_lat})-({max_lon},{max_lat})"
+        );
+        // And end to end, through the index.
+        let mut db = Db::new();
+        cmd(&mut db, &[b"GEOSET", b"edge", b"3.2", b"82.2"]);
+        assert_eq!(
+            geo_reply_keys(&cmd(
+                &mut db,
+                &[
+                    b"GEOSEARCH",
+                    b"FROMLONLAT",
+                    b"0",
+                    b"80",
+                    b"BYBOX",
+                    b"100",
+                    b"500",
+                    b"km"
+                ],
+            )),
+            vec!["edge".to_string()]
+        );
+    }
+
+    #[test]
+    fn region_snapshot_takes_the_index_not_the_whole_geo_keyspace() {
+        // The live-geofence REGION snapshot walked every geo key on the hub. It
+        // now goes through the same candidate path GEOSEARCH uses; this pins the
+        // two halves of that: the box exists, and it prunes hard.
+        let mut db = Db::new();
+        let pts = geo_cloud(4000, 13.35, 38.25, 0.5, 0.5);
+        for (i, (lon, lat)) in pts.iter().enumerate() {
+            cmd(
+                &mut db,
+                &[
+                    b"GEOSET",
+                    format!("p{i}").as_bytes(),
+                    lon.to_string().as_bytes(),
+                    lat.to_string().as_bytes(),
+                ],
+            );
+        }
+        let (bx_lon, bx_lat, mx_lon, mx_lat) =
+            geo_circle_bbox(13.35, 38.25, 1_000.0).expect("a 1 km region has a candidate box");
+        let candidates = db.geo_candidates(bx_lon, bx_lat, mx_lon, mx_lat);
+        let total = db.geo_keys().len();
+        assert_eq!(total, 4000);
+        assert!(
+            candidates.len() * 20 < total,
+            "1 km region considered {} of {total} geo keys — not using the index",
+            candidates.len()
+        );
+        // No false negatives: every point actually inside the circle is a candidate.
+        let inside: Vec<String> = pts
+            .iter()
+            .enumerate()
+            .filter(|&(_, &(lon, lat))| haversine_m(13.35, 38.25, lon, lat) <= 1_000.0)
+            .map(|(i, _)| format!("p{i}"))
+            .collect();
+        assert!(!inside.is_empty());
+        for k in inside {
+            assert!(
+                candidates.iter().any(|c| c == k.as_bytes()),
+                "{k} is inside the region but not a candidate"
+            );
+        }
     }
 
     #[test]

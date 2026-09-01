@@ -148,6 +148,11 @@ A spatial index over geo keys powers search; persists via RDB/AOF.
 | `GEODIST key1 key2 [m\|km\|mi\|ft]` | great-circle (haversine) distance |
 | `GEOSEARCH FROMLONLAT lon lat \| FROMKEY key  BYRADIUS r unit \| BYBOX w h unit  [ASC\|DESC] [COUNT n] [WITHCOORD] [WITHDIST] [WHERE field value ...]` | keys within a radius/box (geohash-indexed), optionally sorted, and filtered by attribute (`WHERE`, AND'd) |
 
+`COUNT n` (ascending — the default when `COUNT` is given) is a **nearest-neighbour** search: it probes
+outward and stops at the first radius already holding n matches, so its cost tracks the neighbourhood,
+not the radius. `COUNT n DESC` (the n farthest) and a query with no `COUNT` still consider the whole
+shape — bound wide searches with `COUNT`. See [GEO.md](GEO.md).
+
 (Live geofencing — `CDCSUBSCRIBE REGION …` over the changefeed — and a real S2/R-tree index with
 combined attribute filters are the next phases.)
 

@@ -119,8 +119,10 @@ $ redis-cli -p 6379 GEOSEARCH fleet FROMLONLAT 55.27 25.2 BYRADIUS 5 km ASC   # 
   existence is logged to the AOF and replicated, so it survives a `kill -9` and a failover, and its
   pending list is written into the snapshot and handed to a replica on sync.
 - **[Geo-first](docs/GEO.md):** `GEOSET`/`GEOPOS`/`GEODIST`/`GEOSEARCH` (backed by a **geohash spatial
-  index** → sub-linear radius/box queries) with **combined attribute filters** (`GEOSEARCH … WHERE
-  status active`), plus **live geofencing** via `CDCSUBSCRIBE REGION`.
+  index** → sub-linear radius/box queries, and `COUNT n` is a true **nearest-neighbour search** that
+  stops as soon as it has the n closest — 0.08 ms for a top-10 at 20 km over 200k points) with
+  **combined attribute filters** (`GEOSEARCH … WHERE status active`), plus **live geofencing** via
+  `CDCSUBSCRIBE REGION`.
 - **[Sketches](docs/SKETCHES.md):** Bloom (dedup), HyperLogLog (distinct counts), Count-Min
   (trending), Top-K (heavy hitters), t-digest (live percentiles).
 - **CAS verbs:** `CAS`/`CADEL`/`SETMAX`/`INCRCAP` — atomic check-and-write.
@@ -404,7 +406,8 @@ Release build, both servers on one 8-core machine, `redis-server 8.8.0` for comp
 | `ZRANGE key 0 9` on a 200k sorted set | 11.6k ops/s · 0.087 ms | 18.7k ops/s | 1.6× |
 | `ZRANGEBYSCORE` on a 200k sorted set | 11.1k ops/s · 0.090 ms | 18.9k ops/s | 1.7× |
 | `GEOSET` ingest, 200k points | 102k ops/s | 219k ops/s | 2.1× |
-| `GEOSEARCH` 1 km `COUNT 10` | 1.27 ms | 0.23 ms | 5.6× |
+| `GEOSEARCH` 1 km `COUNT 10` | 0.34 ms | 0.19 ms | 1.8× |
+| `GEOSEARCH` 20 km `COUNT 10` | 0.082 ms | 57 ms | **696× faster** |
 
 Writing into a large collection costs the same as writing a fresh key (131k vs 132k ops/s above) — the
 per-write work does not grow with the collection, which is what the harness's floor assertions pin
@@ -420,6 +423,18 @@ the ordered index that was already being maintained on every write: the same que
 replaying an 11,658-command corpus against both the old and new binaries and diffing the raw protocol
 output. `ZRANK` is the remaining O(n) read; it is O(rank) rather than O(log n), which matters only for
 high-ranked members of a large set.
+
+`GEOSEARCH` was the other single-hub stall, and 0.9.0 closes it. The spatial index chose one cell
+coarse enough that the query box spanned at most four of them, which made every cell 2–3× wider than
+the query and, on dense data at a large radius, made a *single* cell swallow the whole dataset — the
+index quietly degenerated into a full scan, 181 ms of hub time for a top-10 at 20 km. The cover is now
+up to 64 fine cells (each an `O(log n)` seek) with longitude carrying the extra bit it needs, and
+`COUNT n` became a real nearest-neighbour search: since every point inside a circle of radius ρ is
+nearer than every point outside it, the query probes outward — ρ = r/64, r/8, then the full shape — and
+stops at the first radius that already holds n matches. The 20 km top-10 went from 181 ms to 0.082 ms,
+and no longer costs more than the 1 km one. A query with **no** `COUNT` still returns every match and
+therefore still costs what its own result costs (103,450 members in ~190 ms) — bound wide searches with
+`COUNT`.
 
 Throughput is otherwise bounded by the single-hub design (one channel hop per command) — the deliberate
 price of lock-free, serially-consistent execution, and the very property (one ordered point) that makes

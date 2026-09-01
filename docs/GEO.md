@@ -46,8 +46,9 @@ CDCSUBSCRIBE REGION <lon> <lat> <radius> <unit>
 ```
 A snapshot of the geo keys currently inside the circle, then a live stream as objects **enter/move**
 (`cdc-change write`, value `"lon,lat"`) and **leave** (`cdc-change del` — moved out, deleted, or
-expired). Each subscriber tracks its own in-region membership, so transitions are exact. See
-[CHANGEFEED.md](CHANGEFEED.md).
+expired). Each subscriber tracks its own in-region membership, so transitions are exact. The snapshot
+goes through the same spatial-index prefilter as `GEOSEARCH`, so it costs the region, not the keyspace.
+See [CHANGEFEED.md](CHANGEFEED.md).
 
 ```console
 redis-cli GEOSET driver:7 0 0
@@ -60,18 +61,35 @@ redis-cli GEOSET driver:7 30 30             # moves out      -> cdc-change del  
 ## Internals & limits
 
 - **Index:** geo points are kept in a **geohash spatial index** — each point's (lon, lat) is encoded to a
-  52-bit interleaved cell id held in a `BTreeMap`, so `GEOSEARCH` range-scans only the handful of cells
-  covering the query box and then refines those candidates by true haversine distance. This makes the
-  common case (small radius) **sub-linear** instead of scanning every geo key. A box that straddles a pole
-  or the ±180° meridian safely falls back to a full scan. The 52-bit cell id is also the shard key for
-  spatial clustering (cell-in-key sharding). *(A finer S2-cell / R-tree index is a later refinement; combined attribute filters
-  are implemented — see `WHERE`; the query interface won't change.)*
+  52-bit interleaved cell id held in a `BTreeMap`, so `GEOSEARCH` range-scans only the cells covering the
+  query box and then refines those candidates by true haversine distance. A box that straddles a pole or
+  the ±180° meridian safely falls back to a full scan. The 52-bit cell id is also the shard key for
+  spatial clustering (cell-in-key sharding). *(A finer S2-cell / R-tree index is a later refinement;
+  combined attribute filters are implemented — see `WHERE`; the query interface won't change.)*
+- **Cell precision:** the cover is up to **64 small cells**, chosen as the finest geohash prefix that fits
+  that budget, which keeps the scanned area within ~1.3× the query box. Longitude gets one bit more
+  precision than latitude, because it spans 360° to latitude's 180° — otherwise every cell comes out twice
+  as wide as it is tall. Each extra cell is one `O(log n)` `BTreeMap` seek, far cheaper than the points a
+  coarser cell sweeps in.
+- **`COUNT n` is a nearest-neighbour search, not a scan-then-sort.** Every point inside a circle of radius
+  ρ is nearer than every point outside it, so `GEOSEARCH … COUNT n` (ascending, which is the default when
+  `COUNT` is given) probes outward — ρ = r/64, then r/8, then the full shape — and stops at the first
+  radius that already holds n matches. On dense data this makes a large-radius top-n query cost roughly
+  what a small-radius one costs: **0.08 ms for `BYRADIUS 20 km ASC COUNT 10` over 200 000 points**, against
+  172 ms before v0.9.0. `COUNT n` with `DESC` (the n *farthest*) cannot probe, but still collects through a
+  bounded heap instead of sorting every candidate.
+- **What is still linear:** a query with **no `COUNT`** returns every match, so it costs what its own result
+  costs — `BYRADIUS 20 km` with no count over that same 200 000-point set returns 103 450 members in
+  ~190 ms, and the index cannot help with work that is the reply itself. Bound large-radius queries with
+  `COUNT`.
 - **Attribute filter (`WHERE`):** evaluated on each spatial candidate after the shape test, so it composes
   with the index for free. Attributes are stored inline on the point (`Vec` of pairs — geo objects are
   small); a dedicated attribute index is a later optimization if filters get heavy.
 - **Distance:** haversine with Redis's earth radius (6 372 797.560856 m); units `m`/`km`/`mi`/`ft`.
-- **`BYBOX`** uses east-west and north-south distance from the center (an approximation that's good for
-  modest boxes).
+- **`BYBOX`** uses east-west and north-south distance from the center, with east-west measured on the
+  point's own parallel (an approximation that's good for modest boxes). The candidate box is scaled by the
+  box's most poleward latitude, not the center's, so a tall box at a high latitude does not lose matches
+  along its poleward edge.
 - **Clustering:** with `LOCUS_CLUSTER_ENABLED`, `GEOSEARCH` is a **scatter-gather** — the queried node
   fans out to the relevant shards and merges the hits by distance into one global result.
   - *Unbounded* (default): geo keys name-shard, so a search consults every shard. Always correct.
@@ -80,5 +98,7 @@ redis-cli GEOSET driver:7 30 30             # moves out      -> cdc-change del  
     `GEOSEARCH` only consults the shards owning the cells its box covers — the Tile38-beating lane.
     Moving an object to another cell is a re-key (`DEL` old, `GEOSET` new); name-only lookups work
     because the cell lives in the key.
+  - Shards receive the query without its `COUNT`, so the nearest-neighbour probe above applies on the
+    coordinating node only; a clustered large-radius `GEOSEARCH` still scans each shard's candidate box.
 - **Roadmap:** keyset pagination, a finer S2/R-tree index, per-shard failover, and cross-shard changefeed
   ordering.

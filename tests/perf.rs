@@ -727,6 +727,22 @@ fn perf_table() {
         ));
     }
 
+    // The geo floor, same ratio style (session 6, plan item 4.2): a top-10
+    // GEOSEARCH must cost about what a top-10 costs, whatever the radius. The
+    // defect it guards is exactly a ratio — a cell so coarse that a large radius
+    // sweeps the whole dataset, which measured 133x here (1.294 ms at 1 km
+    // against 172 ms at 20 km) before the finer cover and the growing-circle
+    // probe landed. A healthy index sits at or below 1x, because a wider radius
+    // finds its ten neighbours sooner.
+    let near = find(&l, "GEOSEARCH 1 km").ops;
+    let far = find(&l, "GEOSEARCH 20 km").ops;
+    let ratio = near / far.max(f64::MIN_POSITIVE);
+    if ratio > 5.0 {
+        failures.push(format!(
+            "GEOSEARCH COUNT 10 at 20 km is {ratio:.1}x slower than at 1 km              ({far:.0} vs {near:.0} ops/s) — the spatial index degrades into a scan              as the radius grows"
+        ));
+    }
+
     // A catastrophic-regression tripwire, an order of magnitude below what this
     // model does, so it fires on a broken build and not on a busy machine.
     let set = find(&l, "SET / ").ops;

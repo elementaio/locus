@@ -196,10 +196,13 @@ a silent stop. Full details in [CHANGEFEED.md](CHANGEFEED.md).
 
 A geo object is its own key holding a `Geo(lon, lat, attrs)` value. The keyspace keeps a **geohash
 spatial index** — a `BTreeMap<u64 cell, keys>` over 52-bit interleaved geohash cells — so `GEOSEARCH`
-range-scans only the handful of cells covering the query box (sub-linear) and then refines by true
-haversine distance, with optional `WHERE` attribute filters. Because geo writes flow through the
-changefeed like any other, a *region* filter yields live geofencing. The same cell id is the cluster
-shard key (see Clustering). See [GEO.md](GEO.md).
+range-scans only the cells covering the query box (sub-linear) and then refines by true haversine
+distance, with optional `WHERE` attribute filters. The cover is up to 64 fine cells rather than a few
+coarse ones, which keeps the scanned area near the query's own; and `COUNT n` is a nearest-neighbour
+search that probes outward and stops at the first radius holding n matches, so a wide top-n query does
+not sweep the box. Because geo writes flow through the changefeed like any other, a *region* filter
+yields live geofencing — and that snapshot takes the same candidate path. The same cell id is the
+cluster shard key (see Clustering). See [GEO.md](GEO.md).
 
 ## Sketches
 
