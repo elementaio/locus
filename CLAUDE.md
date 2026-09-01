@@ -116,10 +116,9 @@ v0.11.0, ~19,000 lines of Rust plus a test-harness suite (`std`-only except `src
 optional feature). 135 unit + 128 integration + 6 embedding + differential + fault tests green on both
 feature sets. **Phases 0–5 are done, and phase 6 is decided (freeze).**
 
-- **Pushed to public `origin`:** `v0.7.0` (phases 0–2 + the pulled-forward sentinel auth), `v0.8.0`
-  (phase 3), `v0.9.0` (phase 4).
-- **Tagged but NOT yet pushed:** `v0.10.0` (the library split) and `v0.11.0` (session 8's nine fixes).
-  The owner pushes both after the session-8 review.
+- **Public `origin` is in sync (pushed 2026-09-01):** `main` through v0.11.0, plus every release tag
+  `v0.1.0`–`v0.11.0` — including the backfilled `v0.4.0`/`v0.5.0`/`v0.5.1`/`v0.6.1`, so all CHANGELOG
+  compare-links resolve. Nothing is tagged-but-unpushed.
 
 What each phase delivered:
 
