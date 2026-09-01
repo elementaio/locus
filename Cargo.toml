@@ -43,3 +43,7 @@ rustls = { version = "0.23", default-features = false, features = [
 
 [profile.release]
 opt-level = 3
+# The engine lives in the `locusdb` library and the hub calls into it across a
+# crate boundary once per command; thin LTO restores cross-crate inlining on that
+# hot path (added when the library split landed, session 7). No behaviour change.
+lto = "thin"

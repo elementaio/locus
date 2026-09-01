@@ -233,6 +233,10 @@ server drives from its maintenance tick, so an embedder that wants keys to actua
 
 `tests/embedding.rs` in the repository is a working example.
 
+Note: the optional `tls` feature is a **binary** feature — it terminates TLS for the `locus`
+server. It is a no-op for the `locusdb` library, which has no transport of its own; an embedder brings
+its own.
+
 ### Configuration
 
 Configured entirely through environment variables (minimal config by design):

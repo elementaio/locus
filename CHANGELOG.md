@@ -6,6 +6,10 @@ All notable changes to Locus are documented here. The format is based on
 
 ## [0.10.0] — 2026-09-01
 
+- Internal: the release profile now enables thin LTO — the library split moved the hub→engine calls
+  across a crate boundary once per command, and thin LTO restores cross-crate inlining on that path.
+  No behaviour change.
+
 **Locus is now embeddable.** The package builds two targets instead of one: the `locus` binary — the
 server, unchanged — and a new `locusdb` library, the engine underneath it. Nothing about running Locus
 as a server changes: same commands, same replies, same persistence, same binary name. This is a
