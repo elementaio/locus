@@ -213,7 +213,7 @@ single-threaded hub guarantees it). The connection enters push mode (like pub/su
 | `CDCSUBSCRIBE REGION <lon> <lat> <radius> <unit>` | **live geofencing**: snapshot of geo keys in the circle, then live `write` as keys enter/move and `del` as they leave (move out / delete / expire); change value is `"lon,lat"` |
 | `CDCUNSUBSCRIBE` | leave push mode |
 | `CDCREAD <offset> [COUNT n] [PREFIX p]` | pull retained changes after `offset` (catch-up after a disconnect); each entry `[offset, event, key, value]` |
-| `CDCGROUP CREATE <group> [offset\|$\|0]` / `CDCGROUP DESTROY <group>` | consumer group (load-balanced read mode); `$`/default = only new, `0` = all retained. **The only changefeed verbs that are logged and replicated** — a group's existence survives a `kill -9` and reaches replicas (its cursor and pending list are snapshot-durable; see [CHANGEFEED.md](CHANGEFEED.md)) |
+| `CDCGROUP CREATE <group> [offset\|$\|0]` / `CDCGROUP DESTROY <group>` | consumer group (load-balanced read mode); `$`/default = only new, `0` = all retained. **The only changefeed verbs that are logged and replicated** — a group's existence survives a `kill -9` and reaches replicas (its cursor and pending list are snapshot-durable; see [CHANGEFEED.md](CHANGEFEED.md)). The only one that needs **`+@write`**; every other `CDC` verb is `@read` |
 | `CDCREADGROUP <group> <consumer> [0\|FROMPENDING] [COUNT n]` | deliver the next un-delivered records to a consumer (disjoint across the group); tracked as pending until acked. With the `0` / `FROMPENDING` sentinel (as `XREADGROUP … 0`) it re-delivers **this consumer's own** still-pending entries in offset order instead — how a restarted consumer recovers its in-flight work — without moving the group cursor |
 | `CDCACK <group> <offset> [offset ...]` | acknowledge delivery (drop from the pending list) |
 | `CDCPENDING <group> [COUNT n]` | `[total, [[consumer, count], …], [[offset, consumer, idle-ms, delivery-count], …]]` — the third element is the oldest `n` pending entries (default 10; `COUNT 0` = all) |
@@ -269,6 +269,14 @@ re-authenticate and cannot answer the `HELLO` most modern clients open with, so 
 standard Redis client at all. This lifts the *command-class* gate only: key scope, channel scope, and
 the fail-closed check for a deleted or disabled identity all still apply, and the rest of
 `@connection` (`PING`, `ECHO`, `CLIENT`, `COMMAND`, `SELECT`) still needs `+@connection`.
+
+**Consuming a changefeed is `@read`; provisioning one is `@write`.** `CDCGROUP CREATE` and
+`CDCGROUP DESTROY` mutate replicated, log-durable state, so they need `+@write` — without that split a
+read-only consumer could destroy a group every other consumer of the feed was working from. Everything
+else in the `CDC` family (`CDCSUBSCRIBE`, `CDCREAD`, `CDCREADGROUP`, `CDCACK`, `CDCPENDING`, `CDCCLAIM`,
+`CDCAUTOCLAIM`) is `@read`, and is scoped by the key **prefix** it follows rather than by a key name:
+the group verbs and `CDCSUBSCRIBE REGION` span the whole keyspace, so a prefix-scoped user is refused
+them outright.
 
 `SUBSCRIBE` and `PUBLISH` match the channel against the user's patterns. `PSUBSCRIBE` is checked
 against the **pattern itself, literally**: a user granted `&news.*` may `PSUBSCRIBE news.*` but not

@@ -3141,6 +3141,62 @@ fn cdc_requires_read_class_and_respects_key_prefix() {
     );
 }
 
+/// Session 5c. `CDCGROUP CREATE`/`DESTROY` mutate replicated, log-durable state
+/// (session 5b made them AOF- and replication-logged), so they class `@write`.
+/// Before this they were `@read` along with the rest of the `CDC` family, which
+/// meant a read-only consumer could `CDCGROUP DESTROY` the group every other
+/// consumer of the feed was working from. Consuming a group is still `@read`.
+#[test]
+fn cdcgroup_provisioning_needs_write_class_but_consuming_stays_read() {
+    let s = Server::start_inner(&[("LOCUS_CDC_MAXLEN", "100")]);
+    let mut admin = s.connect();
+    admin.cmd(&["SET", "a", "1"]); // offset 1
+    admin.cmd(&["SET", "b", "2"]); // offset 2
+    assert_eq!(admin.cmd(&["CDCGROUP", "CREATE", "grp", "0"]), "OK");
+    assert_eq!(
+        admin.cmd(&["ACL", "SETUSER", "reader", "on", ">pw", "+@read", "allkeys"]),
+        "OK"
+    );
+    assert_eq!(
+        admin.cmd(&[
+            "ACL", "SETUSER", "writer", "on", ">pw", "+@write", "allkeys"
+        ]),
+        "OK"
+    );
+
+    // A `+@read` user may not provision — neither half of the verb.
+    let mut r = s.connect();
+    assert_eq!(r.cmd(&["AUTH", "reader", "pw"]), "OK");
+    assert!(
+        r.cmd(&["CDCGROUP", "CREATE", "other", "0"])
+            .starts_with("-NOPERM")
+    );
+    assert!(
+        r.cmd(&["CDCGROUP", "DESTROY", "grp"])
+            .starts_with("-NOPERM")
+    );
+    // …and the refusal was real: the group is untouched and still consumable.
+    assert_eq!(
+        r.cmd(&["CDCREADGROUP", "grp", "c1", "COUNT", "2"]),
+        "[[1, write, a, 1], [2, write, b, 2]]"
+    );
+    assert!(r.cmd(&["CDCPENDING", "grp"]).starts_with("[2,"));
+    assert_eq!(r.cmd(&["CDCACK", "grp", "1", "2"]), "2");
+    assert!(r.cmd(&["CDCCLAIM", "grp", "c2", "0", "1"]).starts_with("["));
+    assert!(
+        r.cmd(&["CDCAUTOCLAIM", "grp", "c2", "0", "0"])
+            .starts_with("[")
+    );
+
+    // A `+@write` user provisions freely.
+    let mut w = s.connect();
+    assert_eq!(w.cmd(&["AUTH", "writer", "pw"]), "OK");
+    assert_eq!(w.cmd(&["CDCGROUP", "CREATE", "prov", "0"]), "OK");
+    assert_eq!(w.cmd(&["CDCGROUP", "DESTROY", "prov"]), "1");
+    // The read half is genuinely a separate grant — `+@write` alone can't read.
+    assert!(w.cmd(&["CDCREADGROUP", "grp", "c1"]).starts_with("-NOPERM"));
+}
+
 #[test]
 fn wait_ignores_forged_replconf_acks() {
     let s = Server::start();

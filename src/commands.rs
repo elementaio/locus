@@ -512,8 +512,15 @@ pub fn command_class(cmd: &[u8]) -> u8 {
         | b"DEBUG" => CLASS_ADMIN,
         b"SUBSCRIBE" | b"UNSUBSCRIBE" | b"PSUBSCRIBE" | b"PUNSUBSCRIBE" | b"PUBLISH"
         | b"PUBSUB" => CLASS_PUBSUB,
-        // Changefeed commands READ keyspace data (snapshot + values), so they
-        // class as reads — `+@pubsub` alone must not stream the whole keyspace.
+        // `CDCGROUP CREATE`/`DESTROY` provision a group, and since 0.9.0 that
+        // is replicated, log-durable state — a mutation, so `@write`. Classing
+        // it `@read` let a read-only user DESTROY a group out from under every
+        // other consumer of it. (Redis classes `XGROUP` the same way.) The verb
+        // has only those two subcommands, so it moves whole.
+        b"CDCGROUP" => CLASS_WRITE,
+        // The rest of the changefeed READS keyspace data (snapshot + values),
+        // so it classes as reads — `+@pubsub` alone must not stream the whole
+        // keyspace. Consuming a group is `@read`; provisioning one is `@write`.
         c if c.starts_with(b"CDC") => CLASS_READ,
         _ if command_meta(cmd).is_some_and(|m| m.write) => CLASS_WRITE,
         _ => CLASS_READ,
@@ -6598,6 +6605,37 @@ mod tests {
         // is_write is case-insensitive.
         assert!(is_write(b"set"));
         assert!(!is_write(b"get"));
+    }
+
+    #[test]
+    fn cdcgroup_classes_as_write_and_the_rest_of_cdc_as_read() {
+        use crate::acl::{CLASS_READ, CLASS_WRITE};
+        // Provisioning a group mutates replicated, log-durable state, so it is
+        // `@write` — a read-only user must not be able to DESTROY a group that
+        // every other consumer depends on.
+        assert_eq!(command_class(b"CDCGROUP"), CLASS_WRITE);
+        // Consuming a group stays `@read`.
+        for r in [
+            b"CDCREADGROUP".as_slice(),
+            b"CDCACK".as_slice(),
+            b"CDCPENDING".as_slice(),
+            b"CDCCLAIM".as_slice(),
+            b"CDCAUTOCLAIM".as_slice(),
+            b"CDCREAD".as_slice(),
+            b"CDCSUBSCRIBE".as_slice(),
+            b"CDCUNSUBSCRIBE".as_slice(),
+        ] {
+            assert_eq!(
+                command_class(r),
+                CLASS_READ,
+                "{} should stay @read",
+                String::from_utf8_lossy(r)
+            );
+        }
+        // The ACL class moved; the keyspace-write flag did NOT — CDCGROUP is
+        // still dispatched by the hub and propagated by session 5b's own seam,
+        // not by the generic AOF/replication/READONLY path `is_write` gates.
+        assert!(!is_write(b"CDCGROUP"));
     }
 
     #[test]

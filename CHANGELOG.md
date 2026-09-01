@@ -34,10 +34,11 @@ nothing about the existing `CDCREADGROUP` / `CDCACK` flow or any `GEOSEARCH` rep
   taking a record the first is still processing. Set it above your slowest expected processing time.
 
 - **A consumer group no longer vanishes on an unclean stop.** `CDCGROUP CREATE` and `CDCGROUP DESTROY`
-  were classed as reads, so they reached neither the AOF nor the replication link and group state was
-  snapshot-durable only. A group created since the last snapshot was simply *gone* after a `kill -9` —
-  the next `CDCREADGROUP` answered `-NOGROUP` and that consumer silently stopped receiving — and a
-  group created after a replica synced existed only on the master, so a failover lost it.
+  were classed as reads in the command table, so they reached neither the AOF nor the replication link
+  and group state was snapshot-durable only. A group created since the last snapshot was simply *gone*
+  after a `kill -9` — the next `CDCREADGROUP` answered `-NOGROUP` and that consumer silently stopped
+  receiving — and a group created after a replica synced existed only on the master, so a failover
+  lost it.
 
   Those two commands are now logged and replicated, carrying the **resolved** start offset so a replay
   or a replica rebuilds the group at the same cursor origin rather than at "now". Replay is idempotent
@@ -133,6 +134,22 @@ nothing about the existing `CDCREADGROUP` / `CDCACK` flow or any `GEOSEARCH` rep
   from a re-read or a claim as `[offset, nil, nil, nil]`. The payload is genuinely gone and the consumer
   can only ack it — saying so plainly beats dropping the entry and making it look like it was never
   delivered. Size retention above your worst-case consumer downtime.
+
+### BREAKING
+
+- **`CDCGROUP CREATE` / `CDCGROUP DESTROY` now require `@write`** (they were `@read`); grant it to any
+  user that provisions changefeed groups. Making them logged and replicated, above, made a command
+  classed `@read` mutate durable, replicated state — and concretely, a read-only user could
+  `CDCGROUP DESTROY` a group out from under every other consumer of it. Redis classes `XGROUP` the same
+  way. **Consuming a group is unchanged and still `@read`**: `CDCREADGROUP`, `CDCACK`, `CDCPENDING`,
+  `CDCCLAIM` and `CDCAUTOCLAIM` all stay where they were. The model is now: *consuming* a feed is a
+  read, *provisioning* one is a write.
+
+  **Migration** — for each named user that creates or destroys groups:
+
+  ```
+  ACL SETUSER <name> +@write        # a consumer that also provisions needs +@read +@write
+  ```
 
 ### Known limits
 

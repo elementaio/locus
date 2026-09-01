@@ -146,6 +146,13 @@ Leave `LOCUS_SAVE` at its default cadence to keep that duplicate window small.
 Entries restored from a snapshot count as maximally idle — whoever held them before the restart is not
 coming back for them — so they are claimable immediately.
 
+**Who may provision a group.** Because `CDCGROUP CREATE`/`DESTROY` mutate that log-durable, replicated
+state, they are ACL class **`@write`**; the whole consuming side — `CDCREADGROUP`, `CDCACK`,
+`CDCPENDING`, `CDCCLAIM`, `CDCAUTOCLAIM` — stays `@read`. So a worker fleet can run on `+@read` and a
+read-only user cannot destroy the group the fleet is working from; whoever provisions groups needs
+`+@write` as well. All of them span the whole keyspace, so they also need `allkeys` — a prefix-scoped
+user is refused them. See [COMMANDS.md § Access control](COMMANDS.md#access-control-acl).
+
 ## Geofencing — `CDCSUBSCRIBE REGION`
 
 A *region* filter instead of a *prefix* filter turns the changefeed into live geofencing (see
