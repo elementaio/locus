@@ -106,12 +106,13 @@ or issue.
 | `plans/IMPROVEMENTS-AUDIT-2026-07.md` | The July multi-agent audit — 84 findings, mostly still open |
 | `docs/` | The published documentation (README's targets) |
 
-## Current state — updated 2026-09-01 after session 4
+## Current state — updated 2026-09-01 after session 5
 
-v0.8.0, ~18,500 lines of Rust (`std`-only except `src/tls.rs`, which is behind the optional feature),
-116 unit + 116 integration tests green on both feature sets. **Phases 0–3 of the plan are done**,
-tagged `v0.7.0` (phases 0–2 + the pulled-forward sentinel security fix) and `v0.8.0` (phase 3). Nothing
-is pushed to `origin` yet — that is the owner's call.
+v0.9.0 (unreleased), ~18,900 lines of Rust (`std`-only except `src/tls.rs`, which is behind the
+optional feature), 118 unit + 121 integration tests green on both feature sets. **Phases 0–3 are done
+and phase 4 is in progress.** Tagged and **pushed** to public `origin`: `v0.7.0` (phases 0–2 + the
+pulled-forward sentinel security fix) and `v0.8.0` (phase 3). Phase-4 work (session 5) is committed on
+`main` but unreleased.
 
 - **Phase 1** — the hub has a panic boundary (`catch_unwind`; a command bug becomes one `-ERR`, not an
   outage), and the three live-verified ACL defects are closed. Session 1b cleared the debt behind it
@@ -132,10 +133,24 @@ is pushed to `origin` yet — that is the owner's call.
 `ZRANK` remains O(rank) — deliberately (no order-statistic tree in `std`; the bookkeeping would risk
 the map-and-index lock-step invariant for a cold-path gain).
 
-**Next: phase 4 — "make the flagship honest"** (session 5: changefeed consumer-group redelivery; session
-6: spatial-index precision — `GEOSEARCH` at a large radius still stalls the hub). One small follow-up is
-open: **session 3b**, converting `ZRANGEBYSCORE`'s low-bound `skip_while` to a `range` seek. See
-`plans/EXECUTION-PLAN-2026-08.md` and `plans/SESSIONS.md`.
+**Phase 4 is in progress ("make the flagship honest").** Session 5 landed item 4.1: the changefeed's
+at-least-once promise is now real. A consumer that died between `CDCREADGROUP` and `CDCACK` used to
+strand its records forever; now the PEL carries per-entry `{consumer, delivered_ms, delivery_count}`,
+`CDCREADGROUP … 0` re-delivers a consumer's own pending, and `CDCCLAIM`/`CDCAUTOCLAIM` (min-idle-gated,
+bounded scan) let a live consumer take over a dead one's work. The extras trailer versioned LXT2→LXT3
+with a backward-compatible load. This is committed as **unreleased v0.9.0** (`Cargo.toml` is at 0.9.0,
+the `[0.9.0]` CHANGELOG section is open) but **not tagged and not pushed** — v0.9.0 waits for the rest
+of phase 4.
+
+**Still open before the v0.9.0 tag:**
+- **Session 5b** — group *existence* is only snapshot-durable (a group created since the last snapshot
+  vanishes on an unclean stop; replicas have no groups). Propagate `CDCGROUP CREATE`/`DESTROY` (only
+  those) to the AOF and replication; cursor and PEL stay snapshot-durable.
+- **Session 6** — spatial-index precision (item 4.2): `GEOSEARCH` at a large radius still stalls the
+  hub (~133 ms at 20 km on 200k points) because `ranges_for_box` picks cells too coarse.
+- **Session 3b** — small: convert `ZRANGEBYSCORE`'s low-bound `skip_while` to a `range` seek.
+
+See `plans/EXECUTION-PLAN-2026-08.md` and `plans/SESSIONS.md`.
 
 **The `node exited early` flake is fixed** (session 1b). `free_port()` no longer bind-races: it hands
 out ports from a fixed window below every OS ephemeral range, walked by a process-wide counter and
