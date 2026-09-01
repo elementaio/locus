@@ -110,137 +110,54 @@ or issue.
 | `plans/IMPROVEMENTS-AUDIT-2026-07.md` | The July multi-agent audit — 84 findings, mostly still open |
 | `docs/` | The published documentation (README's targets) |
 
-## Current state — updated 2026-09-01 after session 8 (phase 5.2: the harnesses)
+## Current state — updated 2026-09-01 after session 8 (phase 5 complete)
 
-v0.11.0 (unreleased), ~19,000 lines of Rust plus ~3,500 of new test harness (`std`-only except
-`src/tls.rs`, which is behind the optional feature), 135 unit + 128 integration + 6 embedding +
-5 differential + 7 fault tests green on both feature sets. **Phases 0–5 are done.** Tagged and
-**pushed** to public `origin`: `v0.7.0` (phases 0–2 + the pulled-forward sentinel security fix) and
-`v0.8.0` (phase 3). `v0.9.0` (phase 4) and `v0.10.0` (the library) are tagged but not pushed; `v0.11.0`
-(session 8's fixes) is committed, untagged and unreleased.
+v0.11.0, ~19,000 lines of Rust plus a test-harness suite (`std`-only except `src/tls.rs`, behind the
+optional feature). 135 unit + 128 integration + 6 embedding + differential + fault tests green on both
+feature sets. **Phases 0–5 are done, and phase 6 is decided (freeze).**
 
-- **Phase 1** — the hub has a panic boundary (`catch_unwind`; a command bug becomes one `-ERR`, not an
-  outage), and the three live-verified ACL defects are closed. Session 1b cleared the debt behind it
-  (the port flake, the ACL handshake gate, the release tags, the publication gate).
-- **Phase 2 (perf)** — memory accounting is lazy now, so large-collection writes went from 60–268×
-  Redis to low single digits (writing into a 200k-element collection costs the same as a fresh key);
-  and zset range reads walk the ordered index in place, taking `ZRANGE key 0 9` on a 200k zset from
-  ~34 ms to ~0.05 ms (446×). The perf harness is `tests/perf.rs`.
-- **Session 2b (security)** — the sentinel peer plane is authenticated (loopback by default, shared
-  secret on every verb, refuse-to-start without one), closing an unauthenticated `SWITCH`
-  replication-takeover; and every doc that claimed partition-safety was corrected.
-- **Phase 3 (durability)** — automatic save points (`LOCUS_SAVE`, on by default at Redis's cadence);
-  a CRC-32 footer on every RDB (bad checksum refuses to start; pre-0.8.0 snapshots still load);
-  `appendfsync=always` now returns `-MISCONF` instead of acking a failed fsync; `everysec` fsync moved
-  off the hub; and `BGSAVE` stays on the hub (no `fork()` — unsafe with 2N threads) with the stall
-  measured (`rdb_last_bgsave_hub_stall_us`) and a backup-from-a-replica procedure in `docs/DEPLOYMENT.md`.
+- **Pushed to public `origin`:** `v0.7.0` (phases 0–2 + the pulled-forward sentinel auth), `v0.8.0`
+  (phase 3), `v0.9.0` (phase 4).
+- **Tagged but NOT yet pushed:** `v0.10.0` (the library split) and `v0.11.0` (session 8's nine fixes).
+  The owner pushes both after the session-8 review.
 
-Session 7 split the engine into the **`locusdb` library** (`src/lib.rs`) with the server as a thin
-binary over it — Locus is now embeddable, fuzzable, and unit-testable from outside the crate; the binary
-is byte-identical and the release profile gained thin LTO. `tls` is a binary-only feature (no-op for the
-library).
+What each phase delivered:
 
-`ZRANK` remains O(rank) — deliberately (no order-statistic tree in `std`; the bookkeeping would risk
-the map-and-index lock-step invariant for a cold-path gain).
+- **Phase 1** — a panic boundary around the hub (`catch_unwind`: a command bug is one `-ERR`, not an
+  outage) and the three live-verified ACL defects closed. Session 1b cleared the debt behind it.
+- **Phase 2** — memory accounting is lazy (large-collection writes 60–268× → low single digits) and
+  zset range reads walk the ordered index in place (`ZRANGE key 0 9` on 200k: ~34 ms → ~0.05 ms).
+  Harness: `tests/perf.rs`.
+- **Session 2b (security)** — the sentinel peer plane is authenticated; every doc claiming
+  partition-safety was corrected.
+- **Phase 3** — automatic save points (`LOCUS_SAVE`), an RDB CRC-32 footer (bad checksum refuses to
+  start; old snapshots still load), `appendfsync=always` no longer acks a failed fsync, `everysec`
+  fsync off the hub, and backup-from-a-replica documented (no `fork()` — unsafe with 2N threads).
+- **Phase 4** — the changefeed's at-least-once promise is real (`CDCCLAIM`/`CDCAUTOCLAIM`, self-pending
+  re-read; group existence AOF+replication-durable via `CDCGROUP CREATE`/`DESTROY`, `@write`-classed);
+  and the spatial index was rewritten so large-radius `GEOSEARCH` no longer stalls the hub (20 km on
+  200k: ~181 ms → ~0.08 ms, now faster than Redis). Session 5b also fixed a pre-existing durability bug
+  (`propagate` writes — eviction/expiry/migration — were lost if they landed mid-`BGREWRITEAOF`).
+- **Phase 5** — the engine is the **`locusdb` library** (`src/lib.rs`; the server is a thin binary over
+  it, byte-identical, thin-LTO release); and a differential harness (`tests/differential.rs`, engine
+  in-process vs `redis-server`, 2.2M commands clean) plus a fault-injection suite (`tests/fault.rs`)
+  found and fixed **nine defects** — a self-move TTL-immortality bug, glob `[...]` classes, negative-
+  range clamping, arity panics, and more. The fault suite found no product bug; the phase-6
+  documented-unsafe path is pinned as an assertion.
 
-**Phases 0–4 are done and pushed (`v0.7.0`–`v0.9.0`). Phase 5.1 is done: `v0.10.0` (library target) is tagged, not yet pushed.** Session 5 landed item 4.1: the changefeed's
-at-least-once promise is now real. A consumer that died between `CDCREADGROUP` and `CDCACK` used to
-strand its records forever; now the PEL carries per-entry `{consumer, delivered_ms, delivery_count}`,
-`CDCREADGROUP … 0` re-delivers a consumer's own pending, and `CDCCLAIM`/`CDCAUTOCLAIM` (min-idle-gated,
-bounded scan) let a live consumer take over a dead one's work. The extras trailer versioned LXT2→LXT3
-with a backward-compatible load. This is committed as **unreleased v0.9.0** (`Cargo.toml` is at 0.9.0,
-the `[0.9.0]` CHANGELOG section is open) but **not tagged and not pushed** — v0.9.0 waits for the rest
-of phase 4.
+**Note on the glob fix (session 8):** it widened ACL **channel** patterns (globs), `KEYS`/`SCAN`/
+`PSUBSCRIBE` — **not** ACL key scope, which is a literal prefix (`starts_with`, acl.rs:184) and was
+unaffected. A glob-looking key pattern (`~app:[0-9]*`) silently degrades to the prefix `app:[0-9]`
+(fail-closed); documented in `docs/COMMANDS.md`.
 
-**Phase 5 is closed.** Session 8 landed item 5.2, the credibility gate: two harnesses, and they found
-nine defects between them.
-
-`tests/differential.rs` runs randomized, seeded command sequences against the `locusdb` engine
-**in-process** and a real `redis-server` over a socket and diffs the replies — **2,245,423 commands
-clean** in one run after the fixes (4,000 sequences x 500 commands, fresh seeds). Its normalizations
-(unordered replies as multisets, errors by code, TTL slack) are each *counted*, and the counts say
-something worth knowing: out of 33,373 float-shaped and 500,905 error comparisons, the float and
-error-text relaxations fired **zero** times — Locus's double formatting and its error messages are
-byte-identical to Redis's everywhere the harness reaches.
-
-`tests/fault.rs` covers what an in-process diff cannot: a real binary over a socket with the master
-SIGKILLed under load (the replica must hold a consistent prefix), a replication link dropped mid-stream
-(the resumed stream must replay exactly the missed commands), a stale replica past the backlog (must be
-sent for a full resync, not handed a hole), a failover raced by two sentinels (exactly one promotion,
-every `WAIT`-acknowledged write survives), and a slot migrated under concurrent writes (nothing lost,
-nothing duplicated). **It found no product bug** — those paths hold under the faults injected. Per the
-ratified phase-6 posture, the documented-unsafe path is *pinned as an assertion*: a returned old master
-is not fenced and its writes are silently discarded, exactly as `docs/DEPLOYMENT.md` says, so a change
-in either direction now fails a test.
-
-The seven behavioural divergences and two panics it found are fixed and released as **v0.11.0**
-(unreleased, untagged) — negative-index clamping in `GETRANGE`/`BITCOUNT`/`BITPOS`, the
-missing-source short-circuit in `LMOVE`/`RPOPLPUSH`/`SMOVE`, a self-move silently dropping a key's TTL,
-`SET`'s contradictory-option handling, non-canonical integers (`+1`, `02`, `-0`) being accepted, a glob
-matcher with no `[...]` character classes (**which silently emptied any ACL pattern using them**),
-`INCRBYFLOAT`'s rendering, and two commands that panicked on a bare command name. See the `[0.11.0]`
-CHANGELOG section; each has a regression test verified red on `469b376`.
-
-**Next: session 9** — the P3-batch of small correctness items, and the loose end in session 3b.
-
-**Phase 6 is DECIDED (2026-09-01): freeze & document (A).** The cluster/sentinel layer ships as
-documented-unsafe — "trusted network, operator-driven, not partition-safe" — and gets **no further
+**Phase 6 is DECIDED (2026-09-01): freeze & document (A).** The cluster/sentinel layer ships
+documented-unsafe ("trusted network, operator-driven, not partition-safe") and gets **no further
 investment now**. Do not start cluster/HA hardening: option (B) (min-replicas knob, off-hub
-MIGRATESLOT, off-hub scatter, ASK) is recorded in the plan, ready to brief only on a real customer
-need; option (C) (consensus/Raft) is permanently off the table (identity). After phase 5, the roadmap
-is **phase 7** (multi-tenancy, Go client, sync SDK) plus loose ends (session 3b, the session-9
-P3-batch).
+MIGRATESLOT, off-hub scatter, ASK) is recorded in the plan, ready only on a real customer need;
+option (C) (consensus/Raft) is permanently off the table (identity).
 
-**The former phase-6 blocker line, for reference:** the decision —
-either harden the cluster/sentinel layer (fencing, coordinated epochs, chunked migration) or narrow the
-documented guarantees. The authentication and the false-partition-safety claims were already pulled
-forward (session 2b); what remains is a product call, not a coding task.
-
-Loose ends, none blocking: **session 3b** (convert `ZRANGEBYSCORE`'s low-bound `skip_while` to a `range`
-seek) and a P3-batch (session 9) of small correctness items — `NaN` in zsets, `EXPIRE` flags,
-`EXPIRETIME`/`HINCRBYFLOAT`/`ZRANGEBYLEX`/`MEMORY USAGE`, observability counters, an
-eviction-during-BGREWRITEAOF regression test, and the `LOCUS_MAXCLIENTS` default.
-
-Session 5b landed: `CDCGROUP CREATE`/`DESTROY` (only those) now propagate to the AOF and replication,
-so a group survives an unclean stop and reaches a replica (5c then reclassified `CDCGROUP` as `@write`). It also fixed a **pre-existing** durability
-bug — `propagate` (eviction/expiry/slot-migration writes) did not mirror into an in-flight
-`BGREWRITEAOF` tail, so such writes landing mid-rewrite were lost on crash replay; now fixed for every
-`propagate` site.
-
-Session 6 closed item 4.2: `ranges_for_box` now covers a query box with up to 64 fine cells (per-axis
-precision, adjacent cells merged into single `BTreeMap` seeks) instead of ≤4 coarse ones, and `COUNT n`
-is a real nearest-neighbour probe. `GEOSEARCH 20 km COUNT 10` on 200k points went from ~181 ms to
-**0.082 ms** — now *faster than Redis*, which does geo over an O(n) zset. Correctness proved against a
-brute-force oracle (the old HashSet-order path was never byte-stable). The one honest limit: a wide
-search with no `COUNT` is reply-bound (~190 ms for 103k members) — the cost is the reply, not the index;
-bound wide searches.
-
-See `plans/EXECUTION-PLAN-2026-08.md` and `plans/SESSIONS.md`.
-
-**The `node exited early` flake is fixed** (session 1b). `free_port()` no longer bind-races: it hands
-out ports from a fixed window below every OS ephemeral range, walked by a process-wide counter and
-sliced by pid, so neither another test nor another `cargo test` process can take a port out from under
-a spawning node. If a cluster node ever does die at startup again, the panic now carries the child's
-exit status and stderr instead of just "node exited early".
-
-**Session 8 tightened `free_port` again.** The pid-derived slice separated two concurrent `cargo test`
-*processes* but left the test binaries *inside* one run leaning on their pids happening to differ — and
-with four server-spawning binaries (session 8 added the third and fourth) that started losing:
-`EADDRINUSE` at child startup in two of six full runs. The slice index now carries the harness's own id
-in its low bits, so integration, perf, differential and fault provably cannot collide with each other,
-and the window widened to 16384–32768 so pid separation was not traded away for it. The differential
-harness also keeps **one** reference `redis-server` alive at a time rather than one per test — a full
-concurrent run had managed to get one killed mid-assertion — and handshakes with `PING` before handing
-the connection out.
-
-**The cluster spawn race is fixed properly now** (session 8). `free_port` binds a number, drops it, and
-only then does the child bind — a window a *previous* `cargo test` invocation's node can still occupy,
-which is why `integration.rs`'s cluster tests kept losing it at ~1 run in 20. A cluster node cannot
-answer `EADDRINUSE` by taking a different port (its address is in the topology string every other node
-was given), so `spawn_cluster_node*` now waits for the address to become bindable and retries the spawn
-on the same port. Same for `tests/fault.rs`'s resurrected-master respawn.
-
-**Both earlier test flakes are fixed.** `free_port()` above (session 1b), and
-`disk_tier_survives_kill9_with_aof_and_rewrite` (session 2b, item 2b.4) — it no longer sleeps a fixed
-300 ms for `BGREWRITEAOF`; it polls `aof_rewrite_in_progress` down to 0. The suite is green on both
-feature sets with no known timing races.
+**Next: phase 7 — the larger layer** (multi-tenancy, a Go client for Motus, the browser sync SDK).
+Non-blocking loose ends: **session 3b** (`ZRANGEBYSCORE` low-bound `skip_while` → `range` seek) and the
+**session 9** P3-batch (`NaN` in zsets, `EXPIRE` flags, `EXPIRETIME`/`HINCRBYFLOAT`/`ZRANGEBYLEX`/
+`MEMORY USAGE`, observability counters, gate the `DEBUG` tests to debug builds, and whether ACL key
+scope should learn real globs). See `plans/EXECUTION-PLAN-2026-08.md` and `plans/SESSIONS.md`.
