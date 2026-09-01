@@ -186,9 +186,11 @@ A group's pending-entries list (delivered-but-unacked offset → owning consumer
 delivery count) is what makes group reads **at-least-once** rather than at-most-once: a consumer that
 dies mid-processing has its entries re-read under its own name (`CDCREADGROUP … 0`) or claimed by
 another consumer past an idle window (`CDCCLAIM`/`CDCAUTOCLAIM`). It is ordered by offset, so recovery
-walks it in delivery order. It rides in the snapshot trailer and the full-resync payload — but not in
-the AOF or the replication stream, so across an unclean stop a group is only as fresh as the last
-snapshot. Full details in [CHANGEFEED.md](CHANGEFEED.md).
+walks it in delivery order. A group's **existence** is log-durable — `CDCGROUP CREATE`/`DESTROY` go to
+the AOF and the replication stream, so a group survives a `kill -9` and reaches replicas — while its
+**cursor and pending list** ride only in the snapshot trailer and the full-resync payload. So across an
+unclean stop the group is still there, at the position of the last snapshot: bounded duplicates, never
+a silent stop. Full details in [CHANGEFEED.md](CHANGEFEED.md).
 
 ## Geo
 

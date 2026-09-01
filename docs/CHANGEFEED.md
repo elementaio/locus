@@ -124,14 +124,24 @@ of the retained log (`LOCUS_CDC_MAXLEN`) comes back from a re-read or a claim as
 — the payload is genuinely gone, and saying so beats dropping the entry and making it look like it was
 never delivered. Size retention above your worst-case consumer downtime.
 
-**Where group state is durable, and where it is not.** The cursor and the pending list ride in the
-snapshot trailer and in the full-resync payload, so they survive a graceful restart (`SAVE` and
-`SHUTDOWN` both write them) and they are handed to a replica when it syncs. They are *not* a logged
-command stream: `CDCREADGROUP`, `CDCACK` and the claim verbs go to neither the AOF nor the replication
-link. So after a `kill -9` or a failover, a group is only as fresh as the last snapshot or the last
-resync — already-acked records can come back (duplicates, which is what at-least-once permits), and a
-group **created** since then is missing entirely. If you depend on group state surviving an unclean
-stop, leave `LOCUS_SAVE` at its default cadence rather than turning snapshots off.
+**Where group state is durable.** Two different guarantees, deliberately:
+
+- **A group's existence is log-durable and replicated.** `CDCGROUP CREATE` and `CDCGROUP DESTROY` are
+  written to the AOF and streamed to replicas (with the resolved start offset, so a replay or a replica
+  rebuilds the group at the same cursor origin, never at "now"). A group survives a `kill -9` and is
+  present on a replica after a failover. Replay is idempotent: re-applying a `CREATE` for a group that
+  already exists keeps the cursor and pending list it already has, and destroying a group that is not
+  there is a no-op.
+- **A group's cursor and pending list are snapshot-durable.** They ride in the snapshot trailer and the
+  full-resync payload, so they survive a graceful restart (`SAVE` and `SHUTDOWN` both write them) and
+  are handed to a replica when it syncs — but `CDCREADGROUP`, `CDCACK`, `CDCCLAIM` and `CDCAUTOCLAIM`
+  are **not** logged or replicated, on purpose. They change on every group read, and logging them would
+  put a write in the AOF for each one. So after a `kill -9` or a failover, the *position* is only as
+  fresh as the last snapshot: already-acked records can come back. That is a duplicate, which is
+  exactly what at-least-once permits and what your consumer must already tolerate — unlike a vanished
+  group, which was a silent stop and is now fixed.
+
+Leave `LOCUS_SAVE` at its default cadence to keep that duplicate window small.
 
 Entries restored from a snapshot count as maximally idle — whoever held them before the restart is not
 coming back for them — so they are claimable immediately.

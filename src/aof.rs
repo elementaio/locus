@@ -500,7 +500,52 @@ fn extract_bulks(reply: &[u8]) -> Vec<Vec<u8>> {
     out
 }
 
-/// Replay the AOF to rebuild the dataset.
+/// A changefeed consumer-group mutation replayed from the log.
+///
+/// Groups live on the hub, not in `Db` — the loader cannot apply these itself,
+/// so it collects them in log order and hands them back for the hub to fold in
+/// after the snapshot trailer (see `Hub::apply_cdc_group_ops`).
+#[derive(Debug, PartialEq)]
+pub enum CdcGroupOp {
+    /// `CDCGROUP CREATE <name> <start>` — the start offset travels with it, so a
+    /// replayed group is recreated at its original cursor origin, not at "now".
+    Create {
+        name: Vec<u8>,
+        start: u64,
+    },
+    Destroy {
+        name: Vec<u8>,
+    },
+}
+
+/// Recognize a logged `CDCGROUP CREATE|DESTROY`. Anything else — including the
+/// read verbs, which are never logged — returns `None`.
+fn cdc_group_op(tokens: &[Vec<u8>]) -> Option<CdcGroupOp> {
+    // Length first: an empty token list must not index.
+    if tokens.len() < 3 || !tokens[0].eq_ignore_ascii_case(b"CDCGROUP") {
+        return None;
+    }
+    let name = tokens[2].clone();
+    if tokens[1].eq_ignore_ascii_case(b"CREATE") {
+        // A CREATE without a resolved offset cannot be replayed faithfully
+        // (there is no "now" at load time); treat it as offset 0 — the
+        // conservative direction, since a group can only be re-delivered
+        // records it may already have seen, never skip past unseen ones.
+        let start = tokens
+            .get(3)
+            .and_then(|t| std::str::from_utf8(t).ok())
+            .and_then(|s| s.parse::<u64>().ok())
+            .unwrap_or(0);
+        Some(CdcGroupOp::Create { name, start })
+    } else if tokens[1].eq_ignore_ascii_case(b"DESTROY") {
+        Some(CdcGroupOp::Destroy { name })
+    } else {
+        None
+    }
+}
+
+/// Replay the AOF to rebuild the dataset (plus the changefeed group
+/// create/destroy ops it carries, which belong to the hub).
 ///
 /// A crash can only ever truncate the FINAL command, so a short/incomplete tail
 /// is tolerated (stop at the last complete command). But a `Parsed::Error` — a
@@ -509,13 +554,14 @@ fn extract_bulks(reply: &[u8]) -> Vec<Vec<u8>> {
 /// hide an unbounded amount of still-present history. That is refused (unless
 /// LOCUS_AOF_LOAD_TRUNCATED=yes), so the operator sees it instead of quietly
 /// starting with half the data and appending after the hole.
-pub fn load(path: &str) -> io::Result<Db> {
+pub fn load(path: &str) -> io::Result<(Db, Vec<CdcGroupOp>)> {
     let mut data = Vec::new();
+    let mut groups = Vec::new();
     match File::open(path) {
         Ok(mut f) => {
             f.read_to_end(&mut data)?;
         }
-        Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(Db::new()),
+        Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok((Db::new(), groups)),
         Err(e) => return Err(e),
     }
     let allow_truncated = std::env::var("LOCUS_AOF_LOAD_TRUNCATED")
@@ -528,7 +574,15 @@ pub fn load(path: &str) -> io::Result<Db> {
         match parse_command(&data[pos..]) {
             Parsed::Complete(tokens, consumed) => {
                 if !tokens.is_empty() {
-                    execute(&tokens, &mut db); // replay; no re-logging happens here
+                    // CDCGROUP is the one logged command the keyspace knows
+                    // nothing about: collect it for the hub instead of handing
+                    // `execute` a command it would answer with "unknown".
+                    match cdc_group_op(&tokens) {
+                        Some(op) => groups.push(op),
+                        None => {
+                            execute(&tokens, &mut db); // replay; no re-logging here
+                        }
+                    }
                 }
                 pos += consumed;
             }
@@ -548,13 +602,20 @@ pub fn load(path: &str) -> io::Result<Db> {
             Parsed::Incomplete | Parsed::Error(_) => break,
         }
     }
-    Ok(db)
+    Ok((db, groups))
 }
 
 /// Serialize the whole dataset as the minimal command set that rebuilds it — the
 /// base image for an AOF rewrite (BGREWRITEAOF). Pure in-memory; the disk write
 /// is done off the hub thread (see `write_tmp` / `finalize_rewrite`).
-pub fn serialize_rewrite(db: &Db) -> Vec<u8> {
+///
+/// `cdc_groups` is `(name, cursor)` for every live changefeed group. A rewrite
+/// replaces the whole log, so without this every logged `CDCGROUP CREATE` would
+/// be thrown away and group existence would stop being crash-durable the moment
+/// the AOF was rewritten. Emitting the group at its *current* cursor (rather
+/// than its original creation offset) also keeps the rewrite from rewinding a
+/// group that a snapshot never covered.
+pub fn serialize_rewrite(db: &Db, cdc_groups: &[(Vec<u8>, u64)]) -> Vec<u8> {
     let mut buf = Vec::new();
     for (key, value) in db.entries() {
         for c in reconstruct(key, value) {
@@ -564,7 +625,26 @@ pub fn serialize_rewrite(db: &Db) -> Vec<u8> {
             encode_command(&mut buf, &pexpireat(key, t));
         }
     }
+    for (name, cursor) in cdc_groups {
+        encode_command(&mut buf, &cdc_group_create(name, *cursor));
+    }
     buf
+}
+
+/// The durable form of "this changefeed group exists, at this cursor" — the one
+/// command shape written to the AOF and streamed to replicas for a group.
+pub fn cdc_group_create(name: &[u8], start: u64) -> Vec<Vec<u8>> {
+    vec![
+        b"CDCGROUP".to_vec(),
+        b"CREATE".to_vec(),
+        name.to_vec(),
+        start.to_string().into_bytes(),
+    ]
+}
+
+/// The matching destroy form.
+pub fn cdc_group_destroy(name: &[u8]) -> Vec<Vec<u8>> {
+    vec![b"CDCGROUP".to_vec(), b"DESTROY".to_vec(), name.to_vec()]
 }
 
 /// Encode already-deterministic commands onto `buf` — used to capture writes that
@@ -791,7 +871,7 @@ mod tests {
         a.append(&[vec![b"INCR".to_vec(), b"c".to_vec()]]).unwrap();
         drop(a);
 
-        let mut db = load(path).unwrap();
+        let (mut db, _) = load(path).unwrap();
         assert_eq!(run(&mut db, &[b"GET", b"k"]), b"$1\r\nv\r\n".to_vec());
         assert_eq!(run(&mut db, &[b"LLEN", b"l"]), b":2\r\n".to_vec());
         assert_eq!(run(&mut db, &[b"GET", b"c"]), b"$1\r\n2\r\n".to_vec());
@@ -811,7 +891,7 @@ mod tests {
         f.write_all(b"*3\r\n$3\r\nSET\r\n$4\r\nhalf").unwrap(); // no value/CRLF
         drop(f);
 
-        let mut db = load(path).unwrap();
+        let (mut db, _) = load(path).unwrap();
         assert_eq!(run(&mut db, &[b"GET", b"ok"]), b"$1\r\n1\r\n".to_vec());
         assert_eq!(run(&mut db, &[b"EXISTS", b"half"]), b":0\r\n".to_vec()); // torn cmd dropped
         let _ = fs::remove_file(path);
@@ -836,7 +916,7 @@ mod tests {
 
         // The override recovers everything up to the corruption.
         unsafe { std::env::set_var("LOCUS_AOF_LOAD_TRUNCATED", "yes") };
-        let mut db = load(path).unwrap();
+        let (mut db, _) = load(path).unwrap();
         assert_eq!(run(&mut db, &[b"GET", b"a"]), b"$1\r\n1\r\n".to_vec());
         unsafe { std::env::remove_var("LOCUS_AOF_LOAD_TRUNCATED") };
         let _ = fs::remove_file(path);
@@ -851,7 +931,7 @@ mod tests {
         // Base image captured before the (off-thread) rewrite.
         let mut db = Db::new();
         db.insert_with_expire(b"k".to_vec(), Value::Str(b"v".to_vec()), None);
-        let base = serialize_rewrite(&db);
+        let base = serialize_rewrite(&db, &[]);
         write_tmp(&tmp, &base).unwrap();
         // A write that lands during the rewrite, captured as a tail and folded in.
         let mut tail = Vec::new();
@@ -861,10 +941,74 @@ mod tests {
         );
         finalize_rewrite(&tmp, path, &tail).unwrap();
         // Replaying the swapped-in file yields base + tail, nothing lost.
-        let mut loaded = load(path).unwrap();
+        let (mut loaded, _) = load(path).unwrap();
         assert_eq!(run(&mut loaded, &[b"GET", b"k"]), b"$1\r\nv\r\n".to_vec());
         assert_eq!(run(&mut loaded, &[b"GET", b"k2"]), b"$2\r\nv2\r\n".to_vec());
         let _ = fs::remove_file(path);
+    }
+
+    /// 5b — a rewrite replaces the whole log, so the base image has to re-emit
+    /// the changefeed groups or their existence stops being crash-durable the
+    /// moment the AOF is rewritten. And the loader has to hand them back rather
+    /// than feed them to `execute`, which knows nothing about groups.
+    #[test]
+    fn a_rewrite_carries_changefeed_groups_and_the_loader_returns_them() {
+        let path = "/tmp/locus_aof_cdcgroups.aof";
+        let tmp = format!("{path}.tmp");
+        let _ = fs::remove_file(path);
+        let _ = fs::remove_file(&tmp);
+        let mut db = Db::new();
+        db.insert_with_expire(b"k".to_vec(), Value::Str(b"v".to_vec()), None);
+        let base = serialize_rewrite(&db, &[(b"grp".to_vec(), 7)]);
+        write_tmp(&tmp, &base).unwrap();
+        // A group created DURING the rewrite lands in the folded-in tail.
+        let mut tail = Vec::new();
+        encode_into(&mut tail, &[cdc_group_create(b"during", 0)]);
+        encode_into(&mut tail, &[cdc_group_destroy(b"grp")]);
+        finalize_rewrite(&tmp, path, &tail).unwrap();
+
+        let (mut loaded, ops) = load(path).unwrap();
+        assert_eq!(run(&mut loaded, &[b"GET", b"k"]), b"$1\r\nv\r\n".to_vec());
+        // In log order, cursor and all — the hub folds these in after the trailer.
+        assert_eq!(
+            ops,
+            vec![
+                CdcGroupOp::Create {
+                    name: b"grp".to_vec(),
+                    start: 7
+                },
+                CdcGroupOp::Create {
+                    name: b"during".to_vec(),
+                    start: 0
+                },
+                CdcGroupOp::Destroy {
+                    name: b"grp".to_vec()
+                },
+            ]
+        );
+        let _ = fs::remove_file(path);
+    }
+
+    /// The read verbs are never logged — but if one ever were, it must not be
+    /// mistaken for a group mutation on the way back in.
+    #[test]
+    fn only_cdcgroup_create_and_destroy_are_recognized_as_group_ops() {
+        let cmd = |parts: &[&[u8]]| -> Vec<Vec<u8>> { parts.iter().map(|p| p.to_vec()).collect() };
+        assert!(cdc_group_op(&cmd(&[b"CDCREADGROUP", b"grp", b"c1"])).is_none());
+        assert!(cdc_group_op(&cmd(&[b"CDCACK", b"grp", b"1"])).is_none());
+        assert!(cdc_group_op(&cmd(&[b"CDCCLAIM", b"grp", b"c1", b"0", b"1"])).is_none());
+        assert!(cdc_group_op(&cmd(&[b"SET", b"CDCGROUP", b"x"])).is_none());
+        assert!(cdc_group_op(&cmd(&[b"CDCGROUP", b"WAT", b"grp"])).is_none());
+        assert!(cdc_group_op(&cmd(&[b"CDCGROUP", b"CREATE"])).is_none()); // too short
+        assert!(cdc_group_op(&[]).is_none()); // and an empty frame must not index
+        // Case-insensitive, as the wire is.
+        assert_eq!(
+            cdc_group_op(&cmd(&[b"cdcgroup", b"create", b"g", b"3"])),
+            Some(CdcGroupOp::Create {
+                name: b"g".to_vec(),
+                start: 3
+            })
+        );
     }
 
     /// 3.4 — the `everysec` fsync must not run on the thread that asks for it.

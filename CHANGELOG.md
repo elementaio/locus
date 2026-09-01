@@ -32,6 +32,26 @@ the existing `CDCREADGROUP` / `CDCACK` flow changes shape.
   Both are gated on `min-idle-ms`, which is the entire safety story: it is what stops a second worker
   taking a record the first is still processing. Set it above your slowest expected processing time.
 
+- **A consumer group no longer vanishes on an unclean stop.** `CDCGROUP CREATE` and `CDCGROUP DESTROY`
+  were classed as reads, so they reached neither the AOF nor the replication link and group state was
+  snapshot-durable only. A group created since the last snapshot was simply *gone* after a `kill -9` —
+  the next `CDCREADGROUP` answered `-NOGROUP` and that consumer silently stopped receiving — and a
+  group created after a replica synced existed only on the master, so a failover lost it.
+
+  Those two commands are now logged and replicated, carrying the **resolved** start offset so a replay
+  or a replica rebuilds the group at the same cursor origin rather than at "now". Replay is idempotent
+  in both directions: re-applying a `CREATE` for a group that already exists keeps the cursor and
+  pending list it already has (it never rewinds one), and a `DESTROY` of a group that is not there is a
+  no-op, not an error. An `BGREWRITEAOF` re-emits every live group into its base image, so a rewrite
+  does not quietly undo this.
+
+  **The read verbs still do not propagate, deliberately.** `CDCREADGROUP`, `CDCACK`, `CDCCLAIM` and
+  `CDCAUTOCLAIM` move the cursor and the pending list on *every* group read; logging them would put a
+  write in the AOF for each one. Those stay snapshot-durable, so an unclean stop replays a group from
+  the last snapshot's position — a bounded **duplicate**, which is what at-least-once permits and what
+  a consumer already has to tolerate. A vanished group was not a duplicate, which is why it was the
+  half worth fixing.
+
 ### Added
 
 - **`CDCCLAIM`** and **`CDCAUTOCLAIM`** (above). Offsets that are not pending, or not idle long enough,
@@ -68,13 +88,11 @@ the existing `CDCREADGROUP` / `CDCACK` flow changes shape.
 - The pending list is still capped at `LOCUS_CDC_PEL_MAX` per group (default 100,000). At the cap the
   **oldest** unacked entries are dropped with a warning in the log: a consumer that never acks degrades
   to at-most-once rather than growing hub memory without bound. Unchanged from 0.8.0.
-- **Group state is snapshot-durable, not log-durable** — also unchanged, and worth stating plainly now
-  that redelivery depends on it. `CDCREADGROUP`, `CDCACK` and the claim verbs are not written to the
-  AOF and not propagated over the replication link; the cursor and the pending list travel only in the
-  snapshot trailer and the full-resync payload. After a `kill -9` or a failover a group is therefore
-  only as fresh as the last snapshot: already-acked records can be redelivered (a duplicate, which
-  at-least-once permits), and a group created since the last snapshot is gone. Leave `LOCUS_SAVE` at
-  its default cadence if you depend on group state surviving an unclean stop.
+- **A group's cursor and pending list are snapshot-durable** (its *existence* is log-durable — see
+  above). `CDCREADGROUP`, `CDCACK` and the claim verbs are not written to the AOF and not propagated
+  over the replication link, so after a `kill -9` or a failover a group comes back at the position of
+  the last snapshot: already-acked records can be redelivered. That is a duplicate, which at-least-once
+  permits. Leave `LOCUS_SAVE` at its default cadence to keep the window small.
 
 ## [0.8.0] — 2026-09-01
 

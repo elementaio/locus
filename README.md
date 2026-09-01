@@ -115,8 +115,9 @@ $ redis-cli -p 6379 GEOSEARCH fleet FROMLONLAT 55.27 25.2 BYRADIUS 5 km ASC   # 
 - **[Changefeed](docs/CHANGEFEED.md):** `CDCSUBSCRIBE` (snapshot + live deltas, no gap/dup), offsets +
   `CDCREAD` catch-up, and **at-least-once** consumer groups — a delivered record stays pending until it
   is acked, and if its consumer dies another one recovers it (`CDCREADGROUP … 0` under the same name,
-  `CDCCLAIM`/`CDCAUTOCLAIM` from a different one). A reliable, ordered keyspace feed, with the pending
-  list written into the snapshot and handed to a replica on sync.
+  `CDCCLAIM`/`CDCAUTOCLAIM` from a different one). A reliable, ordered keyspace feed: the group's
+  existence is logged to the AOF and replicated, so it survives a `kill -9` and a failover, and its
+  pending list is written into the snapshot and handed to a replica on sync.
 - **[Geo-first](docs/GEO.md):** `GEOSET`/`GEOPOS`/`GEODIST`/`GEOSEARCH` (backed by a **geohash spatial
   index** → sub-linear radius/box queries) with **combined attribute filters** (`GEOSEARCH … WHERE
   status active`), plus **live geofencing** via `CDCSUBSCRIBE REGION`.

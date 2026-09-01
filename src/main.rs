@@ -1067,6 +1067,9 @@ struct TxState {
 impl Hub {
     fn new(tx: mpsc::SyncSender<Msg>) -> Hub {
         let aof_path = aof::configured_path();
+        // Changefeed groups live on the hub, not in `Db`, so the AOF loader
+        // hands their create/destroys back here to fold in after the trailer.
+        let mut cdc_group_ops = Vec::new();
         let (db, aof, extras) = match &aof_path {
             Some(path) => {
                 // A torn tail loads fine (stops at the last complete command);
@@ -1074,12 +1077,13 @@ impl Hub {
                 // than quarantine-and-start-empty (which would silently discard
                 // the recoverable prefix). The operator fixes the disk or sets
                 // LOCUS_AOF_LOAD_TRUNCATED=yes to recover what precedes the hole.
-                let db = aof::load(path).unwrap_or_else(|e| {
+                let (db, ops) = aof::load(path).unwrap_or_else(|e| {
                     log::error(&format!(
                         "refusing to start: {e}. The AOF is the source of truth and dropping it would lose data. Investigate {path}, or set LOCUS_AOF_LOAD_TRUNCATED=yes to load everything up to the corruption."
                     ));
                     std::process::exit(1);
                 });
+                cdc_group_ops = ops;
                 let aof = aof::Aof::open(path)
                     .map_err(|e| log::warn(&format!("AOF open failed: {e}")))
                     .ok();
@@ -1232,6 +1236,11 @@ impl Hub {
             waiting: Vec::new(),
         };
         hub.apply_extras(extras);
+        // AFTER the trailer, never before: the snapshot carries each group's
+        // cursor and pending list, the log carries only that the group exists.
+        // Replaying a CREATE over a group the trailer restored must not rewind
+        // it — see `apply_cdc_group_ops`.
+        hub.apply_cdc_group_ops(cdc_group_ops);
         // The disk tier (LOCUS_TIER=path|1): tiered values live in a segmented
         // value-log on disk; RAM keeps stubs. RAM is for LIVE data.
         if let Some(base) = tier_base_from_env() {
@@ -1432,7 +1441,7 @@ impl Hub {
             return Err("ERR AOF is not enabled");
         };
         let tmp = format!("{path}.tmp.{}", std::process::id());
-        let buf = aof::serialize_rewrite(&self.db);
+        let buf = aof::serialize_rewrite(&self.db, &self.cdc_group_snapshot());
         self.aof_rewrite_buf = Some(Vec::new());
         let tx = self.tx.clone();
         let rewrite_gen = self.aof_rewrite_gen;
@@ -1573,7 +1582,7 @@ impl Hub {
         if self.aof.is_none() {
             return; // AOF disabled (or already dark) — nothing to rebuild
         }
-        let buf = aof::serialize_rewrite(&self.db);
+        let buf = aof::serialize_rewrite(&self.db, &self.cdc_group_snapshot());
         let tmp = format!("{path}.tmp.{}", std::process::id());
         let res = aof::write_tmp(&tmp, &buf).and_then(|()| aof::finalize_rewrite(&tmp, &path, &[]));
         match res.and_then(|()| aof::Aof::open(&path)) {
@@ -4044,6 +4053,20 @@ impl Hub {
     }
 
     /// CDCGROUP CREATE <group> [<offset>|$|0] | CDCGROUP DESTROY <group>.
+    ///
+    /// **These two are the only changefeed verbs that are logged and replicated**
+    /// (session 5b). A group's *existence* has to survive an unclean stop and a
+    /// failover: before this, groups were snapshot-durable only, so one created
+    /// since the last snapshot was simply gone after a `kill -9` — the next
+    /// `CDCREADGROUP` got `-NOGROUP` and that consumer silently stopped
+    /// receiving. That is not a duplicate, and at-least-once does not permit it.
+    ///
+    /// The cursor and the pending list deliberately stay snapshot-durable. They
+    /// change on *every* group read, and logging that would put a write in the
+    /// AOF for each one — turning the changefeed into a write amplifier for a
+    /// failure mode at-least-once already tolerates (a crash re-delivers from
+    /// the last snapshot: bounded duplicates). So `CDCREADGROUP`, `CDCACK`,
+    /// `CDCCLAIM` and `CDCAUTOCLAIM` are not propagated, on purpose.
     fn handle_cdc_group(&mut self, id: u64, tokens: &[Vec<u8>]) {
         if tokens.len() < 3 {
             return self.send(
@@ -4051,16 +4074,28 @@ impl Hub {
                 resp::error("ERR wrong number of arguments for 'cdcgroup' command"),
             );
         }
+        // A replica applies its master's stream verbatim — it may not reject or
+        // reshape a command, or the two datasets diverge. So the client-facing
+        // guards below (retention off, BUSYGROUP) are skipped for it, and an
+        // already-present group makes the CREATE a no-op instead of an error.
+        // The AOF replay path (`aof::load` -> `apply_cdc_group_ops`) applies the
+        // same rule, for the same reason.
+        let from_master = id == MASTER_ID;
         let group = tokens[2].clone();
         match tokens[1].to_ascii_uppercase().as_slice() {
             b"CREATE" => {
-                if self.cdc_maxlen == 0 {
+                if self.cdc_maxlen == 0 && !from_master {
                     return self.send(
                         id,
                         resp::error("ERR changefeed retention disabled (set LOCUS_CDC_MAXLEN)"),
                     );
                 }
                 if self.cdc_groups.contains_key(&group) {
+                    if from_master {
+                        // Idempotent: keep the cursor/PEL we already hold rather
+                        // than rewinding the group to the stream's start offset.
+                        return self.send(id, resp::simple_string("OK"));
+                    }
                     return self.send(id, resp::error("BUSYGROUP changefeed group already exists"));
                 }
                 // Start offset: default / "$" = only new changes; "0" = all retained.
@@ -4082,20 +4117,64 @@ impl Hub {
                     },
                 };
                 self.cdc_groups.insert(
-                    group,
+                    group.clone(),
                     CdcGroup {
                         last_delivered: start,
                         pending: BTreeMap::new(),
                     },
                 );
+                // The RESOLVED offset travels, never `$` — a replay or a replica
+                // has no "now" of its own, and recreating the group at its own
+                // high-water mark would skip every record between.
+                self.propagate(&aof::cdc_group_create(&group, start));
                 self.send(id, resp::simple_string("OK"));
             }
             b"DESTROY" => {
                 let removed = self.cdc_groups.remove(&group).is_some();
+                // Only a real removal propagates — a DESTROY of a group that was
+                // never there changed nothing, and replaying it would be noise.
+                if removed {
+                    self.propagate(&aof::cdc_group_destroy(&group));
+                }
                 self.send(id, resp::integer(removed as i64));
             }
             _ => self.send(id, resp::error("ERR syntax error")),
         }
+    }
+
+    /// Fold the changefeed group create/destroys replayed from the AOF into the
+    /// group table, in log order.
+    ///
+    /// Called AFTER `apply_extras`, and that order is the whole design: the
+    /// snapshot trailer carries the richer state (cursor + pending list), the
+    /// log carries only existence. So a CREATE for a group the trailer already
+    /// restored is a no-op — it must not rewind a live cursor to the offset the
+    /// group was created at — while a CREATE for one the trailer never saw
+    /// (created since the last snapshot) builds it at the logged origin. A
+    /// DESTROY that comes later in the log removes it either way.
+    fn apply_cdc_group_ops(&mut self, ops: Vec<aof::CdcGroupOp>) {
+        for op in ops {
+            match op {
+                aof::CdcGroupOp::Create { name, start } => {
+                    self.cdc_groups.entry(name).or_insert(CdcGroup {
+                        last_delivered: start,
+                        pending: BTreeMap::new(),
+                    });
+                }
+                aof::CdcGroupOp::Destroy { name } => {
+                    self.cdc_groups.remove(&name);
+                }
+            }
+        }
+    }
+
+    /// `(name, cursor)` for every live group — the durable form an AOF rewrite
+    /// re-emits so a rewrite does not throw group existence away.
+    fn cdc_group_snapshot(&self) -> Vec<(Vec<u8>, u64)> {
+        self.cdc_groups
+            .iter()
+            .map(|(name, g)| (name.clone(), g.last_delivered))
+            .collect()
     }
 
     /// CDCREADGROUP <group> <consumer> [0|FROMPENDING] [COUNT n] — deliver the
@@ -4953,6 +5032,14 @@ impl Hub {
         let batch = vec![tokens.to_vec()];
         if let Some(a) = self.aof.as_mut() {
             let _ = a.append(&batch);
+        }
+        // Mirror into an in-flight BGREWRITEAOF's tail, exactly as `exec_one`
+        // does for client writes. Without this, anything propagated during a
+        // rewrite (a changefeed group create, an eviction DEL) is dropped when
+        // the rewritten file replaces the log: its base image predates the
+        // command and the tail never carried it.
+        if let Some(buf) = self.aof_rewrite_buf.as_mut() {
+            aof::encode_into(buf, &batch);
         }
         self.replicate(resp::command(tokens));
     }

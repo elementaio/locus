@@ -218,6 +218,21 @@ fn info_field(c: &mut Conn, field: &str) -> u64 {
         .unwrap()
 }
 
+/// Poll a command until it returns `want`, or fail with `msg`. Replication is
+/// asynchronous, so a test that reads a replica must wait for the stream rather
+/// than sleep a guessed interval.
+fn wait_for(c: &mut Conn, args: &[&str], want: &str, msg: &str) {
+    let deadline = Instant::now() + Duration::from_secs(5);
+    loop {
+        let got = c.cmd(args);
+        if got == want {
+            return;
+        }
+        assert!(Instant::now() < deadline, "{msg} (last reply: {got})");
+        sleep(Duration::from_millis(20));
+    }
+}
+
 // === pipelining / basics ====================================================
 
 #[test]
@@ -1169,6 +1184,283 @@ fn changefeed_pending_list_survives_a_restart() {
         assert_eq!(c.cmd(&["CDCACK", "grp", "1", "2"]), "2");
     }
     let _ = std::fs::remove_file(&rdb);
+}
+
+// === group existence is log-durable (phase 4, session 5b) ===================
+//
+// The cursor and the pending list are snapshot-durable, and a crash replaying
+// them from the last snapshot is a bounded DUPLICATE — which at-least-once
+// permits. A group VANISHING is not: the consumer silently stops receiving.
+// So `CDCGROUP CREATE`/`DESTROY` — and only those two — are logged to the AOF
+// and streamed to replicas.
+
+/// A group created after the last snapshot used to be gone after `kill -9`
+/// (`-NOGROUP`). The AOF now carries its existence and its start offset.
+#[test]
+fn changefeed_group_created_after_the_last_snapshot_survives_kill9() {
+    let base = format!(
+        "{}/locus-cdcgrp-crash-{}",
+        std::env::temp_dir().display(),
+        std::process::id()
+    );
+    let (rdb, aof) = (format!("{base}.rdb"), format!("{base}.aof"));
+    let _ = std::fs::remove_file(&rdb);
+    let _ = std::fs::remove_file(&aof);
+    // LOCUS_SAVE off: no snapshot may sneak in, so the ONLY way the group can
+    // come back is the log — which is exactly what this test is about.
+    let env = [
+        ("LOCUS_CDC_MAXLEN", "100"),
+        ("LOCUS_AOF", aof.as_str()),
+        ("LOCUS_SAVE", ""),
+    ];
+    {
+        let mut s = Server::spawn_at(rdb.clone(), &env);
+        let mut c = s.connect();
+        c.cmd(&["SET", "a", "1"]);
+        assert_eq!(c.cmd(&["CDCGROUP", "CREATE", "grp", "0"]), "OK");
+        assert_eq!(c.cmd(&["CDCREADGROUP", "grp", "c1"]), "[[1, write, a, 1]]");
+        s.child.kill().unwrap(); // SIGKILL: no graceful shutdown, no final save
+        let _ = s.child.wait();
+        // `Server::drop` removes the RDB here, which makes the point sharper:
+        // round 2 starts with NO snapshot trailer at all, so the group can only
+        // come back from the log.
+    }
+    {
+        let mut s = Server::spawn_at(rdb.clone(), &env);
+        let mut c = s.connect();
+        // Before session 5b this was "-NOGROUP No such changefeed group".
+        assert_eq!(c.cmd(&["CDCREADGROUP", "grp", "c1"]), "[]");
+        // And the recovered group still works: a new change is delivered to it.
+        c.cmd(&["SET", "b", "2"]);
+        assert_eq!(c.cmd(&["CDCREADGROUP", "grp", "c1"]), "[[1, write, b, 2]]");
+        let _ = s.child.kill();
+        let _ = s.child.wait();
+    }
+    let _ = std::fs::remove_file(&rdb);
+    let _ = std::fs::remove_file(&aof);
+}
+
+/// The AOF holds the CREATE and the DESTROY — and *nothing* from the read
+/// verbs. Logging a cursor move would put a write in the log on every group
+/// read; the crash story for those is "re-deliver from the last snapshot",
+/// which is a duplicate and permitted.
+#[test]
+fn changefeed_group_reads_are_never_logged() {
+    let base = format!(
+        "{}/locus-cdcgrp-log-{}",
+        std::env::temp_dir().display(),
+        std::process::id()
+    );
+    let (rdb, aof) = (format!("{base}.rdb"), format!("{base}.aof"));
+    let _ = std::fs::remove_file(&rdb);
+    let _ = std::fs::remove_file(&aof);
+    let mut s = Server::spawn_at(
+        rdb.clone(),
+        &[
+            ("LOCUS_CDC_MAXLEN", "100"),
+            ("LOCUS_AOF", aof.as_str()),
+            ("LOCUS_SAVE", ""),
+        ],
+    );
+    let mut c = s.connect();
+    c.cmd(&["SET", "a", "1"]);
+    assert_eq!(c.cmd(&["CDCGROUP", "CREATE", "grp", "0"]), "OK");
+    assert_eq!(c.cmd(&["CDCREADGROUP", "grp", "c1"]), "[[1, write, a, 1]]");
+    assert_eq!(c.cmd(&["CDCACK", "grp", "1"]), "1");
+    assert_eq!(c.cmd(&["CDCCLAIM", "grp", "c2", "0", "1"]), "[]");
+    assert_eq!(c.cmd(&["CDCGROUP", "DESTROY", "grp"]), "1");
+    assert_eq!(c.cmd(&["CDCGROUP", "DESTROY", "grp"]), "0"); // no-op: not logged
+    let log = std::fs::read_to_string(&aof).expect("read aof");
+    assert_eq!(
+        log.matches("CDCGROUP").count(),
+        2,
+        "exactly one CREATE and one DESTROY belong in the log: {log:?}"
+    );
+    assert!(log.contains("CREATE") && log.contains("DESTROY"), "{log:?}");
+    for verb in ["CDCREADGROUP", "CDCACK", "CDCCLAIM", "CDCAUTOCLAIM"] {
+        assert!(!log.contains(verb), "{verb} must never be logged: {log:?}");
+    }
+    let _ = s.child.kill();
+    let _ = s.child.wait();
+    let _ = std::fs::remove_file(&rdb);
+    let _ = std::fs::remove_file(&aof);
+}
+
+/// A group created on the master after a replica synced used to exist only on
+/// the master — so a failover lost it. Now CREATE/DESTROY stream over the
+/// replication link, and the read verbs still do not (the offset does not move).
+#[test]
+fn changefeed_group_create_and_destroy_reach_a_replica() {
+    let master = Server::start_inner(&[("LOCUS_CDC_MAXLEN", "100")]);
+    let replica = Server::start_inner(&[("LOCUS_CDC_MAXLEN", "100")]);
+    let (mut m, mut r) = (master.connect(), replica.connect());
+    m.cmd(&["SET", "a", "1"]);
+    assert_eq!(
+        r.cmd(&["REPLICAOF", "127.0.0.1", &master.port.to_string()]),
+        "OK"
+    );
+    wait_for(&mut r, &["GET", "a"], "1", "initial sync never completed");
+
+    // Created AFTER the sync: only the replication stream can carry it.
+    assert_eq!(m.cmd(&["CDCGROUP", "CREATE", "grp", "0"]), "OK");
+    wait_for(
+        &mut r,
+        &["CDCPENDING", "grp"],
+        "[0, [], []]",
+        "CDCGROUP CREATE never reached the replica",
+    );
+
+    // The read verbs do not propagate: the master's replication offset must not
+    // move across them (it moves for the group commands themselves).
+    let before = info_field(&mut m, "master_repl_offset");
+    assert_eq!(m.cmd(&["CDCREADGROUP", "grp", "c1"]), "[[1, write, a, 1]]");
+    assert_eq!(m.cmd(&["CDCACK", "grp", "1"]), "1");
+    assert_eq!(m.cmd(&["CDCAUTOCLAIM", "grp", "c2", "0", "0"]), "[0, []]");
+    assert_eq!(
+        info_field(&mut m, "master_repl_offset"),
+        before,
+        "a group READ must not enter the replication stream"
+    );
+
+    // And a destroy does not leave the group resurrected on the replica.
+    assert_eq!(m.cmd(&["CDCGROUP", "DESTROY", "grp"]), "1");
+    wait_for(
+        &mut r,
+        &["CDCPENDING", "grp"],
+        "-NOGROUP No such changefeed group",
+        "CDCGROUP DESTROY never reached the replica",
+    );
+}
+
+/// Replay must be idempotent: a replica and an AOF loader apply the stream
+/// verbatim, so a re-applied CREATE (or a DESTROY of a group that is gone)
+/// has to be a no-op, not an error — and a re-applied CREATE must not rewind
+/// the cursor of a group the snapshot trailer already restored.
+#[test]
+fn changefeed_group_replay_is_idempotent_and_never_rewinds_the_cursor() {
+    let base = format!(
+        "{}/locus-cdcgrp-replay-{}",
+        std::env::temp_dir().display(),
+        std::process::id()
+    );
+    let (rdb, aof) = (format!("{base}.rdb"), format!("{base}.aof"));
+    let _ = std::fs::remove_file(&rdb);
+    let _ = std::fs::remove_file(&aof);
+    let env = [
+        ("LOCUS_CDC_MAXLEN", "100"),
+        ("LOCUS_AOF", aof.as_str()),
+        ("LOCUS_SAVE", ""),
+    ];
+    {
+        let mut s = Server::spawn_at(rdb.clone(), &env);
+        let mut c = s.connect();
+        c.cmd(&["SET", "a", "1"]);
+        c.cmd(&["SET", "b", "2"]);
+        assert_eq!(c.cmd(&["CDCGROUP", "CREATE", "grp", "0"]), "OK");
+        // Read both, then snapshot: the trailer now holds cursor = 2.
+        assert_eq!(
+            c.cmd(&["CDCREADGROUP", "grp", "c1"]),
+            "[[1, write, a, 1], [2, write, b, 2]]"
+        );
+        assert_eq!(c.cmd(&["SAVE"]), "OK");
+        s.child.kill().unwrap();
+        let _ = s.child.wait();
+        std::mem::forget(s); // keep the snapshot (Drop would remove it)
+    }
+    // Hand-doctor the log the way a replay of history would look: the CREATE
+    // duplicated, plus a DESTROY of a group that never existed.
+    {
+        use std::io::Write as _;
+        let mut f = std::fs::OpenOptions::new().append(true).open(&aof).unwrap();
+        f.write_all(b"*4\r\n$8\r\nCDCGROUP\r\n$6\r\nCREATE\r\n$3\r\ngrp\r\n$1\r\n0\r\n")
+            .unwrap();
+        f.write_all(b"*3\r\n$8\r\nCDCGROUP\r\n$7\r\nDESTROY\r\n$4\r\ngone\r\n")
+            .unwrap();
+        // And one the trailer has never heard of — the case the whole session
+        // exists for: a group created since the last snapshot.
+        f.write_all(b"*4\r\n$8\r\nCDCGROUP\r\n$6\r\nCREATE\r\n$5\r\nfresh\r\n$1\r\n1\r\n")
+            .unwrap();
+    }
+    {
+        let mut s = Server::spawn_at(rdb.clone(), &env);
+        let mut c = s.connect();
+        assert_eq!(c.cmd(&["PING"]), "PONG"); // the doctored log loaded cleanly
+        // The trailer's cursor (2) wins over the log's start offset (0): the
+        // re-applied CREATE is a no-op, so records 1 and 2 are not re-delivered
+        // as new. The pending list from the trailer is intact.
+        let p = c.cmd(&["CDCPENDING", "grp"]);
+        assert!(
+            p.starts_with("[2, [[c1, 2]]"),
+            "the snapshot's pending list must survive the log replay: {p}"
+        );
+        assert_eq!(c.cmd(&["CDCREADGROUP", "grp", "c1"]), "[]");
+        // The log-only group is built, at the offset the log named (1), so it
+        // still sees record 2 — a bounded duplicate window, never a gap.
+        assert_eq!(
+            c.cmd(&["CDCREADGROUP", "fresh", "c1"]),
+            "[[2, write, b, 2]]"
+        );
+        let _ = s.child.kill();
+        let _ = s.child.wait();
+    }
+    let _ = std::fs::remove_file(&rdb);
+    let _ = std::fs::remove_file(&aof);
+}
+
+/// A rewrite replaces the whole log, so the base image has to re-emit the
+/// groups or `BGREWRITEAOF` would quietly un-do their durability — and a group
+/// created *during* the rewrite has to land in the folded-in tail.
+#[test]
+fn changefeed_groups_survive_an_aof_rewrite() {
+    let base = format!(
+        "{}/locus-cdcgrp-rewrite-{}",
+        std::env::temp_dir().display(),
+        std::process::id()
+    );
+    let (rdb, aof) = (format!("{base}.rdb"), format!("{base}.aof"));
+    let _ = std::fs::remove_file(&rdb);
+    let _ = std::fs::remove_file(&aof);
+    let env = [
+        ("LOCUS_CDC_MAXLEN", "100"),
+        ("LOCUS_AOF", aof.as_str()),
+        ("LOCUS_SAVE", ""),
+    ];
+    {
+        let mut s = Server::spawn_at(rdb.clone(), &env);
+        let mut c = s.connect();
+        c.cmd(&["SET", "a", "1"]);
+        assert_eq!(c.cmd(&["CDCGROUP", "CREATE", "before", "0"]), "OK");
+        assert_eq!(
+            c.cmd(&["BGREWRITEAOF"]),
+            "Background append only file rewriting started"
+        );
+        // Whether this lands mid-rewrite or after it, the group must survive:
+        // the tail is folded into the new file before it is swapped in.
+        assert_eq!(c.cmd(&["CDCGROUP", "CREATE", "during", "0"]), "OK");
+        // Wait for the rewrite to finish (poll, never a fixed sleep).
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while c.cmd(&["INFO"]).contains("aof_rewrite_in_progress:1") {
+            assert!(Instant::now() < deadline, "BGREWRITEAOF never finished");
+            sleep(Duration::from_millis(20));
+        }
+        s.child.kill().unwrap();
+        let _ = s.child.wait();
+    }
+    {
+        let mut s = Server::spawn_at(rdb.clone(), &env);
+        let mut c = s.connect();
+        for g in ["before", "during"] {
+            assert_eq!(
+                c.cmd(&["CDCPENDING", g]),
+                "[0, [], []]",
+                "group {g} did not survive the rewrite"
+            );
+        }
+        let _ = s.child.kill();
+        let _ = s.child.wait();
+    }
+    let _ = std::fs::remove_file(&rdb);
+    let _ = std::fs::remove_file(&aof);
 }
 
 #[test]
