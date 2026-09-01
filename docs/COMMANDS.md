@@ -263,6 +263,11 @@ implicit `default` user is unrestricted, and every named user is least-privilege
 not a channel grant and neither is `+@all`, because a channel name is not a key name. A new user
 starts with **no channels** — grant them explicitly with `&pattern`.
 
+> **Key scope is a prefix, not a glob.** `~app:` (or `~app:*`, the trailing `*` is stripped) grants
+> every key starting with `app:`. A glob-looking key pattern is **not** expanded: `~app:[0-9]*` is taken
+> as the literal prefix `app:[0-9]`, which matches almost nothing (fail-closed). Channel scope (`&pattern`)
+> *is* a full glob. This asymmetry is deliberate — key scope stays a cheap prefix check on the hot path.
+
 **The handshake is never gated.** `AUTH`, `HELLO`, `RESET` and `QUIT` run whatever the user's classes
 are — Redis's `no-auth` set, and the same four names. Without that, a `+@read` user cannot
 re-authenticate and cannot answer the `HELLO` most modern clients open with, so it cannot use a

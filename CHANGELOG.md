@@ -40,8 +40,9 @@ sequences of 500 commands — 2,245,423 executed, zero unexplained divergences.
   `-ERR value is not an integer or out of range`.
 - **The glob matcher understood only `*` and `?`.** Every bracket pattern therefore matched *nothing*:
   `KEYS user:[0-9]*`, `SCAN … MATCH`, `HSCAN`/`SSCAN`/`ZSCAN`, `PSUBSCRIBE`, `CLIENT LIST` filters and —
-  this is the one to check on upgrade — **ACL key and channel patterns**. An ACL grant written
-  `&app:[0-9]*` was silently an empty grant; it now grants what it says. `[abc]`, `[a-z]`, `[^a]` and
+  this is the one to check on upgrade — **ACL *channel* patterns** (`&pattern`, which are globs). An ACL
+  channel grant written `&app:[0-9]*` was silently an empty grant; it now grants what it says. *ACL key
+  scope is unaffected* — it is a literal prefix (`~app:`), never a glob (see the ACL note below). `[abc]`, `[a-z]`, `[^a]` and
   `\` escapes all work, matching Redis's `stringmatchlen` (quirks included: `[1-]` really is the range
   `'1'..=']'`).
 - **`INCRBYFLOAT` used the sorted-set score formatter.** Redis has two double renderings and this
