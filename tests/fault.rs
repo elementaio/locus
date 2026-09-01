@@ -142,7 +142,40 @@ impl Server {
 
     /// Spawn on a *fixed* port, for a node that has to come back at the address
     /// its replicas and sentinels already know.
+    ///
+    /// Retried, because a fixed port is not always free the instant we want it:
+    /// this is how a SIGKILLed master is brought back at its own address, and the
+    /// kernel may not have finished releasing the listening socket of the process
+    /// we just killed. Waiting for the port to become bindable and re-trying is
+    /// exactly right here — unlike `free_port`, a different number is not an
+    /// option, since the replicas and the sentinels only know this one.
     fn spawn_on(port: u16, rdb: &str, extra: &[(&str, &str)]) -> Server {
+        let deadline = Instant::now() + Duration::from_secs(20);
+        loop {
+            // Wait for the address to come free before even trying.
+            while TcpListener::bind(("127.0.0.1", port)).is_err() {
+                assert!(
+                    Instant::now() < deadline,
+                    "port {port} never became bindable"
+                );
+                sleep(Duration::from_millis(50));
+            }
+            match Server::try_spawn_on(port, rdb, extra) {
+                Some(s) => return s,
+                None => {
+                    // Lost the race between our probe and the child's bind.
+                    assert!(
+                        Instant::now() < deadline,
+                        "server on fixed port {port} kept exiting at startup"
+                    );
+                    sleep(Duration::from_millis(100));
+                }
+            }
+        }
+    }
+
+    /// One attempt; `None` when the child died before it started listening.
+    fn try_spawn_on(port: u16, rdb: &str, extra: &[(&str, &str)]) -> Option<Server> {
         let mut cmd = Command::new(env!("CARGO_BIN_EXE_locus"));
         cmd.env("LOCUS_PORT", port.to_string())
             .env("LOCUS_RDB", rdb)
@@ -158,8 +191,8 @@ impl Server {
         loop {
             let mut line = String::new();
             if reader.read_line(&mut line).expect("read stdout") == 0 {
-                let status = child.wait().ok();
-                panic!("server on fixed port {port} exited early (status {status:?})");
+                let _ = child.wait();
+                return None; // died at startup — the caller retries
             }
             if line.contains("listening") {
                 break;
@@ -169,11 +202,11 @@ impl Server {
             let mut sink = Vec::new();
             let _ = reader.read_to_end(&mut sink);
         });
-        Server {
+        Some(Server {
             child: Some(child),
             port,
             rdb: rdb.to_string(),
-        }
+        })
     }
 
     fn connect(&self) -> Conn {
