@@ -154,7 +154,15 @@ of phase 4.
 (in-process command differential vs `redis-server`, plus spawn-a-server fault injection on
 replication/failover/reshard). It closes phase 5 and is the credibility gate.
 
-**The phase 6 posture decision is the owner's, and it blocks any further distribution work** —
+**Phase 6 is DECIDED (2026-09-01): freeze & document (A).** The cluster/sentinel layer ships as
+documented-unsafe — "trusted network, operator-driven, not partition-safe" — and gets **no further
+investment now**. Do not start cluster/HA hardening: option (B) (min-replicas knob, off-hub
+MIGRATESLOT, off-hub scatter, ASK) is recorded in the plan, ready to brief only on a real customer
+need; option (C) (consensus/Raft) is permanently off the table (identity). After phase 5, the roadmap
+is **phase 7** (multi-tenancy, Go client, sync SDK) plus loose ends (session 3b, the session-9
+P3-batch).
+
+**The former phase-6 blocker line, for reference:** the decision —
 either harden the cluster/sentinel layer (fencing, coordinated epochs, chunked migration) or narrow the
 documented guarantees. The authentication and the false-partition-safety claims were already pulled
 forward (session 2b); what remains is a product call, not a coding task.
