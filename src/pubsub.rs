@@ -17,6 +17,13 @@ pub struct PubSub {
     counts: HashMap<u64, usize>,              // client -> total (chan + pattern) subscriptions
 }
 
+/// Delegates to [`PubSub::new`] — no channels, no patterns, no subscribers.
+impl Default for PubSub {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl PubSub {
     pub fn new() -> Self {
         PubSub {

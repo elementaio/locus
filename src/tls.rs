@@ -25,7 +25,8 @@ use rustls::pki_types::{
 };
 use rustls::{ServerConfig, ServerConnection, StreamOwned};
 
-use crate::{Dispatch, Msg, OutBytes, dispatch_commands, log, query_buf_limit, resp};
+use crate::{Dispatch, Msg, OutBytes, dispatch_commands, query_buf_limit};
+use locusdb::{log, resp};
 
 /// Build a rustls server config from the PEM cert/key named by LOCUS_TLS_CERT /
 /// LOCUS_TLS_KEY. Returns a human error (logged by the caller) on any problem.
@@ -108,7 +109,7 @@ pub fn handle_tls_conn(
             Ok(n) => {
                 inbuf.extend_from_slice(&chunk[..n]);
                 if inbuf.len() > querybuf_max {
-                    let _ = tls.write_all(&crate::resp::error(
+                    let _ = tls.write_all(&resp::error(
                         "ERR Protocol error: query buffer exceeds the client-query-buffer limit",
                     ));
                     break;

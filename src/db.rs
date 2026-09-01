@@ -217,6 +217,13 @@ pub struct Stream {
     pub last_id: StreamId,
 }
 
+/// Delegates to [`Stream::new`] — an empty stream, no entries, last id 0-0.
+impl Default for Stream {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl Stream {
     pub fn new() -> Self {
         Stream {
@@ -317,6 +324,13 @@ pub struct Db {
     /// the cells covering the query box instead of every geo key.
     geo_index: BTreeMap<u64, HashSet<Vec<u8>>>,
     geo_cell: HashMap<Vec<u8>, u64>,
+}
+
+/// Delegates to [`Db::new`] — an empty keyspace with the configured tier, if any.
+impl Default for Db {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 impl Db {

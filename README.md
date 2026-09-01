@@ -200,6 +200,39 @@ is `locusdb`; the installed command is `locus`):
 cargo install locusdb && locus
 ```
 
+### Embedding Locus as a library
+
+The package ships two targets: the `locus` **binary** (the server) and the `locusdb` **library** (the
+engine). The engine is the keyspace, the command implementations, the RESP codec, the persistence
+formats, the spatial index and the sketches — everything except the server. Commands go in as argument
+vectors and replies come back as encoded RESP bytes, the same bytes the server would put on a socket,
+so anything that can drive a Redis client can drive Locus in-process: no socket, no threads, no server.
+
+```rust
+use locusdb::{Db, execute, resp};
+
+let mut db = Db::new();
+
+execute(&[b"GEOSET".to_vec(), b"driver:7".to_vec(), b"13.36".to_vec(), b"38.11".to_vec()], &mut db);
+let near = execute(
+    &[b"GEOSEARCH".to_vec(), b"FROMLONLAT".to_vec(), b"13.36".to_vec(), b"38.11".to_vec(),
+      b"BYRADIUS".to_vec(), b"5".to_vec(), b"km".to_vec(), b"ASC".to_vec()],
+    &mut db,
+);
+assert_eq!(near, resp::bulk_array(&[b"driver:7".to_vec()]));
+```
+
+`execute` answers in RESP2; `execute_proto(tokens, &mut db, 3)` selects RESP3 for the shape-sensitive
+commands (maps, sets, doubles). `Db` is a plain owned value with `&mut self` methods and **no interior
+locking** — the server does not need any, because one thread owns the keyspace by design — so an
+embedder sharing a `Db` across threads supplies its own mutual exclusion. Commands that only mean
+something to a *server* — replication, `SUBSCRIBE`, blocking pops, the changefeed's group plumbing —
+are handled by the binary's hub, not by `execute`. Expiry is lazy on read plus an active sweep the
+server drives from its maintenance tick, so an embedder that wants keys to actually disappear calls
+`Db::active_expire()` periodically.
+
+`tests/embedding.rs` in the repository is a working example.
+
 ### Configuration
 
 Configured entirely through environment variables (minimal config by design):
@@ -381,6 +414,11 @@ which is what makes the reliable changefeed and live geo-queries possible. Each 
 **reader** and **writer** thread; persistence and replication sit **off the hot path**. Full details in
 [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md).
 
+That box splits cleanly in two, and so does the crate: everything *inside* the hub — the keyspace, the
+command implementations, the codec, persistence, the spatial index — is the `locusdb` **library**;
+everything *around* it — the hub thread itself, the reader/writer threads, replication, cluster and
+sentinel — is the `locus` **binary**. See [Embedding Locus as a library](#embedding-locus-as-a-library).
+
 ---
 
 ## Performance
@@ -483,6 +521,7 @@ instead), and active-active replication.
 ```console
 cargo build --release      # optimized binary at target/release/locus (zero dependencies)
 cargo build --release --features tls   # opt-in: in-process TLS via rustls
+cargo build --lib          # just the embeddable engine (the `locusdb` library target)
 cargo test                 # unit + integration (parser fuzz, crash-recovery, replication, ACL, …)
 cargo test --features tls  # also runs the TLS handshake / round-trip tests
 cargo clippy               # lints (clippy-clean under -D warnings)

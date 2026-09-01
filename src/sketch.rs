@@ -458,6 +458,13 @@ pub struct Hll {
 const HLL_P: u32 = 14;
 pub const HLL_REGS: usize = 1 << HLL_P; // 16384
 
+/// Delegates to [`Hll::new`] — all registers zero (cardinality 0).
+impl Default for Hll {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl Hll {
     pub fn new() -> Hll {
         Hll {

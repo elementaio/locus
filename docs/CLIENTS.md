@@ -8,6 +8,10 @@ aren't part of Redis, but every client can send them through its generic *raw co
 Examples below use Node ([ioredis](https://github.com/redis/ioredis)) and Python
 ([redis-py](https://github.com/redis/redis-py)); the same pattern applies to go-redis, Jedis/Lettuce, etc.
 
+**From Rust, there is a second option:** skip the network entirely and embed the engine. `cargo add
+locusdb` gives you the keyspace and the whole command table in-process — same commands, same RESP reply
+bytes, no server. See [Embedding Locus as a library](../README.md#embedding-locus-as-a-library).
+
 ## Connect
 
 ```js

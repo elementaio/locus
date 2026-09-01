@@ -3,7 +3,7 @@
 # repo, and Docker image are all still `locus`. So `cargo install locusdb`
 # installs a `locus` command (see [[bin]] below).
 name = "locusdb"
-version = "0.9.0"
+version = "0.10.0"
 edition = "2024"
 description = "A zero-dependency, from-scratch Redis-protocol datastore in Rust — with a reactive changefeed, geo-first spatial model, and horizontal spatial clustering."
 authors = ["Emad Jumaah"]
@@ -13,6 +13,15 @@ readme = "README.md"
 keywords = ["redis", "key-value", "in-memory", "database", "resp"]
 categories = ["database-implementations", "caching"]
 
+# The engine, embeddable on its own: the keyspace, the command table, the RESP
+# codec, persistence, the geo index and the sketches. `cargo add locusdb` gets
+# this; the server below is the binary that wraps it.
+[lib]
+name = "locusdb"
+path = "src/lib.rs"
+
+# The server. Depends on the library above and adds everything a *server* needs:
+# the hub thread, connection threads, replication, cluster and sentinel.
 [[bin]]
 name = "locus"
 path = "src/main.rs"

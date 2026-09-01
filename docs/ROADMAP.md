@@ -52,6 +52,12 @@ See [CHANGEFEED.md](CHANGEFEED.md), [GEO.md](GEO.md), [SKETCHES.md](SKETCHES.md)
 - **Replication:** real replid/offset, **`WAIT`**, **PSYNC partial-resync** over a backlog ring, no expiry divergence.
 - **HA + TLS:** built-in **sentinel** auto-failover (quorum + inter-sentinel agreement over an authenticated peer plane) — for a **trusted network**, and **not partition-safe** ([what it guarantees](DEPLOYMENT.md#what-failover-guarantees--and-what-it-does-not)); TLS via sidecar or the optional `tls` feature.
 - **Compat/observability:** `SCAN`/`COMMAND`/`CONFIG`/`SLOWLOG`/`INFO` (works with `redis_exporter`), RESP3 typed replies.
+- **Embeddable engine (since 0.10.0):** the package builds a `locusdb` **library** alongside the `locus`
+  binary. The library is the engine — keyspace, commands, codec, persistence, spatial index, sketches —
+  driven in-process through `Db` + `execute` with no socket and no threads; the server (hub,
+  connections, replication, cluster, sentinel) stays in the binary. It is also what the fuzz targets and
+  the differential harness are built on. See
+  [Embedding Locus as a library](../README.md#embedding-locus-as-a-library).
 - **Geo depth:** geohash **spatial index** (sub-linear `GEOSEARCH`) + combined `WHERE` attribute filters.
 - **Sorted sets:** ordered index (std `BTreeSet`) for range/rank without re-sorting on read — and
   since 0.7.0 the range reads walk it in place rather than cloning the set, so a top-10 is O(log n + m)
@@ -79,7 +85,8 @@ See [CHANGEFEED.md](CHANGEFEED.md), [GEO.md](GEO.md), [SKETCHES.md](SKETCHES.md)
 
 - **GitHub Releases** with prebuilt static binaries (Linux x86_64/aarch64, macOS x86_64/arm64).
 - **Docker image** — `ghcr.io/elementaio/locus` (multi-tag, public).
-- **crates.io** — `cargo install locusdb` (crate `locusdb`; the command stays `locus`).
+- **crates.io** — `cargo install locusdb` (crate `locusdb`; the command stays `locus`). Since 0.10.0 the
+  same crate is also a library dependency: `cargo add locusdb` to embed the engine.
 - Any **Redis client** works over RESP; the custom verbs go through each client's raw-command API
   (see [CLIENTS.md](CLIENTS.md)).
 

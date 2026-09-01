@@ -520,7 +520,7 @@ fn serve_peers(
             let _ = s.set_read_timeout(Some(IO_TIMEOUT));
             let Ok(auth) = read_line(&mut s) else { return };
             let offered = auth.strip_prefix(b"AUTH ".as_slice()).unwrap_or(b"");
-            if !crate::ct_eq(offered, secret.as_bytes()) {
+            if !crate::util::ct_eq(offered, secret.as_bytes()) {
                 let _ = s.write_all(b"-NOAUTH\n");
                 return;
             }

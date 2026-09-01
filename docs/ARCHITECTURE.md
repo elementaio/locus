@@ -69,7 +69,24 @@ feel why the single-owner model is cleaner.
 | `sentinel` | Failover monitor mode: health checks, quorum/inter-sentinel agreement (over an authenticated, loopback-by-default peer plane), promotion, and cluster slot reassignment. Trusted-network orchestration, **not partition-safe** — see [DEPLOYMENT](DEPLOYMENT.md#what-failover-guarantees--and-what-it-does-not). |
 | `tls` | Optional (`tls` feature) in-process TLS via rustls; the default build never compiles it. |
 | `log` | The std-only timestamped leveled logger. |
+| `tier` | The optional cold-tier store: keys spilled to disk and paged back on read. |
+| `util` | The one helper with no other home: constant-time byte comparison, shared by client `AUTH` and the sentinel peer plane. |
 | `main` | The hub, the connection threads, replication, the changefeed, secondary indexes, and the cluster layer (routing, scatter-gather, gossip). |
+
+### Library and binary
+
+Since 0.10.0 the package builds **two** targets, and the split follows the table above exactly:
+
+- **`locusdb`, the library** (`src/lib.rs`) — every module in the table except `tls` and `main`. This is
+  the engine: keyspace, commands, codec, persistence formats, spatial index, sketches. It has no
+  threads and opens no sockets. Embedders, fuzz targets and out-of-crate tests consume this.
+- **`locus`, the binary** (`src/main.rs`) — the server around the engine: the hub thread, the
+  reader/writer thread pair, replication, cluster, sentinel wiring, and the `tls` module, which drives
+  connections and reaches into that hub plumbing rather than into the keyspace.
+
+The seam is the `Db` + `execute` pair: the hub calls `execute_proto` on the keyspace it owns, and an
+embedder calls exactly the same function on a `Db` it owns. Nothing in the library knows a server
+exists. See [Embedding Locus as a library](../README.md#embedding-locus-as-a-library).
 
 ## Values and expiry
 

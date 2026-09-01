@@ -214,6 +214,10 @@ impl User {
     }
 
     /// Apply one `ACL SETUSER` rule. Returns Err on an unrecognized rule.
+    // The `Err(())` carries no payload on purpose: every caller turns any
+    // failure into the single `-ERR Error in ACL SETUSER modifier` reply that
+    // Redis returns, so a richer error type would be information nothing reads.
+    #[allow(clippy::result_unit_err)]
     pub fn apply(&mut self, rule: &[u8]) -> Result<(), ()> {
         let lower = rule.to_ascii_lowercase();
         match lower.as_slice() {

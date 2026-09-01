@@ -12,6 +12,12 @@ to contribute to.
 - **Stay true to the design.** Command execution is single-threaded (atomic by construction). Avoid
   introducing locks or shared mutable state on the data path — see
   [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md).
+- **Know which half you're in.** The package builds two targets: `src/lib.rs` is the `locusdb`
+  **library** (the engine — keyspace, commands, codec, persistence, spatial index, sketches; no threads,
+  no sockets) and `src/main.rs` is the `locus` **binary** (the server — hub thread, connections,
+  replication, cluster, sentinel). Engine code goes in the library and must not reach back into the
+  binary; server code stays in the binary. Anything the library exports is public API now, so a `pub`
+  there is a commitment.
 
 ## Before you open a PR
 

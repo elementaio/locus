@@ -1,5 +1,12 @@
 //! Locus — an in-memory, geo-first datastore that speaks the Redis protocol.
 //!
+//! This is the **server**: everything that turns the engine into a networked
+//! datastore. The engine itself — the keyspace, the command implementations, the
+//! RESP codec, persistence, the spatial index, the sketches — is the `locusdb`
+//! library in `src/lib.rs`, which this binary depends on like any other crate.
+//! The seam is `Db` + `execute_proto`: the hub below calls it on the keyspace it
+//! owns, and an embedder calls the same function on a `Db` of their own.
+//!
 //! Architecture (single-threaded execution, the Redis way):
 //!   * each connection has a READER thread (read + parse) and a WRITER thread
 //!     (drain an output channel to the socket);
@@ -11,20 +18,10 @@
 //! M4 lists/hashes/sets · M5 sorted sets · M6 RDB · M7 AOF · M8 pub/sub ·
 //! M9 replication (full sync + command streaming).
 
-mod acl;
-mod aof;
-mod commands;
-mod db;
-mod geohash;
-mod hlc;
-mod log;
-mod pubsub;
-mod rdb;
-mod resp;
-mod sentinel;
-mod sketch;
-mod streams;
-mod tier;
+// The engine lives in the library half of this package (`src/lib.rs`); the
+// server lives here. `tls` is the one module that stays in the binary — it
+// drives connections and reaches into the hub plumbing below (`Dispatch`,
+// `Msg`, `OutBytes`), which is server state, not engine state.
 #[cfg(feature = "tls")]
 mod tls;
 
@@ -37,10 +34,14 @@ use std::sync::{Arc, mpsc};
 use std::thread;
 use std::time::{Duration, Instant};
 
-use commands::execute_proto;
-use db::{Db, Value, now_ms};
-use pubsub::PubSub;
-use resp::{Parsed, parse_command};
+use locusdb::commands::execute_proto;
+use locusdb::db::{Db, Value, now_ms};
+use locusdb::pubsub::PubSub;
+use locusdb::resp::{Parsed, parse_command};
+use locusdb::util::ct_eq;
+use locusdb::{
+    acl, aof, commands, db, geohash, hlc, log, pubsub, rdb, resp, sentinel, streams, tier,
+};
 
 /// Reserved client id for commands replicated from a master.
 const MASTER_ID: u64 = 0;
@@ -5300,20 +5301,6 @@ fn is_no_auth(cmd: &[u8]) -> bool {
     matches!(cmd, b"AUTH" | b"HELLO" | b"QUIT" | b"RESET")
 }
 
-/// Constant-time equality: folds the whole comparison (including a length
-/// mismatch) into one accumulator and always scans the longer slice, so AUTH
-/// latency doesn't reveal how much of the secret matched.
-fn ct_eq(a: &[u8], b: &[u8]) -> bool {
-    let mut diff: u8 = if a.len() == b.len() { 0 } else { 1 };
-    let n = a.len().max(b.len());
-    for i in 0..n {
-        let x = a.get(i).copied().unwrap_or(0);
-        let y = b.get(i).copied().unwrap_or(0);
-        diff |= x ^ y;
-    }
-    diff == 0
-}
-
 /// Idle read timeout (LOCUS_TIMEOUT seconds); 0/unset means no timeout, matching
 /// the Redis default. Drops connections that go silent (basic slow-loris guard).
 fn idle_timeout() -> Option<Duration> {
@@ -6420,16 +6407,6 @@ mod tests {
         assert_eq!(commands::min_arity(b"PING"), Some(1));
         assert_eq!(commands::min_arity(b"AUTH"), Some(2));
         assert_eq!(commands::min_arity(b"NOTACOMMAND"), None);
-    }
-
-    #[test]
-    fn ct_eq_matches_only_equal_slices() {
-        assert!(ct_eq(b"secret", b"secret"));
-        assert!(ct_eq(b"", b""));
-        assert!(!ct_eq(b"secret", b"secrxt")); // same length, one byte differs
-        assert!(!ct_eq(b"secret", b"secre")); // shorter
-        assert!(!ct_eq(b"secret", b"secrets")); // longer
-        assert!(!ct_eq(b"", b"x"));
     }
 
     #[test]

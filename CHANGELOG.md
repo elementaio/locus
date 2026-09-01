@@ -4,6 +4,54 @@ All notable changes to Locus are documented here. The format is based on
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and the project follows
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.10.0] — 2026-09-01
+
+**Locus is now embeddable.** The package builds two targets instead of one: the `locus` binary — the
+server, unchanged — and a new `locusdb` library, the engine underneath it. Nothing about running Locus
+as a server changes: same commands, same replies, same persistence, same binary name. This is a
+structural release that opens three doors at once — embedding Locus in another Rust program, writing
+fuzz targets against the parser and the keyspace, and testing internals from outside the crate (the
+differential harness that comes next is built on it).
+
+### Added
+
+- **`locusdb` library target.** `src/lib.rs` exports the engine: the keyspace and command
+  implementations, the RESP codec, the RDB/AOF formats, the geo index, the sketches, the ACL model, the
+  changefeed's stream types and the cold tier. Curated at the crate root as `Db`, `Value`, `ZSet`,
+  `execute`, `execute_proto`, `parse_command`, `Parsed`, `now_ms` and `ct_eq`, with every module also
+  reachable by path.
+
+  Commands go in as argument vectors and replies come back as encoded RESP bytes — the same bytes the
+  server would put on a socket — so the engine runs entirely in-process, with no socket and no threads:
+
+  ```rust
+  use locusdb::{Db, execute, resp};
+
+  let mut db = Db::new();
+  execute(&[b"SET".to_vec(), b"k".to_vec(), b"v".to_vec()], &mut db);
+  assert_eq!(execute(&[b"GET".to_vec(), b"k".to_vec()], &mut db), resp::bulk_string(b"v"));
+  ```
+
+  `Db` has no interior locking — one thread owns the keyspace by design — so an embedder sharing one
+  across threads brings its own mutual exclusion. Commands that only mean something to a *server*
+  (replication, `SUBSCRIBE`, blocking pops, the changefeed's group plumbing) stay with the binary's hub.
+  See [Embedding Locus as a library](README.md#embedding-locus-as-a-library) and the worked example in
+  `tests/embedding.rs`.
+- **`Default` for `Db`, `Stream`, `Hll` and `PubSub`**, each delegating to the existing `new()`. These
+  types are public API now, and the idiomatic constructor pair should exist for them.
+- **A `util` module** holding `ct_eq`, the constant-time byte comparison. It was a private helper in
+  `main.rs` that `sentinel` reached back into — the single symbol standing between the modules and a
+  clean library split.
+
+### Changed
+
+- **The server keeps the whole server.** The hub thread, the connection reader/writer pair,
+  replication, cluster, gossip and the sentinel wiring stay in the `locus` binary and are deliberately
+  *not* exported: an embedder brings its own concurrency model. The optional `tls` module stays in the
+  binary too, because it drives connections through that hub plumbing rather than through the keyspace.
+- `cargo install locusdb` still installs a `locus` command, exactly as before; the crate simply now also
+  works as a `cargo add locusdb` dependency.
+
 ## [0.9.0] — 2026-09-01
 
 Both flagship claims, made honest. Locus positions itself on "a reliable, ordered changefeed" and on a
